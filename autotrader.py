@@ -26,7 +26,7 @@ def extract_and_print_listing(list_item):
         return False
 
     # get the van name (text content of the link, excluding hidden span)
-    van_name = title_link.evaluate("el => el.childNodes[0].textContent")
+    van_name = title_link.evaluate("el => el.childNodes[0].textContent").strip()
 
     # get the listing url from the href attribute
     listing_url = title_link.get_attribute("href")
@@ -35,15 +35,20 @@ def extract_and_print_listing(list_item):
 
     # get subtitle
     subtitle = list_item.locator('p[data-testid="search-listing-subtitle"]')
-    subtitle_text = subtitle.inner_text() if subtitle.count() > 0 else ""
+    short_description = subtitle.inner_text() if subtitle.count() > 0 else ""
 
     # get mileage
     mileage = list_item.locator('li[data-testid="mileage"]')
     mileage_text = mileage.inner_text() if mileage.count() > 0 else ""
+    mileage_unit = mileage_text.split(" ")[-1] if " " in mileage_text else None
+    mileage_value_text = mileage_text.split(" ")[0] if " " in mileage_text else mileage_text
+    mileage_value = int(mileage_value_text.replace(",", "")) if mileage_value_text else None
 
     # get year
     year = list_item.locator('li[data-testid="registered_year"]')
     year_text = year.inner_text() if year.count() > 0 else ""
+    year_value = int(year_text.split(" ")[0]) if " " in year_text else int(year_text) if year_text.isdigit() else None
+    reg_text = year_text.split("(")[-1].replace(")", "") if "(" in year_text else None
 
     # get price - find span that starts with £ symbol (class names are unstable)
     price_text = list_item.evaluate(
@@ -51,30 +56,34 @@ def extract_and_print_listing(list_item):
             const spans = element.querySelectorAll('span');
             for (const span of spans) {
                 const text = span.textContent.trim();
-                if (text.startsWith('£')) {
+                if (text.startsWith('£') || text.startsWith('€') || text.startsWith('$')) {
                     return text;
                 }
             }
             return '';
         }"""
     )
+    currency_symbol = price_text[0] if price_text else None
+    price_value = int(price_text[1:].replace(",", "").split(" ")[0]) if " " in price_text else  int(price_text[1:].replace(",", "")) if price_text else None
+    vat_status = " ".join(price_text.split(" ")[1:]).strip() if " " in price_text else None
 
     # get location
     location = list_item.locator('span[data-testid="search-listing-location"]')
     location_text = location.inner_text() if location.count() > 0 else ""
+    location_city = location_text.split("(")[0].strip() if "(" in location_text else location_text.strip() if location_text else None
 
     # print the extracted info
-    print(van_name.strip())
-    if subtitle_text:
-        print(subtitle_text)
+    print(van_name)
+    if short_description:
+        print(short_description)
     if mileage_text:
-        print(mileage_text)
+        print(f"{mileage_value:,}", mileage_unit)
     if year_text:
-        print(year_text)
+        print(year_value, reg_text)
     if price_text:
-        print(price_text)
+        print(currency_symbol, price_value, vat_status)
     if location_text:
-        print(location_text)
+        print(location_city)
     if listing_url:
         print(listing_url)
 

@@ -1,0 +1,1 @@
+"""SQLAlchemy models generated from ICE AI databases."""

@@ -1,0 +1,83 @@
+from sqlalchemy import Column, DateTime, Index, Integer, PrimaryKeyConstraint, String
+from sqlalchemy.orm import Mapped, declarative_base, mapped_column
+from sqlalchemy.orm.base import Mapped
+
+Base = declarative_base()
+
+
+class Languages(Base):
+    __tablename__ = 'languages'
+    __table_args__ = (
+        PrimaryKeyConstraint('code', name='languages_pkey'),
+        {'schema': 'at'}
+    )
+
+    code = mapped_column(String)
+    language = mapped_column(String, nullable=False)
+
+
+class Lookups(Base):
+    __tablename__ = 'lookups'
+    __table_args__ = (
+        PrimaryKeyConstraint('id', name='lookups_pkey'),
+        Index('idx_lookups_code', 'code'),
+        Index('idx_lookups_lookup_type', 'lookup_type'),
+        {'schema': 'at'}
+    )
+
+    id = mapped_column(Integer)
+    lookup_type = mapped_column(String, nullable=False)
+    code = mapped_column(String, nullable=False)
+    value = mapped_column(String)
+    description = mapped_column(String)
+
+
+class PreferredLanguages(Base):
+    __tablename__ = 'preferred_languages'
+    __table_args__ = (
+        PrimaryKeyConstraint('id', name='preferred_languages_pkey'),
+        Index('idx_preferred_languages_language_code', 'language_code'),
+        Index('idx_preferred_languages_owner', 'owner'),
+        {'schema': 'at'}
+    )
+
+    id = mapped_column(Integer)
+    language_code = mapped_column(String, nullable=False)
+    owner = mapped_column(String, nullable=False)
+    createdat = mapped_column(DateTime(True))
+    updatedat = mapped_column(DateTime(True))
+
+
+class VideoStages(Base):
+    __tablename__ = 'video_stages'
+    __table_args__ = (
+        PrimaryKeyConstraint('code', name='video_stages_pkey'),
+        {'schema': 'at'}
+    )
+
+    code = mapped_column(String)
+    name = mapped_column(String, nullable=False)
+    description = mapped_column(String)
+
+
+class Videos(Base):
+    __tablename__ = 'videos'
+    __table_args__ = (
+        PrimaryKeyConstraint('id', name='videos_pkey'),
+        Index('idx_videos_language_code', 'language_code'),
+        Index('idx_videos_owner', 'owner'),
+        Index('idx_videos_stage_code', 'stage_code'),
+        {'schema': 'at'}
+    )
+
+    id = mapped_column(Integer)
+    name = mapped_column(String, nullable=False)
+    language_code = mapped_column(String, nullable=False)
+    stage_code = mapped_column(String, nullable=False)
+    owner = mapped_column(String, nullable=False)
+    video_url = mapped_column(String)
+    transcript = mapped_column(String)
+    description = mapped_column(String)
+    raw_video_id = mapped_column(Integer)
+    createdat = mapped_column(DateTime(True))
+    updatedat = mapped_column(DateTime(True))

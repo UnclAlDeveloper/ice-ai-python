@@ -1,24 +1,25 @@
+import base64
 import hashlib
 import os
 import random
 import re
+import secrets
+import tempfile
 import time
 from datetime import date, datetime
 from typing import Optional
 
+from google import genai
 from playwright.sync_api import Page, sync_playwright
 from sqlalchemy import create_engine, text
+from sqlalchemy.orm import sessionmaker
 
-# from AWSAccess import AWSAccess
+from AWSAccess import AWSAccess
 from environments import load_environment
-from models.auto_ads import FoundListings
-from models.enums import ListingSource
+from models.auto_ads import ProspectListings, Images
+from models.enums import ListingSource, ListingTable
 
-# aws_access = AWSAccess(
-#     bucket_name=os.getenv("AUTO_ADS_BUCKET"), sub_directory_name="images"
-# )
-
-
+# PAUSE FUNCTION
 def pause(min_seconds: float = 1.0, max_seconds: float = 3.0):
     """
     Wait a random amount of time to simulate human browsing behavior.
@@ -31,7 +32,7 @@ def pause(min_seconds: float = 1.0, max_seconds: float = 3.0):
 # GET EXISTING HASH CODES
 def get_existing_hash_codes() -> set[str]:
     """
-    Query database for all existing hash_codes in found_listings table.
+    Query database for all existing hash_codes in prospect_listings table.
     """
 
     database_url = os.getenv("AUTO_ADS_DATABASE_URL")
@@ -39,7 +40,7 @@ def get_existing_hash_codes() -> set[str]:
 
     engine = create_engine(database_url)
     with engine.connect() as conn:
-        result = conn.execute(text(f"SELECT hash_code FROM {schema}.found_listings"))
+        result = conn.execute(text(f"SELECT hash_code FROM {schema}.prospect_listings"))
         return {row[0] for row in result}
 
 
@@ -50,6 +51,15 @@ def generate_hash_code(short_description: str) -> str:
     """
 
     return hashlib.md5(short_description.encode()).hexdigest()[:16]
+
+
+# GENERATE IMAGE HASH
+def generate_image_hash() -> str:
+    """
+    Generate a 16-character random hex string for use as an image filename.
+    """
+
+    return secrets.token_hex(8)
 
 
 # GET SPECS AND FEATURES
@@ -71,7 +81,7 @@ def get_specs_and_features(page: Page) -> Optional[str]:
         return None
 
     # wait for the popup to appear
-    popup = page.locator('div.ppa-enabled')
+    popup = page.locator("div.ppa-enabled")
     if popup.count() == 0:
         return None
 
@@ -109,7 +119,7 @@ def get_specs_and_features(page: Page) -> Optional[str]:
                 if category_span.count() > 0:
                     category_name = category_span.inner_text().strip()
                     # remove trailing number if present (the count badge)
-                    category_name = re.sub(r'\d+$', '', category_name).strip()
+                    category_name = re.sub(r"\d+$", "", category_name).strip()
                     markdown_parts.append(f"### {category_name}\n")
 
             # get all feature items
@@ -143,7 +153,7 @@ def get_specs_and_features(page: Page) -> Optional[str]:
                 if category_span.count() > 0:
                     category_name = category_span.inner_text().strip()
                     # remove trailing number if present (the count badge)
-                    category_name = re.sub(r'\d+$', '', category_name).strip()
+                    category_name = re.sub(r"\d+$", "", category_name).strip()
                     markdown_parts.append(f"### {category_name}\n")
 
             # get all spec items
@@ -266,10 +276,270 @@ def get_overview_value(page: Page, icon_name: str) -> Optional[str]:
     return None
 
 
-# READ FULL FOUND LISTING
-def read_full_found_listing(page: Page) -> FoundListings:
+# SAVE GALLERY IMAGES
+def save_gallery_images(page: Page, prospect_listing: ProspectListings, session) -> None:
     """
-    Extract full listing details from the detail page and return a FoundListings instance.
+    Open the full gallery view, load all images (via carousel or scrolling),
+    fetch them via HTTP, save to S3 and temporary directory, and create Images database records.
+    """
+
+    # click the gallery button to open full gallery view
+    gallery_button = page.locator('section[name="gallery"] button:has(span:text("Gallery"))')
+    if gallery_button.count() == 0:
+        print("Gallery button not found, skipping image extraction")
+        return
+
+    gallery_button.click()
+    pause(1.0, 2.0)
+
+    # create temporary directory for storing images
+    temp_dir = tempfile.mkdtemp(prefix="autotrader_images_")
+    temp_image_paths = []
+
+    # collect unique image urls
+    image_urls = []
+    seen_urls = set()
+
+    # try scroll mode first: scroll down the gallery to load all images
+    # wait for gallery container to be visible
+    page.wait_for_load_state("networkidle")
+    pause(1.0, 2.0)
+
+    # find the scrollable container in the gallery (look for common scrollable elements)
+    scrollable_container = page.evaluate("""
+        () => {
+            // find elements with overflow scroll or auto that have significant height
+            const elements = document.querySelectorAll('*');
+            for (const el of elements) {
+                const style = window.getComputedStyle(el);
+                const overflowY = style.overflowY;
+                if ((overflowY === 'scroll' || overflowY === 'auto') && 
+                    el.scrollHeight > el.clientHeight &&
+                    el.clientHeight > 200) {
+                    return true;
+                }
+            }
+            return false;
+        }
+    """)
+
+    max_scroll_attempts = 20
+    scroll_attempts = 0
+    previous_image_count = 0
+
+    while scroll_attempts < max_scroll_attempts:
+        # collect current images before scrolling
+        img_elements = page.locator("img").all()
+        current_image_count = len(img_elements)
+
+        # scroll the scrollable container or window
+        page.evaluate("""
+            () => {
+                // find and scroll the scrollable container
+                const elements = document.querySelectorAll('*');
+                for (const el of elements) {
+                    const style = window.getComputedStyle(el);
+                    const overflowY = style.overflowY;
+                    if ((overflowY === 'scroll' || overflowY === 'auto') && 
+                        el.scrollHeight > el.clientHeight &&
+                        el.clientHeight > 200) {
+                        el.scrollBy(0, window.innerHeight);
+                        return;
+                    }
+                }
+                // fallback to window scroll
+                window.scrollBy(0, window.innerHeight);
+            }
+        """)
+        pause(0.5, 1.0)
+
+        # wait for potential new images to load
+        page.wait_for_timeout(500)
+
+        # check if we've reached the bottom of the scrollable container
+        at_bottom = page.evaluate("""
+            () => {
+                // check scrollable container first
+                const elements = document.querySelectorAll('*');
+                for (const el of elements) {
+                    const style = window.getComputedStyle(el);
+                    const overflowY = style.overflowY;
+                    if ((overflowY === 'scroll' || overflowY === 'auto') && 
+                        el.scrollHeight > el.clientHeight &&
+                        el.clientHeight > 200) {
+                        return el.scrollTop + el.clientHeight >= el.scrollHeight - 10;
+                    }
+                }
+                // fallback to window check
+                return window.scrollY + window.innerHeight >= document.body.scrollHeight;
+            }
+        """)
+
+        # also check if no new images loaded
+        img_elements_after = page.locator("img").all()
+        new_image_count = len(img_elements_after)
+        if at_bottom and new_image_count == previous_image_count:
+            break
+
+        previous_image_count = new_image_count
+        scroll_attempts += 1
+
+    # pause to ensure all images are fully loaded
+    pause(1.0, 2.0)
+
+    # locate all img elements in the gallery
+    img_elements = page.locator("img").all()
+
+    # use aws access for saving and retrieving images from s3
+    aws_access = AWSAccess(
+        bucket_name=os.getenv("AUTO_ADS_BUCKET"), media_dir="images", sub_directory_name="prospects"
+    )
+
+    for img_element in img_elements:
+        try:
+            src = img_element.get_attribute("src")
+            if src and src not in seen_urls and src.startswith("http"):
+                seen_urls.add(src)
+                image_urls.append(src)
+        except Exception:
+            continue
+
+    # if only one image found, try carousel mode instead
+    if len(image_urls) <= 1:
+        carousel_next_button = page.locator('button[data-testid="carousel-next-icon"]')
+
+        if carousel_next_button.count() > 0:
+            # carousel mode: click through to collect all images
+            max_carousel_clicks = 50
+            carousel_clicks = 0
+
+            while carousel_clicks < max_carousel_clicks:
+                # collect current image url
+                img_elements = page.locator("img").all()
+                for img_element in img_elements:
+                    try:
+                        src = img_element.get_attribute("src")
+                        if src and src not in seen_urls and src.startswith("http"):
+                            seen_urls.add(src)
+                            image_urls.append(src)
+                    except Exception:
+                        continue
+
+                # check if next button is still available and enabled
+                if carousel_next_button.count() == 0:
+                    break
+
+                # check if button is disabled (reached end of carousel)
+                is_disabled = carousel_next_button.get_attribute("disabled")
+                if is_disabled is not None:
+                    break
+
+                # click next to advance carousel
+                try:
+                    carousel_next_button.click()
+                    pause(0.3, 0.6)
+                    carousel_clicks += 1
+                except Exception:
+                    break
+
+    saved_count = 0
+    for index, img_url in enumerate(image_urls):
+        try:
+            # pause between downloading images
+            if index > 0:
+                pause(0.5, 1.5)
+
+            # fetch the image via http request
+            response = page.request.get(img_url)
+            if response.status != 200:
+                print(f"Failed to fetch image {index}: HTTP {response.status}")
+                continue
+
+            image_bytes = response.body()
+
+            # skip if no valid image data
+            if not image_bytes:
+                continue
+
+            # determine file extension from content type or url
+            content_type = response.headers.get("content-type", "")
+            if "jpeg" in content_type or "jpg" in content_type:
+                extension = "jpg"
+            elif "png" in content_type:
+                extension = "png"
+            elif "webp" in content_type:
+                extension = "webp"
+            elif "gif" in content_type:
+                extension = "gif"
+            else:
+                # try to extract from url
+                url_lower = img_url.lower()
+                if ".jpg" in url_lower or ".jpeg" in url_lower:
+                    extension = "jpg"
+                elif ".png" in url_lower:
+                    extension = "png"
+                elif ".webp" in url_lower:
+                    extension = "webp"
+                elif ".gif" in url_lower:
+                    extension = "gif"
+                else:
+                    extension = "jpg"  # default to jpg
+
+            # generate a 16-character random hash for the filename
+            image_hash = generate_image_hash()
+
+            # save to temporary directory
+            temp_file_path = os.path.join(temp_dir, f"{image_hash}.{extension}")
+            with open(temp_file_path, "wb") as f:
+                f.write(image_bytes)
+            temp_image_paths.append(temp_file_path)
+
+            # save to s3
+            aws_access.save_media(image_hash, extension, image_bytes)
+
+            # get the s3 url
+            s3_url = aws_access.get_media_url(image_hash, extension)
+
+            # create images database record
+            image_record = Images(
+                listing_table_id=ListingTable.PROSPECT,
+                listing_id=prospect_listing.id,
+                listing_source_id=ListingSource.AUTOTRADER,
+                url=s3_url,
+                is_primary=(index == 0),
+                created_at=datetime.now(),
+            )
+            session.add(image_record)
+            saved_count += 1
+
+        except Exception as e:
+            print(f"Error extracting image {index}: {e}")
+            continue
+
+    # commit all image records
+    session.commit()
+
+    # store temp directory path in prospect_listing for later use with Gemini
+    # (assuming there's a field for this, or we can add it to the model)
+    prospect_listing._temp_image_dir = temp_dir
+    prospect_listing._temp_image_paths = temp_image_paths
+
+    # pause before closing gallery
+    pause(1.0, 2.0)
+
+    # click the close button to return to listing (works for both carousel and scroll modes)
+    close_button = page.get_by_test_id("gallery-close")
+    if close_button.count() > 0:
+        close_button.click()
+        pause(0.5, 1.0)
+
+    print(f"Saved {saved_count} images for listing {prospect_listing.id} to S3 and temp directory: {temp_dir}")
+
+
+# READ FULL FOUND LISTING
+def read_full_prospect_listing(page: Page) -> ProspectListings:
+    """
+    Extract full listing details from the detail page and return a ProspectListings instance.
     """
 
     # get the current url
@@ -293,7 +563,7 @@ def read_full_found_listing(page: Page) -> FoundListings:
     price_text = price_elem.inner_text() if price_elem.count() > 0 else ""
 
     # parse price components
-    currency = price_text[0] if price_text else None
+    currency_symbol = price_text[0] if price_text else None
     asking_price = None
     vat_status = None
 
@@ -434,8 +704,8 @@ def read_full_found_listing(page: Page) -> FoundListings:
     # set created_at and updated_at to current datetime
     current_datetime = datetime.now()
 
-    # create and return FoundListings instance
-    found_listing = FoundListings(
+    # create and return ProspectListings instance
+    prospect_listing = ProspectListings(
         hash_code=hash_code,
         listing_source_id=ListingSource.AUTOTRADER,
         make_and_model=make_and_model,
@@ -449,7 +719,7 @@ def read_full_found_listing(page: Page) -> FoundListings:
         mileage_unit=mileage_unit,
         year=year,
         registration=registration,
-        currency=currency,
+        currency_symbol=currency_symbol,
         vat_status=vat_status,
         location=location,
         body_type=body_type,
@@ -460,7 +730,7 @@ def read_full_found_listing(page: Page) -> FoundListings:
         engine_size=engine_size,
         colour=colour,
         seats=seats,
-        emmission_class=emission_class,
+        emission_class=emission_class,
         number_of_owners=number_of_owners,
         service_history=service_history,
         basic_history_check=basic_history_check,
@@ -469,9 +739,239 @@ def read_full_found_listing(page: Page) -> FoundListings:
         mot_expiry=mot_expiry,
     )
 
+    # insert into database and populate id field
+    database_url = os.getenv("AUTO_ADS_DATABASE_URL")
+    engine = create_engine(database_url)
+    SessionLocal = sessionmaker(bind=engine)
+
+    with SessionLocal() as session:
+        session.add(prospect_listing)
+        session.flush()
+        session.commit()
+
+        # save gallery images after listing is committed
+        save_gallery_images(page, prospect_listing, session)
+
+        # generate and apply resell analysis
+        resell_analysis = generate_resell_analysis(prospect_listing)
+        prospect_listing = apply_resell_analysis(prospect_listing, resell_analysis)
+
+        # detach the object from the session so it can be used outside the session context
+        session.expunge(prospect_listing)
+
     print(f"Extracted listing: {make_and_model} - {short_description[:50]}...")
 
-    return found_listing
+    return prospect_listing
+
+
+# CONVERT FOUND LISTING TO MARKDOWN
+def convert_prospect_listing_to_markdown(prospect_listing: ProspectListings) -> str:
+    """
+    Convert a ProspectListings object to a markdown formatted string.
+    """
+
+    # helper function to format optional values
+    def format_value(value, default="N/A"):
+        return str(value) if value is not None else default
+
+    # build markdown sections
+    markdown_parts = []
+
+    # header with make and model
+    markdown_parts.append(f"# {format_value(prospect_listing.make_and_model, 'Unknown')}")
+
+    # short description
+    markdown_parts.append(
+        f"## {format_value(prospect_listing.short_description, 'No description')}"
+    )
+    markdown_parts.append("")
+
+    # overview section
+    markdown_parts.append("## Overview")
+
+    # mileage with unit
+    mileage_str = format_value(prospect_listing.mileage)
+    if prospect_listing.mileage_unit:
+        mileage_str += f" {prospect_listing.mileage_unit}"
+    markdown_parts.append(f"- Mileage: {mileage_str}")
+
+    markdown_parts.append(f"- Year: {format_value(prospect_listing.year)}")
+    markdown_parts.append(f"- Registration: {format_value(prospect_listing.registration)}")
+    markdown_parts.append(f"- Body type: {format_value(prospect_listing.body_type)}")
+    markdown_parts.append(f"- Cab type: {format_value(prospect_listing.cab_type)}")
+    markdown_parts.append(f"- Wheelbase: {format_value(prospect_listing.wheelbase)}")
+    markdown_parts.append(f"- Engine: {format_value(prospect_listing.engine_size)}")
+    markdown_parts.append(
+        f"- Emission class: {format_value(prospect_listing.emission_class)}"
+    )
+    markdown_parts.append(f"- Gearbox: {format_value(prospect_listing.gearbox_type)}")
+    markdown_parts.append(f"- Fuel type: {format_value(prospect_listing.fuel_type)}")
+    markdown_parts.append(f"- Seats: {format_value(prospect_listing.seats)}")
+    markdown_parts.append(f"- Colour: {format_value(prospect_listing.colour)}")
+    markdown_parts.append("")
+
+    # specs and features section
+    if prospect_listing.specs_and_features:
+        markdown_parts.append(prospect_listing.specs_and_features)
+        markdown_parts.append("")
+
+    # description section
+    markdown_parts.append("## Description")
+    markdown_parts.append(
+        format_value(prospect_listing.full_description, "No description available")
+    )
+    markdown_parts.append("")
+
+    # history section
+    markdown_parts.append("## History")
+    markdown_parts.append(f"- Owners: {format_value(prospect_listing.number_of_owners)}")
+
+    # service history subsection
+    markdown_parts.append("### Service history:")
+    markdown_parts.append(format_value(prospect_listing.service_history, "Not available"))
+    markdown_parts.append("")
+
+    # basic checks subsection
+    markdown_parts.append("### Basic checks (out of 5)")
+    markdown_parts.append(
+        format_value(prospect_listing.basic_history_check, "Not available")
+    )
+    markdown_parts.append("")
+
+    # mot status subsection
+    markdown_parts.append("### MOT status")
+    mot_info = format_value(prospect_listing.mot_status, "Not available")
+    markdown_parts.append(mot_info)
+
+    return "\n".join(markdown_parts)
+
+
+# GENERATE RESELL ANALYSIS
+def generate_resell_analysis(prospect_listing: ProspectListings) -> str:
+    """
+    Generate resell analysis for a found listing using Google Gemini API.
+    Reads the resell prompt template, converts the listing to markdown,
+    and sends it to Gemini for analysis.
+    """
+
+    # get the directory where this script is located
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    resell_prompt_path = os.path.join(script_dir, "resell_prompt.md")
+
+    # read the resell prompt template
+    with open(resell_prompt_path, "r", encoding="utf-8") as f:
+        resell_prompt = f.read()
+
+    # convert found listing to markdown
+    listing_markdown = convert_prospect_listing_to_markdown(prospect_listing)
+
+    # append the listing markdown to the resell prompt
+    full_prompt = resell_prompt + "\n\n" + listing_markdown
+
+    # get API key and model name from environment variables
+    api_key = os.getenv("AUTO_TRADER_GOOGLE_API_KEY")
+    if not api_key:
+        raise ValueError(
+            "AUTO_TRADER_GOOGLE_API_KEY not found in environment variables"
+        )
+
+    model_name = os.getenv("GEMINI_MODEL_NAME")
+    if not model_name:
+        raise ValueError("GEMINI_MODEL_NAME not found in environment variables")
+
+    # configure the Gemini client with API key
+    client = genai.Client(api_key=api_key)
+
+    # generate the content
+    response = client.models.generate_content(model=model_name, contents=full_prompt)
+
+    return response.text
+
+
+# APPLY RESELL ANALYSIS
+def apply_resell_analysis(
+    prospect_listing: ProspectListings, resell_analysis: str
+) -> ProspectListings:
+    """
+    Parse the markdown resell analysis and populate the AI-generated fields
+    on the prospect_listing object. Returns the updated prospect_listing.
+    """
+
+    # helper to extract price as integer from string like "£27,500"
+    def parse_price(price_str: str) -> Optional[int]:
+        if not price_str:
+            return None
+        # remove currency symbol, commas, and whitespace
+        cleaned = re.sub(r"[£,\s]", "", price_str)
+        try:
+            return int(cleaned)
+        except ValueError:
+            return None
+
+    # helper to extract section content between headers
+    def extract_section(content: str, header: str) -> Optional[str]:
+        pattern = rf"#\s*{header}\s*\n(.*?)(?=\n#\s|\Z)"
+        match = re.search(pattern, content, re.DOTALL | re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+        return None
+
+    # strip markdown code fence if present
+    analysis = resell_analysis.strip()
+    if analysis.startswith("```markdown"):
+        analysis = analysis[len("```markdown") :].strip()
+    elif analysis.startswith("```"):
+        analysis = analysis[3:].strip()
+    if analysis.endswith("```"):
+        analysis = analysis[:-3].strip()
+
+    # extract overview section
+    overview = extract_section(analysis, "Overview")
+    if overview:
+        prospect_listing.ai_resell_overview = overview
+
+    # extract repair costs table
+    repair_costs = extract_section(analysis, "Repair costs")
+    if repair_costs:
+        prospect_listing.ai_work_and_repairs = repair_costs
+
+    # extract notes section
+    notes = extract_section(analysis, "Notes")
+    if notes:
+        prospect_listing.ai_resell_notes = notes
+
+    # extract price ranges section
+    price_section = extract_section(analysis, "Price ranges")
+    if price_section:
+        # parse each price line
+        low_buy_match = re.search(
+            r"Low buy price:\s*(£[\d,]+)", price_section, re.IGNORECASE
+        )
+        high_buy_match = re.search(
+            r"High buy price:\s*(£[\d,]+)", price_section, re.IGNORECASE
+        )
+        repair_cost_match = re.search(
+            r"Expected repair cost:\s*(£[\d,]+)", price_section, re.IGNORECASE
+        )
+        low_sell_match = re.search(
+            r"Low sell price:\s*(£[\d,]+)", price_section, re.IGNORECASE
+        )
+        high_sell_match = re.search(
+            r"High sell price:\s*(£[\d,]+)", price_section, re.IGNORECASE
+        )
+
+        if low_buy_match:
+            prospect_listing.ai_buy_price_low = parse_price(low_buy_match.group(1))
+        if high_buy_match:
+            prospect_listing.ai_buy_price_high = parse_price(high_buy_match.group(1))
+        if repair_cost_match:
+            prospect_listing.ai_repair_cost = parse_price(repair_cost_match.group(1))
+        if low_sell_match:
+            prospect_listing.ai_sell_price_low = parse_price(low_sell_match.group(1))
+        if high_sell_match:
+            prospect_listing.ai_sell_price_high = parse_price(high_sell_match.group(1))
+
+    return prospect_listing
 
 
 def main():
@@ -625,7 +1125,7 @@ def main():
         # scroll down the page one viewport at a time to load all listings
         print("Scrolling to load all van listings...\n")
         processed_listing_ids = set()
-        found_listings = []
+        prospect_listings = []
         scroll_attempts = 0
         max_scroll_attempts = 10  # prevent infinite scrolling
         stop_processing = False
@@ -678,8 +1178,8 @@ def main():
                         pause()
 
                         # extract full listing details
-                        found_listing = read_full_found_listing(page)
-                        found_listings.append(found_listing)
+                        prospect_listing = read_full_prospect_listing(page)
+                        prospect_listings.append(prospect_listing)
 
                         # pause before navigating back
                         pause(2.0, 10.0)
@@ -704,7 +1204,7 @@ def main():
 
         print(f"\nFinished scrolling after {scroll_attempts} scroll operations")
         print(f"Processed {len(processed_listing_ids)} listings")
-        print(f"Found {len(found_listings)} new listings")
+        print(f"Found {len(prospect_listings)} new listings")
 
         print("Press Enter to close the browser...")
         input()

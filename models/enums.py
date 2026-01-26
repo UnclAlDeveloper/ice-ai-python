@@ -17,5 +17,5 @@ class ListingTable(IntEnum):
     Enumeration of listing tables with their corresponding database IDs.
     """
 
-    FOUND = 1
+    PROSPECT = 1
     ADVERTISED = 2

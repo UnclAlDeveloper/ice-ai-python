@@ -4,12 +4,14 @@ import os
 import random
 import re
 import secrets
+import shutil
 import tempfile
 import time
 from datetime import date, datetime
 from typing import Optional
 
 from google import genai
+from google.genai import types
 from playwright.sync_api import Page, sync_playwright
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
@@ -277,17 +279,20 @@ def get_overview_value(page: Page, icon_name: str) -> Optional[str]:
 
 
 # SAVE GALLERY IMAGES
-def save_gallery_images(page: Page, prospect_listing: ProspectListings, session) -> None:
+def save_gallery_images(
+    page: Page, prospect_listing: ProspectListings, session
+) -> Optional[str]:
     """
     Open the full gallery view, load all images (via carousel or scrolling),
     fetch them via HTTP, save to S3 and temporary directory, and create Images database records.
+    Returns the path to the temporary directory containing the images, or None if no images were saved.
     """
 
     # click the gallery button to open full gallery view
     gallery_button = page.locator('section[name="gallery"] button:has(span:text("Gallery"))')
     if gallery_button.count() == 0:
         print("Gallery button not found, skipping image extraction")
-        return
+        return None
 
     gallery_button.click()
     pause(1.0, 2.0)
@@ -519,11 +524,6 @@ def save_gallery_images(page: Page, prospect_listing: ProspectListings, session)
     # commit all image records
     session.commit()
 
-    # store temp directory path in prospect_listing for later use with Gemini
-    # (assuming there's a field for this, or we can add it to the model)
-    prospect_listing._temp_image_dir = temp_dir
-    prospect_listing._temp_image_paths = temp_image_paths
-
     # pause before closing gallery
     pause(1.0, 2.0)
 
@@ -534,6 +534,8 @@ def save_gallery_images(page: Page, prospect_listing: ProspectListings, session)
         pause(0.5, 1.0)
 
     print(f"Saved {saved_count} images for listing {prospect_listing.id} to S3 and temp directory: {temp_dir}")
+
+    return temp_dir
 
 
 # READ FULL FOUND LISTING
@@ -750,11 +752,15 @@ def read_full_prospect_listing(page: Page) -> ProspectListings:
         session.commit()
 
         # save gallery images after listing is committed
-        save_gallery_images(page, prospect_listing, session)
+        temp_image_dir = save_gallery_images(page, prospect_listing, session)
 
-        # generate and apply resell analysis
-        resell_analysis = generate_resell_analysis(prospect_listing)
+        # generate and apply resell analysis using temp image directory
+        resell_analysis = generate_resell_analysis(prospect_listing, temp_image_dir)
         prospect_listing = apply_resell_analysis(prospect_listing, resell_analysis)
+
+        # clean up temp directory after use
+        if temp_image_dir and os.path.isdir(temp_image_dir):
+            shutil.rmtree(temp_image_dir)
 
         # detach the object from the session so it can be used outside the session context
         session.expunge(prospect_listing)
@@ -847,11 +853,13 @@ def convert_prospect_listing_to_markdown(prospect_listing: ProspectListings) -> 
 
 
 # GENERATE RESELL ANALYSIS
-def generate_resell_analysis(prospect_listing: ProspectListings) -> str:
+def generate_resell_analysis(
+    prospect_listing: ProspectListings, temp_image_dir: Optional[str] = None
+) -> str:
     """
     Generate resell analysis for a found listing using Google Gemini API.
     Reads the resell prompt template, converts the listing to markdown,
-    and sends it to Gemini for analysis.
+    and sends it to Gemini for analysis along with any images from the temp directory.
     """
 
     # get the directory where this script is located
@@ -882,8 +890,45 @@ def generate_resell_analysis(prospect_listing: ProspectListings) -> str:
     # configure the Gemini client with API key
     client = genai.Client(api_key=api_key)
 
+    # build the contents list with the text prompt
+    contents = [full_prompt]
+
+    # add images from temp directory if provided
+    if temp_image_dir and os.path.isdir(temp_image_dir):
+        # map file extensions to mime types
+        extension_to_mime = {
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".png": "image/png",
+            ".webp": "image/webp",
+            ".gif": "image/gif",
+        }
+
+        # iterate through image files in the temp directory
+        for filename in sorted(os.listdir(temp_image_dir)):
+            file_path = os.path.join(temp_image_dir, filename)
+
+            # skip if not a file
+            if not os.path.isfile(file_path):
+                continue
+
+            # get file extension and determine mime type
+            _, ext = os.path.splitext(filename.lower())
+            mime_type = extension_to_mime.get(ext)
+
+            # skip unsupported file types
+            if not mime_type:
+                continue
+
+            # read the image bytes and create a Part
+            with open(file_path, "rb") as f:
+                image_bytes = f.read()
+
+            image_part = types.Part.from_bytes(data=image_bytes, mime_type=mime_type)
+            contents.append(image_part)
+
     # generate the content
-    response = client.models.generate_content(model=model_name, contents=full_prompt)
+    response = client.models.generate_content(model=model_name, contents=contents)
 
     return response.text
 

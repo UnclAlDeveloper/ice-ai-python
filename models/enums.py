@@ -1,21 +1,37 @@
-from enum import IntEnum
+from enum import StrEnum
 
 
 # LISTING SOURCE
-class ListingSource(IntEnum):
+class ListingSource(StrEnum):
     """
     Enumeration of listing sources with their corresponding database IDs.
     """
 
-    AUTOTRADER = 1
-    EBAY = 2
+    AUTOTRADER = "Autotrader"
+    EBAY = "Ebay"
+    FACEBOOK = "Facebook"
+    GUMMTREE = "Gummtree"
+    ONLYVANS = "OnlyVans"
 
 
 # LISTING TABLE
-class ListingTable(IntEnum):
+class ListingTable(StrEnum):
     """
     Enumeration of listing tables with their corresponding database IDs.
     """
 
-    PROSPECT = 1
-    ADVERTISED = 2
+    PROSPECT = "Prospect"
+    RESALE = "Resale"
+
+
+# PROSPECT LISTING STATUS
+class ProspectListingStatus(StrEnum):
+    """
+    Enumeration of prospect listing statuses with their corresponding database IDs.
+    """
+
+    NEW = "New"
+    VIEWED = "Viewed"
+    NOT_INTERESTED = "NotInterested"
+    INTERESTED = "Interested"
+    BOUGHT = "Bought"

@@ -19,7 +19,8 @@ from sqlalchemy.orm import sessionmaker
 from AWSAccess import AWSAccess
 from environments import load_environment
 from models.auto_ads import ProspectListings, Images
-from models.enums import ListingSource, ListingTable
+from models.enums import ListingSource, ListingTable, ProspectListingStatus
+
 
 # PAUSE FUNCTION
 def pause(min_seconds: float = 1.0, max_seconds: float = 3.0):
@@ -507,9 +508,9 @@ def save_gallery_images(
 
             # create images database record
             image_record = Images(
-                listing_table_id=ListingTable.PROSPECT,
+                listing_table=ListingTable.PROSPECT,
                 listing_id=prospect_listing.id,
-                listing_source_id=ListingSource.AUTOTRADER,
+                listing_source=ListingSource.AUTOTRADER,
                 url=s3_url,
                 is_primary=(index == 0),
                 created_at=datetime.now(),
@@ -709,7 +710,8 @@ def read_full_prospect_listing(page: Page) -> ProspectListings:
     # create and return ProspectListings instance
     prospect_listing = ProspectListings(
         hash_code=hash_code,
-        listing_source_id=ListingSource.AUTOTRADER,
+        listing_source=ListingSource.AUTOTRADER,
+        status=ProspectListingStatus.NEW,
         make_and_model=make_and_model,
         short_description=short_description,
         url=url,
@@ -757,6 +759,8 @@ def read_full_prospect_listing(page: Page) -> ProspectListings:
         # generate and apply resell analysis using temp image directory
         resell_analysis = generate_resell_analysis(prospect_listing, temp_image_dir)
         prospect_listing = apply_resell_analysis(prospect_listing, resell_analysis)
+        session.flush()
+        session.commit()
 
         # clean up temp directory after use
         if temp_image_dir and os.path.isdir(temp_image_dir):
@@ -1250,9 +1254,6 @@ def main():
         print(f"\nFinished scrolling after {scroll_attempts} scroll operations")
         print(f"Processed {len(processed_listing_ids)} listings")
         print(f"Found {len(prospect_listings)} new listings")
-
-        print("Press Enter to close the browser...")
-        input()
         browser.close()
 
 

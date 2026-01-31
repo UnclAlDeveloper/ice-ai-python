@@ -74,3 +74,4 @@ class ProspectListings(Base):
     ai_resell_notes = mapped_column(String)
     ai_buy_price_low = mapped_column(Integer)
     ai_buy_price_high = mapped_column(Integer)
+    ai_campervan_conversion = mapped_column(String)

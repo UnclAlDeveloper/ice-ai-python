@@ -1,7 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
   <component name="Black">
+    <option name="enabledOnReformat" value="true" />
+    <option name="enabledOnSave" value="true" />
     <option name="sdkName" value="C:\Users\Graeme\AppData\Local\mambaforge\envs\ice-ai" />
   </component>
-  <component name="ProjectRootManager" version="2" project-jdk-name="C:\Users\Graeme\AppData\Local\mambaforge\envs\ice-ai" project-jdk-type="Python SDK" />
+  <component name="ProjectRootManager" version="2" project-jdk-name="C:\Users\Graeme\.local\share\mamba\envs\ice-ai" project-jdk-type="Python SDK" />
 </project>

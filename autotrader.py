@@ -290,7 +290,9 @@ def save_gallery_images(
     """
 
     # click the gallery button to open full gallery view
-    gallery_button = page.locator('section[name="gallery"] button:has(span:text("Gallery"))')
+    gallery_button = page.locator(
+        'section[name="gallery"] button:has(span:text("Gallery"))'
+    )
     if gallery_button.count() == 0:
         print("Gallery button not found, skipping image extraction")
         return None
@@ -398,7 +400,9 @@ def save_gallery_images(
 
     # use aws access for saving and retrieving images from s3
     aws_access = AWSAccess(
-        bucket_name=os.getenv("AUTO_ADS_BUCKET"), media_dir="images", sub_directory_name="prospects"
+        bucket_name=os.getenv("AUTO_ADS_BUCKET"),
+        media_dir="images",
+        sub_directory_name="prospects",
     )
 
     for img_element in img_elements:
@@ -534,7 +538,9 @@ def save_gallery_images(
         close_button.click()
         pause(0.5, 1.0)
 
-    print(f"Saved {saved_count} images for listing {prospect_listing.id} to S3 and temp directory: {temp_dir}")
+    print(
+        f"Saved {saved_count} images for listing {prospect_listing.id} to S3 and temp directory: {temp_dir}"
+    )
 
     return temp_dir
 
@@ -788,7 +794,9 @@ def convert_prospect_listing_to_markdown(prospect_listing: ProspectListings) -> 
     markdown_parts = []
 
     # header with make and model
-    markdown_parts.append(f"# {format_value(prospect_listing.make_and_model, 'Unknown')}")
+    markdown_parts.append(
+        f"# {format_value(prospect_listing.make_and_model, 'Unknown')}"
+    )
 
     # short description
     markdown_parts.append(
@@ -806,7 +814,9 @@ def convert_prospect_listing_to_markdown(prospect_listing: ProspectListings) -> 
     markdown_parts.append(f"- Mileage: {mileage_str}")
 
     markdown_parts.append(f"- Year: {format_value(prospect_listing.year)}")
-    markdown_parts.append(f"- Registration: {format_value(prospect_listing.registration)}")
+    markdown_parts.append(
+        f"- Registration: {format_value(prospect_listing.registration)}"
+    )
     markdown_parts.append(f"- Body type: {format_value(prospect_listing.body_type)}")
     markdown_parts.append(f"- Cab type: {format_value(prospect_listing.cab_type)}")
     markdown_parts.append(f"- Wheelbase: {format_value(prospect_listing.wheelbase)}")
@@ -834,11 +844,15 @@ def convert_prospect_listing_to_markdown(prospect_listing: ProspectListings) -> 
 
     # history section
     markdown_parts.append("## History")
-    markdown_parts.append(f"- Owners: {format_value(prospect_listing.number_of_owners)}")
+    markdown_parts.append(
+        f"- Owners: {format_value(prospect_listing.number_of_owners)}"
+    )
 
     # service history subsection
     markdown_parts.append("### Service history:")
-    markdown_parts.append(format_value(prospect_listing.service_history, "Not available"))
+    markdown_parts.append(
+        format_value(prospect_listing.service_history, "Not available")
+    )
     markdown_parts.append("")
 
     # basic checks subsection
@@ -881,11 +895,9 @@ def generate_resell_analysis(
     full_prompt = resell_prompt + "\n\n" + listing_markdown
 
     # get API key and model name from environment variables
-    api_key = os.getenv("AUTO_TRADER_GOOGLE_API_KEY")
+    api_key = os.getenv("AUTO_ADS_GOOGLE_API_KEY")
     if not api_key:
-        raise ValueError(
-            "AUTO_TRADER_GOOGLE_API_KEY not found in environment variables"
-        )
+        raise ValueError("AUTO_ADS_GOOGLE_API_KEY not found in environment variables")
 
     model_name = os.getenv("GEMINI_MODEL_NAME")
     if not model_name:
@@ -905,7 +917,6 @@ def generate_resell_analysis(
             ".jpeg": "image/jpeg",
             ".png": "image/png",
             ".webp": "image/webp",
-            ".gif": "image/gif",
         }
 
         # iterate through image files in the temp directory
@@ -959,8 +970,10 @@ def apply_resell_analysis(
 
     # helper to extract section content between headers
     def extract_section(content: str, header: str) -> Optional[str]:
-        pattern = rf"#\s*{header}\s*\n(.*?)(?=\n#\s|\Z)"
-        match = re.search(pattern, content, re.DOTALL | re.IGNORECASE)
+        # match header with optional leading whitespace, and capture content until the next header
+        # the next header can also have leading whitespace on the line
+        pattern = rf"^\s*#\s*{header}\s*\n(.*?)(?=^\s*#\s|\Z)"
+        match = re.search(pattern, content, re.DOTALL | re.IGNORECASE | re.MULTILINE)
         if match:
             return match.group(1).strip()
         return None
@@ -988,6 +1001,11 @@ def apply_resell_analysis(
     notes = extract_section(analysis, "Notes")
     if notes:
         prospect_listing.ai_resell_notes = notes
+
+    # extract campervan conversion section
+    campervan_conversion = extract_section(analysis, "Campervan Conversion")
+    if campervan_conversion:
+        prospect_listing.ai_campervan_conversion = campervan_conversion
 
     # extract price ranges section
     price_section = extract_section(analysis, "Price ranges")
@@ -1021,6 +1039,51 @@ def apply_resell_analysis(
             prospect_listing.ai_sell_price_high = parse_price(high_sell_match.group(1))
 
     return prospect_listing
+
+
+# REGENERATE ALL RESELL ANALYSES
+def regenerate_all_resell_analyses():
+    """
+    Iterate through all rows in prospect_listings table and regenerate the
+    resell analysis for each one using the AI model.
+    """
+
+    # load environment variables
+    load_environment()
+
+    database_url = os.getenv("AUTO_ADS_DATABASE_URL")
+    engine = create_engine(database_url)
+    SessionLocal = sessionmaker(bind=engine)
+
+    with SessionLocal() as session:
+        # query all prospect listings
+        prospect_listings = session.query(ProspectListings).all()
+        total_count = len(prospect_listings)
+        print(f"Found {total_count} prospect listings to process")
+
+        for index, prospect_listing in enumerate(prospect_listings, start=1):
+            try:
+                print(
+                    f"Processing {index}/{total_count}: {prospect_listing.make_and_model} "
+                    f"(ID: {prospect_listing.id})"
+                )
+
+                # generate resell analysis (no images available for existing listings)
+                resell_analysis = generate_resell_analysis(prospect_listing, None)
+
+                # apply the analysis to update the AI fields
+                apply_resell_analysis(prospect_listing, resell_analysis)
+
+                # commit changes for this listing
+                session.commit()
+                print(f"  Successfully updated listing {prospect_listing.id}")
+
+            except Exception as e:
+                print(f"  Error processing listing {prospect_listing.id}: {e}")
+                session.rollback()
+                continue
+
+    print(f"Finished processing {total_count} prospect listings")
 
 
 def main():

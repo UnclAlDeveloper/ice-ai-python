@@ -10,6 +10,9 @@ import time
 from datetime import date, datetime
 from typing import Optional
 
+from environments import load_environment
+load_environment()
+
 from google import genai
 from google.genai import types
 from playwright.sync_api import Page, sync_playwright
@@ -17,7 +20,6 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
 from AWSAccess import AWSAccess
-from environments import load_environment
 from models.auto_ads import ProspectListings, Images
 from models.enums import ListingSource, ListingTable, ProspectListingStatus
 
@@ -1321,4 +1323,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    regenerate_all_resell_analyses()

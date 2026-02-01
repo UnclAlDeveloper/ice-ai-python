@@ -10,7 +10,7 @@
             "request": "launch",
             "program": "${file}",
             "console": "integratedTerminal",
-            "python": "C:\\Users\\Graeme\\AppData\\Local\\mambaforge\\envs\\ice-ai\\python.exe"
+            "python": "/opt/conda/envs/uncl-al-dev/bin/python"
         }
     ]
 }

@@ -8,8 +8,8 @@ Use simple grammar but assume a mechanic with domain knowledge and vocabulary re
 
 Todays date is {date}.  Discount the valuation if this date is later than the date you were using to value the van.
 
-Also can you investigate whether it would be realistically possible to convert the var into a campervan.  If not leave
-the "Campervan Conversion" section blank.  If it is possible, can you suggest all the modifications that would need to 
+Also can you investigate whether it would be realistically very profitable to convert the van into a campervan.  If not leave
+the "Campervan Conversion" section blank.  If it is very profitable, can you suggest all the modifications that would need to 
 be made to the van to make it into a campervan?
 
 The ouput should be in raw markdown format.  It should use the following template:
@@ -27,8 +27,8 @@ Item | Estimated Cost | Why it's needed
  that is noticed in the images and the buyer or mechanic should be aware of.  Only include essential and useful information)
 
 # Campervan Conversion
-(If the van is not possible to convert to a campervan, leave this section blank.  
-If it is possible, list the modifications that would need to be made to the van to make it into a campervan)
+(If the van is not very profitable to convert to a campervan, leave this section blank.  
+If it is very profitable, list the modifications that would need to be made to the van to make it into a campervan)
 
 # Price ranges
  (Suggested/expected price ranges)

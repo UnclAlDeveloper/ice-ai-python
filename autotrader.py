@@ -890,6 +890,9 @@ def generate_resell_analysis(
     with open(resell_prompt_path, "r", encoding="utf-8") as f:
         resell_prompt = f.read()
 
+    # substitute {date} placeholder with current date
+    resell_prompt = resell_prompt.replace("{date}", date.today().strftime("%Y-%m-%d"))
+
     # convert found listing to markdown
     listing_markdown = convert_prospect_listing_to_markdown(prospect_listing)
 
@@ -991,23 +994,19 @@ def apply_resell_analysis(
 
     # extract overview section
     overview = extract_section(analysis, "Overview")
-    if overview:
-        prospect_listing.ai_resell_overview = overview
+    prospect_listing.ai_resell_overview = overview if overview else None
 
     # extract repair costs table
     repair_costs = extract_section(analysis, "Repair costs")
-    if repair_costs:
-        prospect_listing.ai_work_and_repairs = repair_costs
+    prospect_listing.ai_work_and_repairs = repair_costs if repair_costs else None
 
     # extract notes section
     notes = extract_section(analysis, "Notes")
-    if notes:
-        prospect_listing.ai_resell_notes = notes
+    prospect_listing.ai_resell_notes = notes if notes else None
 
     # extract campervan conversion section
     campervan_conversion = extract_section(analysis, "Campervan Conversion")
-    if campervan_conversion:
-        prospect_listing.ai_campervan_conversion = campervan_conversion
+    prospect_listing.ai_campervan_conversion = campervan_conversion if campervan_conversion else None
 
     # extract price ranges section
     price_section = extract_section(analysis, "Price ranges")
@@ -1028,17 +1027,17 @@ def apply_resell_analysis(
         high_sell_match = re.search(
             r"High sell price:\s*(£[\d,]+)", price_section, re.IGNORECASE
         )
-
-        if low_buy_match:
-            prospect_listing.ai_buy_price_low = parse_price(low_buy_match.group(1))
-        if high_buy_match:
-            prospect_listing.ai_buy_price_high = parse_price(high_buy_match.group(1))
-        if repair_cost_match:
-            prospect_listing.ai_repair_cost = parse_price(repair_cost_match.group(1))
-        if low_sell_match:
-            prospect_listing.ai_sell_price_low = parse_price(low_sell_match.group(1))
-        if high_sell_match:
-            prospect_listing.ai_sell_price_high = parse_price(high_sell_match.group(1))
+        prospect_listing.ai_buy_price_low = parse_price(low_buy_match.group(1)) if low_buy_match else None
+        prospect_listing.ai_buy_price_high = parse_price(high_buy_match.group(1)) if high_buy_match else None
+        prospect_listing.ai_repair_cost = parse_price(repair_cost_match.group(1)) if repair_cost_match else None
+        prospect_listing.ai_sell_price_low = parse_price(low_sell_match.group(1)) if low_sell_match else None
+        prospect_listing.ai_sell_price_high = parse_price(high_sell_match.group(1)) if high_sell_match else None
+    else:
+        prospect_listing.ai_buy_price_low = None
+        prospect_listing.ai_buy_price_high = None
+        prospect_listing.ai_repair_cost = None
+        prospect_listing.ai_sell_price_low = None
+        prospect_listing.ai_sell_price_high = None
 
     return prospect_listing
 

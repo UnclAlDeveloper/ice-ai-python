@@ -1322,4 +1322,4 @@ def main():
 
 
 if __name__ == "__main__":
-    regenerate_all_resell_analyses()
+    main()

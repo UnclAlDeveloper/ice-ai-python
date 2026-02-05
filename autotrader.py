@@ -1280,10 +1280,9 @@ def main():
                         if hash_code in existing_hash_codes:
                             print(
                                 f"Found existing listing (hash: {hash_code}), "
-                                "stopping..."
+                                "continuing..."
                             )
-                            stop_processing = True
-                            break
+                            continue
 
                         # click to navigate to detail page
                         title_link.click()
@@ -1306,6 +1305,8 @@ def main():
                         pause()
 
                         processed_listing_ids.add(listing_id)
+                        if hash_code not  in existing_hash_codes:
+                            existing_hash_codes.add(hash_code)
 
             # check if we've reached the bottom
             current_height = page.evaluate("document.body.scrollHeight")

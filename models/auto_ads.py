@@ -63,6 +63,7 @@ class ProspectListings(Base):
     basic_history_check = mapped_column(String)
     mot_status = mapped_column(String)
     mot_expiry = mapped_column(Date)
+    auction_closes = mapped_column(DateTime(True))
     ai_work_and_repairs = mapped_column(String)
     ai_repair_cost = mapped_column(Integer)
     ai_sell_price_low = mapped_column(Integer)

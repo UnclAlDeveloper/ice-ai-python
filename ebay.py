@@ -14,6 +14,7 @@ from sqlalchemy.orm import sessionmaker
 from common import generate_hash_code, get_existing_hash_codes, pause
 from listing_images import download_and_save_listing_images
 from models.auto_ads import ProspectListings
+from resell_analysis import process_resell_analysis_for_listing
 from models.enums import ListingSource, ProspectListingStatus
 
 from ebay_rest import API, Error
@@ -239,6 +240,7 @@ class EbayDownloader(BaseModel):
             "transmission": None,
             "year": None,
             "colour": None,
+            "auction_closes": None,
         }
 
         if self._page is None:
@@ -304,10 +306,42 @@ class EbayDownloader(BaseModel):
                         else:
                             details[key] = value_text
 
+            # extract auction close time from timer module if present (auctions only)
+            timer_el = page.query_selector("span.ux-timer__time-left")
+            if timer_el:
+                time_left_text = timer_el.inner_text().strip()
+                if time_left_text:
+                    parsed = self._parse_auction_close_datetime(time_left_text)
+                    if parsed:
+                        details["auction_closes"] = parsed
+
         except Exception as e:
             print(f"  Warning: Could not extract some listing details: {e}")
 
         return details
+
+    # _PARSE_AUCTION_CLOSE_DATETIME
+    def _parse_auction_close_datetime(self, text: str) -> Optional[datetime]:
+        """
+        Parse auction close datetime from eBay timer format (dd/mm, hh:mi).
+        Returns a datetime or None if parsing fails. Infers year from current date.
+        """
+
+        try:
+            parts = text.split(",")
+            if len(parts) != 2:
+                return None
+            date_part = parts[0].strip()
+            time_part = parts[1].strip()
+            day, month = map(int, date_part.split("/"))
+            hour, minute = map(int, time_part.split(":"))
+            now = datetime.now()
+            parsed = datetime(now.year, month, day, hour, minute, 0, 0)
+            if parsed < now:
+                parsed = datetime(now.year + 1, month, day, hour, minute, 0, 0)
+            return parsed
+        except (ValueError, IndexError):
+            return None
 
     def _extract_listing_images(self) -> list[str]:
         """
@@ -502,6 +536,7 @@ class EbayDownloader(BaseModel):
                                 gearbox_type=details.get("transmission"),
                                 year=details.get("year"),
                                 colour=details.get("colour"),
+                                auction_closes=details.get("auction_closes"),
                                 created_at=current_datetime,
                                 updated_at=current_datetime,
                             )
@@ -512,6 +547,7 @@ class EbayDownloader(BaseModel):
                             session.refresh(prospect_listing)
 
                             # download images after id is known, save to temp dir and s3
+                            temp_image_dir = None
                             if image_urls:
                                 temp_image_dir = download_and_save_listing_images(
                                     image_urls,
@@ -521,8 +557,15 @@ class EbayDownloader(BaseModel):
                                     ListingSource.EBAY,
                                     temp_dir_prefix="ebay_images_",
                                 )
-                                if temp_image_dir and os.path.isdir(temp_image_dir):
-                                    shutil.rmtree(temp_image_dir)
+
+                            # generate and apply resell analysis using temp image directory
+                            prospect_listing = process_resell_analysis_for_listing(
+                                prospect_listing, session, temp_image_dir
+                            )
+
+                            # clean up temp directory after use
+                            if temp_image_dir and os.path.isdir(temp_image_dir):
+                                shutil.rmtree(temp_image_dir)
 
                         # add hash code to existing set to avoid duplicates in this run
                         existing_hash_codes.add(hash_code)

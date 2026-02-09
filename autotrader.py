@@ -1,12 +1,6 @@
-import base64
-import hashlib
 import os
-import random
 import re
-import secrets
 import shutil
-import tempfile
-import time
 from datetime import date, datetime
 from typing import Optional
 
@@ -19,52 +13,10 @@ from playwright.sync_api import Page, sync_playwright
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
-from AWSAccess import AWSAccess
-from models.auto_ads import ProspectListings, Images
-from models.enums import ListingSource, ListingTable, ProspectListingStatus
-
-
-# PAUSE FUNCTION
-def pause(min_seconds: float = 1.0, max_seconds: float = 3.0):
-    """
-    Wait a random amount of time to simulate human browsing behavior.
-    """
-
-    delay = random.uniform(min_seconds, max_seconds)
-    time.sleep(delay)
-
-
-# GET EXISTING HASH CODES
-def get_existing_hash_codes() -> set[str]:
-    """
-    Query database for all existing hash_codes in prospect_listings table.
-    """
-
-    database_url = os.getenv("AUTO_ADS_DATABASE_URL")
-    schema = os.getenv("AUTO_ADS_DATABASE_SCHEMA", "aa")
-
-    engine = create_engine(database_url)
-    with engine.connect() as conn:
-        result = conn.execute(text(f"SELECT hash_code FROM {schema}.prospect_listings"))
-        return {row[0] for row in result}
-
-
-# GENERATE HASH CODE
-def generate_hash_code(short_description: str) -> str:
-    """
-    Generate a 16-character hash code from the short description using MD5.
-    """
-
-    return hashlib.md5(short_description.encode()).hexdigest()[:16]
-
-
-# GENERATE IMAGE HASH
-def generate_image_hash() -> str:
-    """
-    Generate a 16-character random hex string for use as an image filename.
-    """
-
-    return secrets.token_hex(8)
+from common import generate_hash_code, get_existing_hash_codes, pause
+from listing_images import download_and_save_listing_images
+from models.auto_ads import ProspectListings
+from models.enums import ListingSource, ProspectListingStatus
 
 
 # GET SPECS AND FEATURES
@@ -302,10 +254,6 @@ def save_gallery_images(
     gallery_button.click()
     pause(1.0, 2.0)
 
-    # create temporary directory for storing images
-    temp_dir = tempfile.mkdtemp(prefix="autotrader_images_")
-    temp_image_paths = []
-
     # collect unique image urls
     image_urls = []
     seen_urls = set()
@@ -400,13 +348,6 @@ def save_gallery_images(
     # locate all img elements in the gallery
     img_elements = page.locator("img").all()
 
-    # use aws access for saving and retrieving images from s3
-    aws_access = AWSAccess(
-        bucket_name=os.getenv("AUTO_ADS_BUCKET"),
-        media_dir="images",
-        sub_directory_name="prospects",
-    )
-
     for img_element in img_elements:
         try:
             src = img_element.get_attribute("src")
@@ -454,82 +395,15 @@ def save_gallery_images(
                 except Exception:
                     break
 
-    saved_count = 0
-    for index, img_url in enumerate(image_urls):
-        try:
-            # pause between downloading images
-            if index > 0:
-                pause(0.5, 1.5)
-
-            # fetch the image via http request
-            response = page.request.get(img_url)
-            if response.status != 200:
-                print(f"Failed to fetch image {index}: HTTP {response.status}")
-                continue
-
-            image_bytes = response.body()
-
-            # skip if no valid image data
-            if not image_bytes:
-                continue
-
-            # determine file extension from content type or url
-            content_type = response.headers.get("content-type", "")
-            if "jpeg" in content_type or "jpg" in content_type:
-                extension = "jpg"
-            elif "png" in content_type:
-                extension = "png"
-            elif "webp" in content_type:
-                extension = "webp"
-            elif "gif" in content_type:
-                extension = "gif"
-            else:
-                # try to extract from url
-                url_lower = img_url.lower()
-                if ".jpg" in url_lower or ".jpeg" in url_lower:
-                    extension = "jpg"
-                elif ".png" in url_lower:
-                    extension = "png"
-                elif ".webp" in url_lower:
-                    extension = "webp"
-                elif ".gif" in url_lower:
-                    extension = "gif"
-                else:
-                    extension = "jpg"  # default to jpg
-
-            # generate a 16-character random hash for the filename
-            image_hash = generate_image_hash()
-
-            # save to temporary directory
-            temp_file_path = os.path.join(temp_dir, f"{image_hash}.{extension}")
-            with open(temp_file_path, "wb") as f:
-                f.write(image_bytes)
-            temp_image_paths.append(temp_file_path)
-
-            # save to s3
-            aws_access.save_media(image_hash, extension, image_bytes)
-
-            # get the s3 url
-            s3_url = aws_access.get_media_url(image_hash, extension)
-
-            # create images database record
-            image_record = Images(
-                listing_table=ListingTable.PROSPECT,
-                listing_id=prospect_listing.id,
-                listing_source=ListingSource.AUTOTRADER,
-                url=s3_url,
-                is_primary=(index == 0),
-                created_at=datetime.now(),
-            )
-            session.add(image_record)
-            saved_count += 1
-
-        except Exception as e:
-            print(f"Error extracting image {index}: {e}")
-            continue
-
-    # commit all image records
-    session.commit()
+    # download images, save to temp dir and s3, create database records
+    temp_dir = download_and_save_listing_images(
+        image_urls,
+        page,
+        prospect_listing,
+        session,
+        ListingSource.AUTOTRADER,
+        temp_dir_prefix="autotrader_images_",
+    )
 
     # pause before closing gallery
     pause(1.0, 2.0)
@@ -539,10 +413,6 @@ def save_gallery_images(
     if close_button.count() > 0:
         close_button.click()
         pause(0.5, 1.0)
-
-    print(
-        f"Saved {saved_count} images for listing {prospect_listing.id} to S3 and temp directory: {temp_dir}"
-    )
 
     return temp_dir
 

@@ -420,7 +420,7 @@ def save_gallery_images(
 
 
 # READ FULL FOUND LISTING
-def read_full_prospect_listing(page: Page) -> ProspectListings:
+def read_full_prospect_listing(page: Page, expected_short_description: str) -> ProspectListings:
     """
     Extract full listing details from the detail page and return a ProspectListings instance.
     """
@@ -437,6 +437,8 @@ def read_full_prospect_listing(page: Page) -> ProspectListings:
     short_description = (
         short_desc_elem.inner_text() if short_desc_elem.count() > 0 else ""
     )
+    if short_description != expected_short_description:
+        raise Exception(f"Expected short description {expected_short_description}, got {short_description}")
 
     # generate hash code from short description
     hash_code = generate_hash_code(short_description)
@@ -553,10 +555,12 @@ def read_full_prospect_listing(page: Page) -> ProspectListings:
     if owners_div.count() > 0:
         owners_value = owners_div.locator("p").nth(1)
         if owners_value.count() > 0:
-            try:
-                number_of_owners = int(owners_value.inner_text())
-            except ValueError:
-                pass
+            owners_text = owners_value.inner_text()
+            if owners_text.isnumeric():
+                try:
+                    number_of_owners = int(owners_text)
+                except ValueError:
+                    pass
 
     # get service history
     service_history = get_overview_value(page, "service-history")
@@ -901,7 +905,7 @@ def main():
                         pause()
 
                         # extract full listing details
-                        prospect_listing = read_full_prospect_listing(page)
+                        prospect_listing = read_full_prospect_listing(page, short_description)
                         prospect_listings.append(prospect_listing)
 
                         # pause before navigating back

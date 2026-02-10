@@ -105,8 +105,8 @@ class EbayDownloader(BaseModel):
 
         # user configuration for application-only access
         user = {
-            "email_or_username": "TESTUSER_Graeme_Test",
-            "password": "ice-ai9EB",
+            "email_or_username": os.getenv("AUTO_ADS_EBAY_USERNAME"),
+            "password": os.getenv("AUTO_ADS_EBAY_PASSWORD"),
             "refresh_token": "",
             "refresh_token_expiry": "",
         }
@@ -164,6 +164,7 @@ class EbayDownloader(BaseModel):
         """
         Search for van listings on eBay using the Browse API.
         Yields individual listing records as dictionaries.
+        Handles pagination automatically to fetch all available listings.
 
         For local pickup searches, both pickup parameters must be provided together:
         - pickup_postal_code: The postal/zip code for local pickup location
@@ -201,17 +202,23 @@ class EbayDownloader(BaseModel):
         if filters:
             search_params["filter"] = ",".join(filters)
 
+        # only set limit if specified - the API handles pagination automatically
         if self.limit is not None:
             search_params["limit"] = self.limit
 
         # execute search and yield results
+        # the API generator handles pagination automatically, so we just iterate through it
+        records_yielded = 0
         for record in api.buy_browse_search(**search_params):
             if "record" in record:
+                records_yielded += 1
                 yield record["record"]
             elif "total" in record:
                 # metadata record with totals
-                print(f"Total records available: {record['total'].get('records_available', 'unknown')}")
-                print(f"Total records yielded: {record['total'].get('records_yielded', 'unknown')}")
+                total_info = record.get("total", {})
+                print(f"Total records available: {total_info.get('records_available', 'unknown')}")
+
+        print(f"Total records yielded: {records_yielded}")
 
     def _accept_cookie_consent_if_present(self) -> None:
         """
@@ -319,6 +326,47 @@ class EbayDownloader(BaseModel):
             print(f"  Warning: Could not extract some listing details: {e}")
 
         return details
+
+    # _EXTRACT_SELLER_TYPE
+    def _extract_seller_type(self) -> Optional[str]:
+        """
+        Extract the seller type (Private or Business) from the current eBay listing page.
+        Returns "Private" if the seller is a private seller, "Business" if a business,
+        or None if the seller type cannot be determined.
+        """
+
+        if self._page is None:
+            return None
+
+        page = self._page
+
+        try:
+            # look for the seller type span within the seller card
+            seller_type_elements = page.query_selector_all(
+                '.x-sellercard-atf__about-seller-item span.ux-textspans.ux-textspans--SECONDARY'
+            )
+            
+            for element in seller_type_elements:
+                text = element.inner_text().strip()
+                # check if this element contains "Private" or "Business"
+                if text == "Private":
+                    return "Private"
+                elif text == "Business":
+                    return "Business"
+            
+            # alternative selector: direct search for the text
+            seller_info_section = page.query_selector('.x-sellercard-atf__about-seller')
+            if seller_info_section:
+                all_text = seller_info_section.inner_text()
+                if "Private" in all_text:
+                    return "Private"
+                elif "Business" in all_text:
+                    return "Business"
+
+        except Exception as e:
+            print(f"  Warning: Could not extract seller type: {e}")
+
+        return None
 
     # _PARSE_AUCTION_CLOSE_DATETIME
     def _parse_auction_close_datetime(self, text: str) -> Optional[datetime]:
@@ -494,6 +542,12 @@ class EbayDownloader(BaseModel):
                                 pause(0.1, 0.5)
                                 self._accept_cookie_consent_if_present()
 
+                                # check seller type and skip if not private
+                                seller_type = self._extract_seller_type()
+                                if seller_type != "Private" or seller_type is None:
+                                    print(f"  Skipping listing: seller is {seller_type} (not Private)")
+                                    continue
+
                                 # extract full description and item specifics from page
                                 details = self._extract_listing_details()
 
@@ -620,10 +674,10 @@ def main():
     print("=" * 60)
 
     try:
-        # download listings with a limit for testing
+        # download all listings (set limit=None to get all results)
         downloader = EbayDownloader(
             marketplace="GB",
-            limit=50,  # limit for testing, set to None for all
+            limit=None,  # set to None to fetch all available listings
             pickup_postal_code="LS1 3AD",
             pickup_radius=100,
         )

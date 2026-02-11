@@ -287,12 +287,15 @@ def process_resell_analysis_for_listing(
     """
 
     # generate and apply resell analysis using temp image directory
-    resell_analysis = generate_resell_analysis(prospect_listing, temp_image_dir)
-    prospect_listing = apply_resell_analysis(prospect_listing, resell_analysis)
+    try:
+        resell_analysis = generate_resell_analysis(prospect_listing, temp_image_dir)
+        prospect_listing = apply_resell_analysis(prospect_listing, resell_analysis)
 
-    # resave prospect listing to database with ai fields
-    session.add(prospect_listing)
-    session.flush()
-    session.commit()
+        # resave prospect listing to database with ai fields
+        session.add(prospect_listing)
+        session.flush()
+        session.commit()
+    except Exception as e:
+        pass
 
     return prospect_listing

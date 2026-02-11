@@ -420,7 +420,7 @@ def save_gallery_images(
 
 
 # READ FULL FOUND LISTING
-def read_full_prospect_listing(page: Page, expected_short_description: str) -> ProspectListings:
+def read_full_prospect_listing(page: Page, expected_short_description: str) -> Optional[ProspectListings]:
     """
     Extract full listing details from the detail page and return a ProspectListings instance.
     """
@@ -447,22 +447,26 @@ def read_full_prospect_listing(page: Page, expected_short_description: str) -> P
     price_elem = page.get_by_test_id("advert-price")
     price_text = price_elem.inner_text() if price_elem.count() > 0 else ""
 
+    # check that the record has a price and is not an AUCTION
+    if not price_text:
+        print(f"No price found for listing: {make_and_model} - {short_description}")
+        return None
+    if not price_text or price_text == "AUCTION":
+        print(f"Indicates AUCTION listing: {make_and_model} - {short_description}")
+        return None
+
     # parse price components
     currency_symbol = price_text[0] if price_text else None
     asking_price = None
     vat_status = None
 
-    if price_text:
-        # remove currency symbol and parse
-        price_parts = price_text[1:].split(" ", 1)
-        price_value_text = price_parts[0].replace(",", "")
-        try:
-            asking_price = int(price_value_text)
-        except ValueError:
-            asking_price = None
-        # get vat status (everything after the price number)
-        if len(price_parts) > 1:
-            vat_status = price_parts[1].strip()
+    # remove currency symbol and parse
+    price_parts = price_text[1:].split(" ", 1)
+    price_value_text = price_parts[0].replace(",", "")
+    asking_price = int(price_value_text)
+    # get vat status (everything after the price number)
+    if len(price_parts) > 1:
+        vat_status = price_parts[1].strip()
 
     # get location from contact seller section
     location_elem = page.locator('p[class*="sc-1ph9l9h-4"]').first
@@ -893,10 +897,7 @@ def main():
 
                         # check if already processed - stop if duplicate found
                         if hash_code in existing_hash_codes:
-                            print(
-                                f"Found existing listing (hash: {hash_code}), "
-                                "continuing..."
-                            )
+                            print(f"Found existing listing (hash: {hash_code}), skipping...")
                             continue
 
                         # click to navigate to detail page
@@ -906,6 +907,10 @@ def main():
 
                         # extract full listing details
                         prospect_listing = read_full_prospect_listing(page, short_description)
+                        if prospect_listing is None:
+                            print(f"skipping...")
+                            continue
+
                         prospect_listings.append(prospect_listing)
 
                         # pause before navigating back

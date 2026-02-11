@@ -5,6 +5,7 @@ from datetime import date, datetime
 from typing import Optional
 
 from environments import load_environment
+
 load_environment()
 
 from playwright.sync_api import Page, sync_playwright
@@ -26,7 +27,7 @@ from models.enums import ListingSource, ProspectListingStatus
 def get_specs_and_features(page: Page) -> Optional[str]:
     """
     Click the 'View all spec and features' button, expand all accordion sections,
-    and extract all specs and features into markdown     """
+    and extract all specs and features into markdown"""
 
     # try to find and click the "View all spec and features" button
     view_all_button = page.get_by_test_id("view-all-spec-and-features-signpost")
@@ -266,7 +267,8 @@ def save_gallery_images(
     pause(1.0, 2.0)
 
     # find the scrollable container in the gallery (look for common scrollable elements)
-    scrollable_container = page.evaluate("""
+    scrollable_container = page.evaluate(
+        """
         () => {
             // find elements with overflow scroll or auto that have significant height
             const elements = document.querySelectorAll('*');
@@ -281,7 +283,8 @@ def save_gallery_images(
             }
             return false;
         }
-    """)
+    """
+    )
 
     max_scroll_attempts = 20
     scroll_attempts = 0
@@ -293,7 +296,8 @@ def save_gallery_images(
         current_image_count = len(img_elements)
 
         # scroll the scrollable container or window
-        page.evaluate("""
+        page.evaluate(
+            """
             () => {
                 // find and scroll the scrollable container
                 const elements = document.querySelectorAll('*');
@@ -310,14 +314,16 @@ def save_gallery_images(
                 // fallback to window scroll
                 window.scrollBy(0, window.innerHeight);
             }
-        """)
+        """
+        )
         pause(0.5, 1.0)
 
         # wait for potential new images to load
         page.wait_for_timeout(500)
 
         # check if we've reached the bottom of the scrollable container
-        at_bottom = page.evaluate("""
+        at_bottom = page.evaluate(
+            """
             () => {
                 // check scrollable container first
                 const elements = document.querySelectorAll('*');
@@ -333,7 +339,8 @@ def save_gallery_images(
                 // fallback to window check
                 return window.scrollY + window.innerHeight >= document.body.scrollHeight;
             }
-        """)
+        """
+        )
 
         # also check if no new images loaded
         img_elements_after = page.locator("img").all()
@@ -420,7 +427,9 @@ def save_gallery_images(
 
 
 # READ FULL FOUND LISTING
-def read_full_prospect_listing(page: Page, expected_short_description: str) -> Optional[ProspectListings]:
+def read_full_prospect_listing(
+    page: Page, expected_short_description: str
+) -> Optional[ProspectListings]:
     """
     Extract full listing details from the detail page and return a ProspectListings instance.
     """
@@ -438,7 +447,9 @@ def read_full_prospect_listing(page: Page, expected_short_description: str) -> O
         short_desc_elem.inner_text() if short_desc_elem.count() > 0 else ""
     )
     if short_description != expected_short_description:
-        raise Exception(f"Expected short description {expected_short_description}, got {short_description}")
+        raise Exception(
+            f"Expected short description {expected_short_description}, got {short_description}"
+        )
 
     # generate hash code from short description
     hash_code = generate_hash_code(short_description)
@@ -768,9 +779,17 @@ def main():
         if not email:
             raise ValueError("AUTOTRADER_EMAIL not found in environment variables")
 
-        # wait for the email input field to appear and fill it
+        # wait for email input, handling possible 'are you human' verification
         email_input = page.get_by_test_id("enter-email-input")
-        email_input.wait_for(state="visible")
+        try:
+            email_input.wait_for(state="visible", timeout=10000)
+        except Exception:
+            # email input didn't appear quickly, likely an 'are you human' check
+            print(
+                "Waiting for 'are you human' verification to be completed manually..."
+            )
+            email_input.wait_for(state="visible", timeout=300000)
+            print("'Are you human' verification completed")
         email_input.fill(email)
         print(f"Entered email address: {email}")
         pause()
@@ -781,30 +800,39 @@ def main():
         print("Clicked 'Continue' button")
         pause()
 
-        # wait for captcha to be filled in manually
-        print("Waiting for captcha to be filled in...")
-        # wait for the password form to appear (this indicates captcha was completed)
+        # wait for either password form or home page (verification code bypasses password)
+        print(
+            "Waiting for next step (password, captcha, or email verification code)..."
+        )
         password_input = page.get_by_test_id("password-entry-password-input")
-        password_input.wait_for(
-            state="visible", timeout=300000
-        )  # 5 minute timeout for manual captcha
-        print("Password form appeared, captcha completed")
+        home_indicator = page.get_by_test_id("header-saved-icon")
+        next_step = password_input.or_(home_indicator)
+        next_step.wait_for(state="visible", timeout=300000)
 
-        # load password from environment variable
-        password = os.getenv("AUTOTRADER_PASSWORD")
-        if not password:
-            raise ValueError("AUTOTRADER_PASSWORD not found in environment variables")
+        if password_input.is_visible():
+            # normal password flow
+            print("Password form appeared")
 
-        # fill in the password field
-        password_input.fill(password)
-        print("Entered password")
-        pause()
+            # load password from environment variable
+            password = os.getenv("AUTOTRADER_PASSWORD")
+            if not password:
+                raise ValueError(
+                    "AUTOTRADER_PASSWORD not found in environment variables"
+                )
 
-        # click the Sign in button
-        sign_in_button = page.get_by_test_id("password-entry-sign-in-button")
-        sign_in_button.click()
-        print("Clicked 'Sign in' button")
-        pause()
+            # fill in the password field
+            password_input.fill(password)
+            print("Entered password")
+            pause()
+
+            # click the sign in button
+            sign_in_button = page.get_by_test_id("password-entry-sign-in-button")
+            sign_in_button.click()
+            print("Clicked 'Sign in' button")
+            pause()
+        else:
+            # verification code was entered manually, now on home page
+            print("Email verification code flow completed, reached home page")
 
         # click the Saved button
         saved_button = page.get_by_test_id("header-saved-icon")
@@ -897,7 +925,9 @@ def main():
 
                         # check if already processed - stop if duplicate found
                         if hash_code in existing_hash_codes:
-                            print(f"Found existing listing (hash: {hash_code}), skipping...")
+                            print(
+                                f"Found existing listing (hash: {hash_code}), skipping..."
+                            )
                             continue
 
                         # click to navigate to detail page
@@ -906,7 +936,9 @@ def main():
                         pause()
 
                         # extract full listing details
-                        prospect_listing = read_full_prospect_listing(page, short_description)
+                        prospect_listing = read_full_prospect_listing(
+                            page, short_description
+                        )
                         if prospect_listing is None:
                             print(f"skipping...")
                             continue
@@ -925,7 +957,7 @@ def main():
                         pause()
 
                         processed_listing_ids.add(listing_id)
-                        if hash_code not  in existing_hash_codes:
+                        if hash_code not in existing_hash_codes:
                             existing_hash_codes.add(hash_code)
 
             # check if we've reached the bottom

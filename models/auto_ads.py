@@ -1,4 +1,4 @@
-from sqlalchemy import Boolean, CHAR, Column, Date, DateTime, Index, Integer, PrimaryKeyConstraint, SmallInteger, String, UniqueConstraint
+from sqlalchemy import Boolean, CHAR, Column, Date, DateTime, Index, Integer, PrimaryKeyConstraint, SmallInteger, String, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import ENUM
 from sqlalchemy.orm import Mapped, declarative_base, mapped_column
 from sqlalchemy.orm.base import Mapped
@@ -38,7 +38,7 @@ class ProspectListings(Base):
     url = mapped_column(String, nullable=False)
     asking_price = mapped_column(Integer, nullable=False)
     listing_source = mapped_column(ENUM('Autotrader', 'Ebay', 'Facebook', 'Gummtree', 'OnlyVans', name='listing_source', schema='aa'), nullable=False)
-    status = mapped_column(ENUM('New', 'Viewed', 'NotInterested', 'Interested', 'Bought', name='prospect_listing_status', schema='aa'), nullable=False)
+    status = mapped_column(ENUM('New', 'Viewed', 'Not Interested', 'Interested', 'Bought', name='prospect_listing_status', schema='aa'), nullable=False)
     created_at = mapped_column(DateTime(True))
     updated_at = mapped_column(DateTime(True))
     full_description = mapped_column(String)
@@ -78,3 +78,18 @@ class ProspectListings(Base):
     auction_closes = mapped_column(DateTime(True))
     ads_est_buy_price = mapped_column(Integer)
     ads_est_sell_price = mapped_column(Integer)
+
+
+class SavedSearches(Base):
+    __tablename__ = 'saved_searches'
+    __table_args__ = (
+        PrimaryKeyConstraint('id', name='saved_searches_pkey'),
+        UniqueConstraint('user_id', 'query', name='saved_searches_user_id_query_unique'),
+        Index('idx_saved_searches_user_id_last_used_at', 'user_id', 'last_used_at'),
+        {'schema': 'aa'}
+    )
+
+    id = mapped_column(Integer)
+    user_id = mapped_column(String, nullable=False)
+    query = mapped_column(Text, nullable=False)
+    last_used_at = mapped_column(DateTime(True), nullable=False)

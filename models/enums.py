@@ -8,9 +8,9 @@ class ListingSource(StrEnum):
     """
 
     AUTOTRADER = "Autotrader"
-    EBAY = "Ebay"
+    EBAY = "eBay"
     FACEBOOK = "Facebook"
-    GUMMTREE = "Gummtree"
+    GUMTREE = "Gumtree"
     ONLYVANS = "OnlyVans"
 
 

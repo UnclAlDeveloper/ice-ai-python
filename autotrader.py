@@ -831,8 +831,18 @@ def main():
             print("Clicked 'Sign in' button")
             pause()
         else:
-            # verification code was entered manually, now on home page
-            print("Email verification code flow completed, reached home page")
+            # home page header is visible but a focus-locked email verification code
+            # modal may be blocking it — wait for any such modal to be dismissed first
+            focus_lock_modal = page.locator('[data-focus-lock-disabled="false"]')
+            if focus_lock_modal.count() > 0:
+                print(
+                    "Email verification code required. "
+                    "Please enter the code sent to your email in the browser."
+                )
+                focus_lock_modal.wait_for(state="hidden", timeout=300000)
+                print("Email verification code entered, proceeding to home page")
+            else:
+                print("Reached home page")
 
         # click the Saved button
         saved_button = page.get_by_test_id("header-saved-icon")

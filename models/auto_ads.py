@@ -21,6 +21,22 @@ class Images(Base):
     created_at = mapped_column(DateTime(True))
 
 
+class Lookups(Base):
+    __tablename__ = 'lookups'
+    __table_args__ = (
+        PrimaryKeyConstraint('id', name='lookups_pkey'),
+        UniqueConstraint('lookup_type', 'code', name='lookups_type_code_unique'),
+        Index('idx_lookups_type_code_unique', 'lookup_type', 'code'),
+        {'schema': 'aa'}
+    )
+
+    id = mapped_column(Integer)
+    lookup_type = mapped_column(String, nullable=False)
+    code = mapped_column(String, nullable=False)
+    value = mapped_column(String)
+    description = mapped_column(String)
+
+
 class ProspectListings(Base):
     __tablename__ = 'prospect_listings'
     __table_args__ = (
@@ -77,6 +93,8 @@ class ProspectListings(Base):
     auction_closes = mapped_column(DateTime(True))
     ads_est_buy_price = mapped_column(Integer)
     ads_est_sell_price = mapped_column(Integer)
+    ai_target_market = mapped_column(String)
+    ai_niche_market = mapped_column(String)
 
 
 class SavedSearches(Base):

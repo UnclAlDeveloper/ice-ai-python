@@ -608,7 +608,6 @@ class EbayDownloader(BaseModel):
                                     self._page,
                                     prospect_listing,
                                     session,
-                                    ListingSource.EBAY,
                                     temp_dir_prefix="ebay_images_",
                                 )
 

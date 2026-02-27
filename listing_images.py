@@ -20,7 +20,6 @@ def download_and_save_listing_images(
     page: Page,
     prospect_listing: ProspectListings,
     session: "Session",
-    listing_source: ListingSource,
     temp_dir_prefix: str = "listing_images_",
 ) -> Optional[str]:
     """
@@ -103,7 +102,6 @@ def download_and_save_listing_images(
             image_record = Images(
                 listing_table=ListingTable.PROSPECT,
                 listing_id=prospect_listing.id,
-                listing_source=listing_source,
                 url=s3_url,
                 is_primary=(index == 0),
                 created_at=datetime.now(),

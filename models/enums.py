@@ -8,9 +8,11 @@ class ListingSource(StrEnum):
     """
 
     AUTOTRADER = "Autotrader"
+    CAR_AND_CLASSIC = "Car&Classic"
     EBAY = "eBay"
     FACEBOOK = "Facebook"
     GUMTREE = "Gumtree"
+    MANUAL_ENTRY = "ManualEntry"
     ONLYVANS = "OnlyVans"
 
 

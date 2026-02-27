@@ -410,7 +410,6 @@ def save_gallery_images(
         page,
         prospect_listing,
         session,
-        ListingSource.AUTOTRADER,
         temp_dir_prefix="autotrader_images_",
     )
 

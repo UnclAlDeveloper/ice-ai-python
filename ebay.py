@@ -14,7 +14,7 @@ from sqlalchemy.orm import sessionmaker
 from common import generate_hash_code, get_existing_hash_codes, pause
 from listing_images import download_and_save_listing_images
 from models.auto_ads import ProspectListings
-from resell_analysis import process_resell_analysis_for_listing
+from ai_analysis import process_ai_analysis_for_listing
 from models.enums import ListingSource, ProspectListingStatus
 
 from ebay_rest import API, Error
@@ -466,7 +466,7 @@ class EbayDownloader(BaseModel):
         """
 
         # load existing hash codes from database at startup
-        existing_hash_codes = get_existing_hash_codes()
+        existing_hash_codes = get_existing_hash_codes(ListingSource.EBAY)
         print(f"Loaded {len(existing_hash_codes)} existing hash codes from database")
 
         # initialize database session for prospect_listing records
@@ -611,8 +611,8 @@ class EbayDownloader(BaseModel):
                                     temp_dir_prefix="ebay_images_",
                                 )
 
-                            # generate and apply resell analysis using temp image directory
-                            prospect_listing = process_resell_analysis_for_listing(
+                            # generate and apply ai analysis using temp image directory
+                            prospect_listing = process_ai_analysis_for_listing(
                                 prospect_listing, session, temp_image_dir
                             )
 

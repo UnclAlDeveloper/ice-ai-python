@@ -51,9 +51,8 @@ class ProspectListings(Base):
     make_and_model = mapped_column(String, nullable=False)
     short_description = mapped_column(String, nullable=False)
     url = mapped_column(String, nullable=False)
-    asking_price = mapped_column(Integer, nullable=False)
     listing_source = mapped_column(ENUM('Autotrader', 'Car&Classic', 'eBay', 'Facebook', 'Gumtree', 'ManualEntry', 'OnlyVans', name='listing_source', schema='aa'), nullable=False)
-    status = mapped_column(ENUM('New', 'Viewed', 'Not Interested', 'Interested', 'Bought', name='prospect_listing_status', schema='aa'), nullable=False)
+    status = mapped_column(ENUM('New', 'Viewed', 'Not Interested', 'Interested', 'Bought', 'Sold', name='prospect_listing_status', schema='aa'), nullable=False)
     created_at = mapped_column(DateTime(True))
     updated_at = mapped_column(DateTime(True))
     full_description = mapped_column(String)
@@ -62,6 +61,7 @@ class ProspectListings(Base):
     year = mapped_column(Integer)
     registration = mapped_column(String)
     currency_symbol = mapped_column(CHAR(1))
+    asking_price = mapped_column(Integer)
     vat_status = mapped_column(String)
     location = mapped_column(String)
     body_type = mapped_column(String)
@@ -94,7 +94,8 @@ class ProspectListings(Base):
     ads_est_buy_price = mapped_column(Integer)
     ads_est_sell_price = mapped_column(Integer)
     ai_target_market = mapped_column(String)
-    ai_niche_market = mapped_column(String)
+    drive_configuration = mapped_column(String)
+    vrn = mapped_column(String)
 
 
 class SavedSearches(Base):

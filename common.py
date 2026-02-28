@@ -18,9 +18,10 @@ def pause(min_seconds: float = 1.0, max_seconds: float = 3.0):
 
 
 # GET EXISTING HASH CODES
-def get_existing_hash_codes() -> set[str]:
+def get_existing_hash_codes(listing_source: str) -> set[str]:
     """
-    Query database for all existing hash_codes in prospect_listings table.
+    Query database for existing hash_codes in prospect_listings filtered by
+    listing_source and restricted to rows with status 'New' or 'Viewed'.
     """
 
     database_url = os.getenv("AUTO_ADS_DATABASE_URL")
@@ -28,7 +29,14 @@ def get_existing_hash_codes() -> set[str]:
 
     engine = create_engine(database_url)
     with engine.connect() as conn:
-        result = conn.execute(text(f"SELECT hash_code FROM {schema}.prospect_listings"))
+        result = conn.execute(
+            text(
+                f"SELECT hash_code FROM {schema}.prospect_listings "
+                f"WHERE listing_source = :listing_source "
+                f"AND status IN ('New', 'Viewed')"
+            ),
+            {"listing_source": listing_source},
+        )
         return {row[0] for row in result}
 
 

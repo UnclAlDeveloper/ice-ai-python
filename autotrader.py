@@ -14,10 +14,10 @@ from sqlalchemy.orm import sessionmaker
 
 from common import generate_hash_code, get_existing_hash_codes, pause
 from listing_images import download_and_save_listing_images
-from resell_analysis import (
-    apply_resell_analysis,
-    generate_resell_analysis,
-    process_resell_analysis_for_listing,
+from ai_analysis import (
+    apply_ai_analysis,
+    generate_ai_analysis,
+    process_ai_analysis_for_listing,
 )
 from models.auto_ads import ProspectListings
 from models.enums import ListingSource, ProspectListingStatus
@@ -654,8 +654,8 @@ def read_full_prospect_listing(
         # save gallery images after listing is committed
         temp_image_dir = save_gallery_images(page, prospect_listing, session)
 
-        # generate and apply resell analysis using temp image directory
-        prospect_listing = process_resell_analysis_for_listing(
+        # generate and apply ai analysis using temp image directory
+        prospect_listing = process_ai_analysis_for_listing(
             prospect_listing, session, temp_image_dir
         )
 
@@ -671,51 +671,6 @@ def read_full_prospect_listing(
     return prospect_listing
 
 
-# REGENERATE ALL RESELL ANALYSES
-def regenerate_all_resell_analyses():
-    """
-    Iterate through all rows in prospect_listings table and regenerate the
-    resell analysis for each one using the AI model.
-    """
-
-    # load environment variables
-    load_environment()
-
-    database_url = os.getenv("AUTO_ADS_DATABASE_URL")
-    engine = create_engine(database_url)
-    SessionLocal = sessionmaker(bind=engine)
-
-    with SessionLocal() as session:
-        # query all prospect listings
-        prospect_listings = session.query(ProspectListings).all()
-        total_count = len(prospect_listings)
-        print(f"Found {total_count} prospect listings to process")
-
-        for index, prospect_listing in enumerate(prospect_listings, start=1):
-            try:
-                print(
-                    f"Processing {index}/{total_count}: {prospect_listing.make_and_model} "
-                    f"(ID: {prospect_listing.id})"
-                )
-
-                # generate resell analysis (no images available for existing listings)
-                resell_analysis = generate_resell_analysis(prospect_listing, None)
-
-                # apply the analysis to update the AI fields
-                apply_resell_analysis(prospect_listing, resell_analysis)
-
-                # commit changes for this listing
-                session.commit()
-                print(f"  Successfully updated listing {prospect_listing.id}")
-
-            except Exception as e:
-                print(f"  Error processing listing {prospect_listing.id}: {e}")
-                session.rollback()
-                continue
-
-    print(f"Finished processing {total_count} prospect listings")
-
-
 def main():
     """
     Navigate to autotrader.co.uk using Playwright with visible browser.
@@ -725,7 +680,7 @@ def main():
     load_environment()
 
     # load existing hash codes from database at startup
-    existing_hash_codes = get_existing_hash_codes()
+    existing_hash_codes = get_existing_hash_codes(ListingSource.AUTOTRADER)
     print(f"Loaded {len(existing_hash_codes)} existing hash codes from database")
 
     with sync_playwright() as p:

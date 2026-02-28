@@ -1,5 +1,7 @@
 import os
 import re
+import shutil
+import tempfile
 from datetime import date
 from typing import TYPE_CHECKING, Optional
 
@@ -8,15 +10,20 @@ from google import genai
 if TYPE_CHECKING:
     from sqlalchemy.orm import Session
 from google.genai import types
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 
-from models.auto_ads import ProspectListings
+from AWSAccess import AWSAccess
+from environments import load_environment
+from models.auto_ads import Images, ProspectListings
+from models.enums import ListingTable
 
 
 # CONVERT FOUND LISTING TO MARKDOWN
 def convert_prospect_listing_to_markdown(prospect_listing: ProspectListings) -> str:
     """
     Convert a ProspectListings object to a markdown formatted string for use in
-    resell analysis prompts.
+    ai analysis prompts.
     """
 
     # helper function to format optional values
@@ -103,32 +110,32 @@ def convert_prospect_listing_to_markdown(prospect_listing: ProspectListings) -> 
     return "\n".join(markdown_parts)
 
 
-# GENERATE RESELL ANALYSIS
-def generate_resell_analysis(
-    prospect_listing: ProspectListings, temp_image_dir: Optional[str] = None
+# GENERATE AI ANALYSIS
+def generate_ai_analysis(
+    prompt_filename: str, prospect_listing: ProspectListings, temp_image_dir: Optional[str] = None
 ) -> str:
     """
-    Generate resell analysis for a found listing using Google Gemini API.
-    Reads the resell prompt template, converts the listing to markdown,
+    Generate ai analysis for a found listing using Google Gemini API.
+    Reads the ai prompt template, converts the listing to markdown,
     and sends it to Gemini for analysis along with any images from the temp directory.
     """
 
     # get the directory where this script is located
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    resell_prompt_path = os.path.join(script_dir, "resell_prompt.md")
+    prompt_path = os.path.join(script_dir, prompt_filename)
 
-    # read the resell prompt template
-    with open(resell_prompt_path, "r", encoding="utf-8") as f:
-        resell_prompt = f.read()
+    # read the prompt template
+    with open(prompt_path, "r", encoding="utf-8") as f:
+        prompt = f.read()
 
     # substitute {date} placeholder with current date
-    resell_prompt = resell_prompt.replace("{date}", date.today().strftime("%Y-%m-%d"))
+    prompt = prompt.replace("{date}", date.today().strftime("%Y-%m-%d"))
 
     # convert found listing to markdown
     listing_markdown = convert_prospect_listing_to_markdown(prospect_listing)
 
-    # append the listing markdown to the resell prompt
-    full_prompt = resell_prompt + "\n\n" + listing_markdown
+    # append the listing markdown to the prompt
+    full_prompt = prompt + "\n\n" + listing_markdown
 
     # get API key and model name from environment variables
     api_key = os.getenv("AUTO_ADS_GOOGLE_API_KEY")
@@ -184,12 +191,12 @@ def generate_resell_analysis(
     return response.text
 
 
-# APPLY RESELL ANALYSIS
-def apply_resell_analysis(
-    prospect_listing: ProspectListings, resell_analysis: str
+# APPLY AI ANALYSIS
+def apply_ai_analysis(
+    prospect_listing: ProspectListings, ai_analysis: str
 ) -> ProspectListings:
     """
-    Parse the markdown resell analysis and populate the AI-generated fields
+    Parse the markdown ai analysis and populate the AI-generated fields
     on the prospect_listing object. Returns the updated prospect_listing.
     """
 
@@ -215,7 +222,7 @@ def apply_resell_analysis(
         return None
 
     # strip markdown code fence if present
-    analysis = resell_analysis.strip()
+    analysis = ai_analysis.strip()
     if analysis.startswith("```markdown"):
         analysis = analysis[len("```markdown") :].strip()
     elif analysis.startswith("```"):
@@ -238,6 +245,10 @@ def apply_resell_analysis(
     # extract campervan conversion section
     campervan_conversion = extract_section(analysis, "Campervan Conversion")
     prospect_listing.ai_campervan_conversion = campervan_conversion if campervan_conversion else None
+
+    # extract market section
+    market = extract_section(analysis, "Market")
+    prospect_listing.ai_target_market = market if market else None
 
     # extract price ranges section
     price_section = extract_section(analysis, "Price ranges")
@@ -274,22 +285,22 @@ def apply_resell_analysis(
 
 
 # PROCESS RESELL ANALYSIS FOR LISTING
-def process_resell_analysis_for_listing(
+def process_ai_analysis_for_listing(
     prospect_listing: ProspectListings,
     session: "Session",
     temp_image_dir: Optional[str] = None,
 ) -> ProspectListings:
     """
-    Generate resell analysis, apply it to the prospect listing, flush and commit
+    Generate ai analysis, apply it to the prospect listing, flush and commit
     the session, and clean up the temp image directory. Returns the updated listing.
     Use this after saving a prospect listing and its images to run the full
-    resell analysis workflow.
+    ai analysis workflow.
     """
 
-    # generate and apply resell analysis using temp image directory
+    # generate and apply ai analysis using temp image directory
     try:
-        resell_analysis = generate_resell_analysis(prospect_listing, temp_image_dir)
-        prospect_listing = apply_resell_analysis(prospect_listing, resell_analysis)
+        ai_analysis = generate_ai_analysis(prospect_listing, temp_image_dir)
+        prospect_listing = apply_ai_analysis(prospect_listing, ai_analysis)
 
         # resave prospect listing to database with ai fields
         session.add(prospect_listing)
@@ -299,3 +310,78 @@ def process_resell_analysis_for_listing(
         pass
 
     return prospect_listing
+
+
+# REGENERATE ALL AI ANALYSES
+def regenerate_all_ai_analyses(prompt_filename: str, listing_source: str):
+    """
+    Iterate through all prospect_listings for a given listing source and
+    regenerate the ai analysis for each one using the AI model.
+    """
+
+    load_environment()
+
+    database_url = os.getenv("AUTO_ADS_DATABASE_URL")
+    engine = create_engine(database_url)
+    SessionLocal = sessionmaker(bind=engine)
+
+    with SessionLocal() as session:
+        prospect_listings = (
+            session.query(ProspectListings)
+            .filter(ProspectListings.listing_source == listing_source)
+            .all()
+        )
+        total_count = len(prospect_listings)
+        print(f"Found {total_count} prospect listings to process")
+
+        aws_access = AWSAccess(
+            bucket_name=os.getenv("AUTO_ADS_BUCKET"),
+            media_dir="images",
+            sub_directory_name="prospects",
+        )
+
+        for index, prospect_listing in enumerate(prospect_listings, start=1):
+            temp_image_dir = None
+            try:
+                print(
+                    f"Processing {index}/{total_count}: {prospect_listing.make_and_model} "
+                    f"(ID: {prospect_listing.id})"
+                )
+
+                # download images from s3 into a temporary directory
+                image_records = (
+                    session.query(Images)
+                    .filter(
+                        Images.listing_id == prospect_listing.id,
+                        Images.listing_table == ListingTable.PROSPECT,
+                    )
+                    .all()
+                )
+
+                if image_records:
+                    temp_image_dir = tempfile.mkdtemp(prefix="ai_analysis_images_")
+                    for img in image_records:
+                        # extract hash name and extension from the s3 url
+                        filename = img.url.rsplit("/", 1)[-1]
+                        name, ext = os.path.splitext(filename)
+                        ext = ext.lstrip(".")
+                        local_path = os.path.join(temp_image_dir, filename)
+                        aws_access.download_media_to_file(name, local_path, ext)
+
+                ai_analysis = generate_ai_analysis(
+                    prompt_filename, prospect_listing, temp_image_dir
+                )
+                apply_ai_analysis(prospect_listing, ai_analysis)
+
+                session.commit()
+                print(f"  Successfully updated listing {prospect_listing.id}")
+
+            except Exception as e:
+                print(f"  Error processing listing {prospect_listing.id}: {e}")
+                session.rollback()
+                continue
+            finally:
+                if temp_image_dir and os.path.isdir(temp_image_dir):
+                    shutil.rmtree(temp_image_dir)
+
+    print(f"Finished processing {total_count} prospect listings")

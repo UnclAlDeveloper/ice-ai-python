@@ -95,7 +95,6 @@ class ProspectListings(Base):
     ads_est_sell_price = mapped_column(Integer)
     ai_target_market = mapped_column(String)
     drive_configuration = mapped_column(String)
-    vrn = mapped_column(String)
 
 
 class SavedSearches(Base):

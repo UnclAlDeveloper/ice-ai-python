@@ -24,7 +24,7 @@ ICON_TO_FIELD = {
     "fuel": "fuel_type",
     "engine": "engine_size",
     "calendar": "year",
-    "vrm": "vrn",
+    "vrm": "registration",
     "colour": "colour",
 }
 
@@ -147,7 +147,7 @@ def extract_listing_details(
     fuel_type = None
     engine_size = None
     year = None
-    vrn = None
+    registration = None
     colour = None
     drive_configuration = None
     location = None
@@ -173,8 +173,8 @@ def extract_listing_details(
                 fuel_type = value
             elif field == "engine_size":
                 engine_size = value
-            elif field == "vrn":
-                vrn = value
+            elif field == "registration":
+                registration = value
             elif field == "colour":
                 colour = value
             elif field == "drive_configuration":
@@ -245,7 +245,7 @@ def extract_listing_details(
         fuel_type=fuel_type,
         engine_size=engine_size,
         year=year,
-        vrn=vrn,
+        registration=registration,
         colour=colour,
         drive_configuration=drive_configuration,
         location=location,

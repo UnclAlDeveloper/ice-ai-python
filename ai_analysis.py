@@ -255,19 +255,19 @@ def apply_ai_analysis(
     if price_section:
         # parse each price line
         low_buy_match = re.search(
-            r"Low buy price:\s*(£[\d,]+)", price_section, re.IGNORECASE
+            r"\*{0,2}Low buy price:?\*{0,2}:?\s*(£[\d,]+)", price_section, re.IGNORECASE
         )
         high_buy_match = re.search(
-            r"High buy price:\s*(£[\d,]+)", price_section, re.IGNORECASE
+            r"\*{0,2}High buy price:?\*{0,2}:?\s*(£[\d,]+)", price_section, re.IGNORECASE
         )
         repair_cost_match = re.search(
-            r"Expected repair cost:\s*(£[\d,]+)", price_section, re.IGNORECASE
+            r"\*{0,2}Expected repair cost:?\*{0,2}:?\s*(£[\d,]+)", price_section, re.IGNORECASE
         )
         low_sell_match = re.search(
-            r"Low sell price:\s*(£[\d,]+)", price_section, re.IGNORECASE
+            r"\*{0,2}Low sell price:?\*{0,2}:?\s*(£[\d,]+)", price_section, re.IGNORECASE
         )
         high_sell_match = re.search(
-            r"High sell price:\s*(£[\d,]+)", price_section, re.IGNORECASE
+            r"\*{0,2}High sell price:?\*{0,2}:?\s*(£[\d,]+)", price_section, re.IGNORECASE
         )
         prospect_listing.ai_buy_price_low = parse_price(low_buy_match.group(1)) if low_buy_match else None
         prospect_listing.ai_buy_price_high = parse_price(high_buy_match.group(1)) if high_buy_match else None

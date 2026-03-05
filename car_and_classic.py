@@ -317,7 +317,7 @@ def scrape_listings(page: Page):
 
             # click into the listing detail page
             articles.nth(i).locator("a").first.click()
-            page.wait_for_load_state("networkidle")
+            page.wait_for_selector("section h1", state="visible", timeout=15000)
             pause()
 
             prospect_listing, image_urls = extract_listing_details(page, hash_code)
@@ -359,7 +359,9 @@ def scrape_listings(page: Page):
 
             # navigate back to the search results
             page.go_back()
-            page.wait_for_load_state("networkidle")
+            page.wait_for_selector(
+                '[data-testid="card-listing"]', state="attached", timeout=15000
+            )
             pause()
 
         # new-vehicles section has no pagination, so stop after one pass
@@ -370,7 +372,9 @@ def scrape_listings(page: Page):
         next_button = page.locator("a[data-next-page]")
         if next_button.is_visible():
             next_button.click()
-            page.wait_for_load_state("networkidle")
+            page.wait_for_selector(
+                '[data-testid="card-listing"]', state="attached", timeout=15000
+            )
             page_number += 1
         else:
             break
@@ -401,15 +405,24 @@ def car_and_classic():
 
         login(page)
 
+        # wait for login to complete before navigating
+        page.wait_for_load_state("load")
+
         # navigate to saved searches
         pause()
         page.goto("https://www.carandclassic.com/account/saved")
-        page.wait_for_load_state("networkidle")
+        page.wait_for_load_state("load")
 
         # click the first saved search link
         pause()
-        page.locator(".grid.grid-cols-2 > a").first.click()
-        page.wait_for_load_state("networkidle")
+        saved_search_link = page.locator(".grid a").first
+        saved_search_link.wait_for(state="visible")
+        saved_search_link.click()
+
+        # vue uses client-side routing so load events don't fire; wait for content
+        page.wait_for_selector(
+            '[data-testid="card-listing"]', state="attached", timeout=15000
+        )
 
         scrape_listings(page)
 

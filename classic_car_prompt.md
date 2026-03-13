@@ -1,6 +1,7 @@
 Based on the following description and attached images of a classic car what would you estimate the likely cost of the 
 work and repairs to be, and if intending to resell this car what would be a good price to buy it at and what would be a 
-good price to sell it at?  What would be the market for the car?
+good price to sell it at?  What would be the target market for the car and what improvements could be made to the car in 
+order to increase it's resell value beyond the cost of the improvements?
 
 Estimate the work and repair costs on a retail basis.
 
@@ -23,6 +24,11 @@ Item | Estimated Cost | Why it's needed
 # Notes
  (Advice on specific things that are notable, or to look out for, in point form.  Include anything particular
  that is noticed in the images and the buyer or mechanic should be aware of.  Only include essential and useful information)
+
+# Value added improvements
+(A list of improvements that could be made to the car to increase it's resell value beyond the cost of the improvements.
+This should emphasize improvements not included in previous sections such as the *Notes* section but also repeat thos
+improvements)
 
 # Market
 (The customer who would be a target market for this car.  Also include a second paragraph with possible niche markets 

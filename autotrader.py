@@ -656,7 +656,7 @@ def read_full_prospect_listing(
 
         # generate and apply ai analysis using temp image directory
         prospect_listing = process_ai_analysis_for_listing(
-            prospect_listing, session, temp_image_dir
+            "van_prompt.md", prospect_listing, session, temp_image_dir
         )
 
         # clean up temp directory after use

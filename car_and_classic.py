@@ -5,7 +5,6 @@ from datetime import date, datetime
 from typing import Optional
 
 from environments import load_environment
-
 load_environment()
 
 from playwright.sync_api import Page, sync_playwright

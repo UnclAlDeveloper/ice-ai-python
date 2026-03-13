@@ -5,6 +5,9 @@ import tempfile
 from datetime import date
 from typing import TYPE_CHECKING, Optional
 
+from environments import load_environment
+load_environment()
+
 from google import genai
 
 if TYPE_CHECKING:
@@ -242,6 +245,10 @@ def apply_ai_analysis(
     notes = extract_section(analysis, "Notes")
     prospect_listing.ai_resell_notes = notes if notes else None
 
+    # extract value added improvements section
+    value_add = extract_section(analysis, "Value added improvements")
+    prospect_listing.ai_value_add_improvements = value_add if value_add else None
+
     # extract campervan conversion section
     campervan_conversion = extract_section(analysis, "Campervan Conversion")
     prospect_listing.ai_campervan_conversion = campervan_conversion if campervan_conversion else None
@@ -284,8 +291,9 @@ def apply_ai_analysis(
     return prospect_listing
 
 
-# PROCESS RESELL ANALYSIS FOR LISTING
+# PROCESS AI ANALYSIS FOR LISTING
 def process_ai_analysis_for_listing(
+    prompt_filename: str,
     prospect_listing: ProspectListings,
     session: "Session",
     temp_image_dir: Optional[str] = None,
@@ -299,7 +307,7 @@ def process_ai_analysis_for_listing(
 
     # generate and apply ai analysis using temp image directory
     try:
-        ai_analysis = generate_ai_analysis(prospect_listing, temp_image_dir)
+        ai_analysis = generate_ai_analysis(prompt_filename, prospect_listing, temp_image_dir)
         prospect_listing = apply_ai_analysis(prospect_listing, ai_analysis)
 
         # resave prospect listing to database with ai fields
@@ -313,10 +321,11 @@ def process_ai_analysis_for_listing(
 
 
 # REGENERATE ALL AI ANALYSES
-def regenerate_all_ai_analyses(prompt_filename: str, listing_source: str):
+def regenerate_all_ai_analyses(prompt_filename: str, listing_source: str, skip_rows: int = 0):
     """
     Iterate through all prospect_listings for a given listing source and
-    regenerate the ai analysis for each one using the AI model.
+    regenerate the ai analysis for each one using the AI model. Rows are
+    ordered by id and the first skip_rows rows are skipped.
     """
 
     load_environment()
@@ -329,6 +338,8 @@ def regenerate_all_ai_analyses(prompt_filename: str, listing_source: str):
         prospect_listings = (
             session.query(ProspectListings)
             .filter(ProspectListings.listing_source == listing_source)
+            .order_by(ProspectListings.id)
+            .offset(skip_rows)
             .all()
         )
         total_count = len(prospect_listings)
@@ -385,3 +396,7 @@ def regenerate_all_ai_analyses(prompt_filename: str, listing_source: str):
                     shutil.rmtree(temp_image_dir)
 
     print(f"Finished processing {total_count} prospect listings")
+
+
+if __name__ == "__main__":
+    regenerate_all_ai_analyses("classic_car_prompt.md", "Car&Classic", 30)

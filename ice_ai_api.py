@@ -1,10 +1,13 @@
 import hashlib
 import os
 from typing import Optional
+from urllib.parse import urlencode
 
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from intuitlib.client import AuthClient
 
+from common import save_oauth_tokens
 from environments import load_environment
 
 load_environment()
@@ -204,6 +207,37 @@ async def autoads_ebay_marketplace_account_deletion_notification(
     )
 
 
+# QUICKBOOKS CONNECT
+@app.get("/quickbooks-connect")
+async def quickbooks_connect() -> RedirectResponse:
+    """
+    Initiate the QuickBooks OAuth flow by redirecting to Intuit's authorisation page.
+    After the user authorises, Intuit redirects back to /quickbooks-redirect with
+    the authorisation code and realmId (company ID).
+    """
+
+    client_id = os.getenv("ICE_AI_QUICKBOOKS_CLIENT_ID")
+    redirect_uri = os.getenv("ICE_AI_QUICKBOOKS_REDIRECT_URL")
+    if not client_id or not redirect_uri:
+        raise HTTPException(
+            status_code=500,
+            detail="ICE_AI_QUICKBOOKS_CLIENT_ID or ICE_AI_QUICKBOOKS_REDIRECT_URL not configured",
+        )
+
+    # build the intuit oauth2 authorisation url
+    params = urlencode({
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "scope": "com.intuit.quickbooks.accounting",
+        "state": "ice-ai-connect",
+    })
+    auth_url = f"https://appcenter.intuit.com/connect/oauth2?{params}"
+
+    print(f"Redirecting to QuickBooks OAuth: {auth_url}")
+    return RedirectResponse(url=auth_url)
+
+
 # QUICKBOOKS REDIRECT
 @app.get("/quickbooks-redirect")
 async def quickbooks_redirect(
@@ -215,11 +249,10 @@ async def quickbooks_redirect(
 ) -> HTMLResponse:
     """
     Handle the OAuth redirect callback from Intuit/QuickBooks.
-    Intuit redirects here after the user authorises the application, providing an authorisation
-    code (and realmId) that can be exchanged for access and refresh tokens.
+    Exchanges the authorisation code for access and refresh tokens, then stores
+    them in the database for use by other processes.
     """
 
-    # print every query parameter received from Intuit
     print("QuickBooks redirect received - parameters:")
     print(f"  code: {code[:20]}..." if code and len(code) > 20 else f"  code: {code}")
     print(f"  realmId (company ID): {realmId}")
@@ -227,7 +260,7 @@ async def quickbooks_redirect(
     print(f"  error: {error}")
     print(f"  error_description: {error_description}")
 
-    # handle error response from Intuit
+    # handle error response from intuit
     if error:
         error_msg = error_description or error
         raise HTTPException(
@@ -235,15 +268,90 @@ async def quickbooks_redirect(
             detail=f"QuickBooks authorisation failed: {error_msg}",
         )
 
-    # validate required authorisation code
     if not code:
         raise HTTPException(
             status_code=400,
             detail="Missing authorisation code from QuickBooks",
         )
 
-    # return success page to user
-    return HTMLResponse(content="QuickBooks authorization token received.", status_code=200)
+    # exchange the authorisation code for access and refresh tokens
+    client_id = os.getenv("ICE_AI_QUICKBOOKS_CLIENT_ID")
+    client_secret = os.getenv("ICE_AI_QUICKBOOKS_CLIENT_SECRET")
+    redirect_uri = os.getenv("ICE_AI_QUICKBOOKS_REDIRECT_URL")
+
+    if not client_id or not client_secret or not redirect_uri:
+        raise HTTPException(
+            status_code=500,
+            detail="QuickBooks client credentials or redirect URL not configured",
+        )
+
+    auth_client = AuthClient(
+        client_id=client_id,
+        client_secret=client_secret,
+        environment="production",
+        redirect_uri=redirect_uri,
+    )
+
+    try:
+        auth_client.get_bearer_token(code, realm_id=realmId)
+    except Exception as e:
+        print(f"QuickBooks token exchange failed: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to exchange authorisation code for tokens: {e}",
+        )
+
+    print(f"QuickBooks token exchange successful for realmId: {realmId}")
+
+    # persist tokens to the database
+    save_oauth_tokens(
+        provider="quickbooks",
+        account_id=realmId,
+        access_token=auth_client.access_token,
+        refresh_token=auth_client.refresh_token,
+    )
+
+    # return success page confirming the connection
+    html_content = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>QuickBooks - Connected</title>
+        <style>
+            body {{
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                display: flex;
+                justify-content: center;
+                align-items: center;
+                height: 100vh;
+                margin: 0;
+                background: linear-gradient(135deg, #2CA01C 0%, #0077C5 100%);
+            }}
+            .container {{
+                background: white;
+                padding: 40px;
+                border-radius: 10px;
+                box-shadow: 0 10px 40px rgba(0, 0, 0, 0.2);
+                text-align: center;
+                max-width: 500px;
+            }}
+            h1 {{ color: #333; margin-bottom: 10px; }}
+            p {{ color: #666; line-height: 1.6; }}
+            .success {{ color: #2CA01C; font-size: 48px; margin-bottom: 20px; }}
+            .detail {{ font-family: monospace; color: #888; font-size: 14px; margin-top: 16px; }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="success">&#10003;</div>
+            <h1>QuickBooks Connected</h1>
+            <p>Tokens have been exchanged and saved to the database. You can close this window.</p>
+            <p class="detail">Company ID: {realmId or 'N/A'}</p>
+        </div>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html_content)
 
 
 # HEALTH CHECK
@@ -269,6 +377,8 @@ async def root() -> dict:
         "endpoints": [
             "/auto-ads-ebay-redirect",
             "/autoads-ebay-marketplace-account-deletion",
+            "/quickbooks-connect",
+            "/quickbooks-redirect",
             "/health",
         ],
     }

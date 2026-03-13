@@ -7,35 +7,47 @@ from intuitlib.client import AuthClient
 from quickbooks import QuickBooks
 from quickbooks.objects.account import Account
 
-# read credentials from environment (set in .env.dev or .env.prod)
+from common import get_oauth_tokens, save_oauth_tokens
+
+# read static app credentials from environment
 client_id = os.getenv("ICE_AI_QUICKBOOKS_CLIENT_ID")
 client_secret = os.getenv("ICE_AI_QUICKBOOKS_CLIENT_SECRET")
-refresh_token = os.getenv("ICE_AI_QUICKBOOKS_REFRESH_TOKEN")
-company_id = os.getenv("ICE_AI_QUICKBOOKS_COMPANY_ID")
+redirect_uri = os.getenv("ICE_AI_QUICKBOOKS_REDIRECT_URL")
 
-# fail fast with clear messages if required values are missing
 if not client_id or not client_secret:
     raise ValueError(
         "QuickBooks credentials missing. Set ICE_AI_QUICKBOOKS_CLIENT_ID and "
         "ICE_AI_QUICKBOOKS_CLIENT_SECRET in your .env file (e.g. .env.dev)."
     )
-if not refresh_token or refresh_token == "REFRESH_TOKEN":
+if not redirect_uri:
     raise ValueError(
-        "QuickBooks refresh token missing. Set ICE_AI_QUICKBOOKS_REFRESH_TOKEN. "
-        "Obtain it by completing the OAuth flow: open the authorize URL in a browser, "
-        "sign in, then use the callback code to exchange for tokens (see intuitlib/QuickBooks SDK docs)."
-    )
-if not company_id or company_id == "COMPANY_ID":
-    raise ValueError(
-        "QuickBooks company ID missing. Set ICE_AI_QUICKBOOKS_COMPANY_ID. "
-        "This is the realm_id returned in the OAuth callback when you connect a company."
+        "QuickBooks redirect URL missing. Set ICE_AI_QUICKBOOKS_REDIRECT_URL "
+        "in your .env file (e.g. .env.dev)."
     )
 
+# load tokens and company id from the database
+tokens = get_oauth_tokens("quickbooks")
+if not tokens or not tokens.refresh_token:
+    raise ValueError(
+        f"QuickBooks tokens not found in the database. Complete the OAuth flow "
+        f"by visiting {ICE_AI_QUICKBOOKS_REDIRECT_URL}"
+    )
+
+refresh_token = tokens.refresh_token
+company_id = tokens.account_id
+
+if not company_id:
+    raise ValueError(
+        "QuickBooks company ID (account_id) is missing from the database. "
+        "Re-run the OAuth flow via /quickbooks-connect."
+    )
+
+# set up the auth client and quickbooks api client
 auth_client = AuthClient(
     client_id=client_id,
     client_secret=client_secret,
     environment="production",
-    redirect_uri="http://localhost:8005/quickbooks-redirect",
+    redirect_uri=redirect_uri,
 )
 
 client = QuickBooks(
@@ -49,5 +61,14 @@ try:
     print(f"Retrieved {len(accounts)} account(s).")
 except Exception as e:
     print(f"QuickBooks API error: {e}")
+finally:
+    # persist the potentially refreshed token back to the database
+    if auth_client.refresh_token and auth_client.refresh_token != refresh_token:
+        save_oauth_tokens(
+            provider="quickbooks",
+            refresh_token=auth_client.refresh_token,
+            access_token=auth_client.access_token,
+        )
+        print("Updated refresh token saved to database.")
 
 pass

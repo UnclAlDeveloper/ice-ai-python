@@ -3,8 +3,13 @@ import os
 import random
 import secrets
 import time
+from datetime import datetime, timezone
+from typing import Optional
 
 from sqlalchemy import create_engine, text
+from sqlalchemy.orm import Session
+
+from models.ice_ai import OauthTokens
 
 
 # PAUSE
@@ -56,3 +61,58 @@ def generate_image_hash() -> str:
     """
 
     return secrets.token_hex(8)
+
+
+# GET OAUTH TOKENS
+def get_oauth_tokens(provider: str) -> Optional[OauthTokens]:
+    """
+    Read OAuth token data for a provider from the ia.oauth_tokens table.
+    Returns an OauthTokens instance, or None if no row exists.
+    """
+
+    database_url = os.getenv("ICE_AI_DATABASE_URL")
+
+    engine = create_engine(database_url)
+    with Session(engine) as session:
+        return session.get(OauthTokens, provider)
+
+
+# SAVE OAUTH TOKENS
+def save_oauth_tokens(
+    provider: str,
+    account_id: Optional[str] = None,
+    access_token: Optional[str] = None,
+    access_token_expiry: Optional[datetime] = None,
+    refresh_token: Optional[str] = None,
+    refresh_token_expiry: Optional[datetime] = None,
+) -> None:
+    """
+    Upsert OAuth token data for a provider into the ia.oauth_tokens table.
+    Only non-None fields are updated so callers can update individual
+    columns without overwriting others.
+    """
+
+    database_url = os.getenv("ICE_AI_DATABASE_URL")
+
+    engine = create_engine(database_url)
+    with Session(engine) as session:
+        existing = session.get(OauthTokens, provider)
+
+        if existing is None:
+            existing = OauthTokens(provider=provider)
+            session.add(existing)
+
+        # only overwrite fields that the caller explicitly provided
+        if account_id is not None:
+            existing.account_id = account_id
+        if access_token is not None:
+            existing.access_token = access_token
+        if access_token_expiry is not None:
+            existing.access_token_expiry = access_token_expiry
+        if refresh_token is not None:
+            existing.refresh_token = refresh_token
+        if refresh_token_expiry is not None:
+            existing.refresh_token_expiry = refresh_token_expiry
+
+        existing.updated_at = datetime.now(timezone.utc)
+        session.commit()

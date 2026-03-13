@@ -1,8 +1,8 @@
 """
 Synchronize ICE AI database models using sqlacodegen-v2.
 
-Generates SQLAlchemy 2.0 dataclass models from the anna-trainer and auto-ads
-databases and saves them to the python/models directory.
+Generates SQLAlchemy 2.0 dataclass models from the ice-ai, anna-trainer,
+and auto-ads databases and saves them to the python/models directory.
 """
 
 import os
@@ -169,6 +169,8 @@ def main() -> int:
     load_environment()
 
     # get database configuration from environment
+    ice_ai_url = os.getenv("ICE_AI_DATABASE_URL")
+    ice_ai_schema = os.getenv("ICE_AI_DATABASE_SCHEMA")
     anna_trainer_url = os.getenv("ANNA_TRAINER_DATABASE_URL")
     anna_trainer_schema = os.getenv("ANNA_TRAINER_DATABASE_SCHEMA")
     auto_ads_url = os.getenv("AUTO_ADS_DATABASE_URL")
@@ -176,6 +178,10 @@ def main() -> int:
 
     # validate required environment variables
     missing_vars = []
+    if not ice_ai_url:
+        missing_vars.append("ICE_AI_DATABASE_URL")
+    if not ice_ai_schema:
+        missing_vars.append("ICE_AI_DATABASE_SCHEMA")
     if not anna_trainer_url:
         missing_vars.append("ANNA_TRAINER_DATABASE_URL")
     if not anna_trainer_schema:
@@ -197,6 +203,13 @@ def main() -> int:
 
     # track success
     success = True
+
+    # generate ice-ai models
+    ice_ai_output = models_dir / "ice_ai.py"
+    if generate_models(ice_ai_url, ice_ai_schema, ice_ai_output, "ice-ai"):
+        fix_enum_schema(ice_ai_output, ice_ai_schema)
+    else:
+        success = False
 
     # generate anna-trainer models
     anna_trainer_output = models_dir / "anna_trainer.py"
@@ -222,6 +235,7 @@ def main() -> int:
     if success:
         print("All models generated successfully!")
         print(f"\nGenerated files:")
+        print(f"  - {ice_ai_output}")
         print(f"  - {anna_trainer_output}")
         print(f"  - {auto_ads_output}")
         return 0

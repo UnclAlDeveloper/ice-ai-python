@@ -742,7 +742,7 @@ def main():
             print(
                 "Waiting for 'are you human' verification to be completed manually..."
             )
-            email_input.wait_for(state="visible", timeout=300000)
+            email_input.wait_for(state="visible", timeout=1200000)
             print("'Are you human' verification completed")
         email_input.fill(email)
         print(f"Entered email address: {email}")
@@ -761,7 +761,7 @@ def main():
         password_input = page.get_by_test_id("password-entry-password-input")
         home_indicator = page.get_by_test_id("header-saved-icon")
         next_step = password_input.or_(home_indicator)
-        next_step.wait_for(state="visible", timeout=300000)
+        next_step.wait_for(state="visible", timeout=1200000)
 
         if password_input.is_visible():
             # normal password flow
@@ -793,7 +793,7 @@ def main():
                     "Email verification code required. "
                     "Please enter the code sent to your email in the browser."
                 )
-                focus_lock_modal.wait_for(state="hidden", timeout=300000)
+                focus_lock_modal.wait_for(state="hidden", timeout=1200000)
                 print("Email verification code entered, proceeding to home page")
             else:
                 print("Reached home page")

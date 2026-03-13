@@ -116,3 +116,20 @@ def save_oauth_tokens(
 
         existing.updated_at = datetime.now(timezone.utc)
         session.commit()
+
+
+# DELETE OAUTH TOKENS
+def delete_oauth_tokens(provider: str) -> None:
+    """
+    Remove the OAuth token row for a provider from the ia.oauth_tokens table.
+    No-op if the row does not exist.
+    """
+
+    database_url = os.getenv("ICE_AI_DATABASE_URL")
+
+    engine = create_engine(database_url)
+    with Session(engine) as session:
+        existing = session.get(OauthTokens, provider)
+        if existing is not None:
+            session.delete(existing)
+            session.commit()

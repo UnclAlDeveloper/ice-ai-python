@@ -204,6 +204,44 @@ async def autoads_ebay_marketplace_account_deletion_notification(
     )
 
 
+# QUICKBOOKS REDIRECT
+@app.get("/quickbooks-redirect")
+async def quickbooks_redirect(
+    code: Optional[str] = None,
+    state: Optional[str] = None,
+    error: Optional[str] = None,
+    error_description: Optional[str] = None,
+) -> HTMLResponse:
+    """
+    Handle the OAuth redirect callback from eBay.
+    eBay redirects here after user authorises the application, providing an authorisation code
+    that can be exchanged for access and refresh tokens.
+    """
+
+    # handle error response from ebay
+    if error:
+        error_msg = error_description or error
+        raise HTTPException(
+            status_code=400,
+            detail=f"Quicken authorisation failed: {error_msg}",
+        )
+
+    # validate required authorisation code
+    if not code:
+        raise HTTPException(
+            status_code=400,
+            detail="Missing authorisation code from Quicken",
+        )
+
+    # log the received authorisation code (in production, exchange this for tokens)
+    print(f"Received Quicken authorisation code: {code[:20]}..." if len(code) > 20 else f"Received Quicken authorisation code: {code}")
+    if state:
+        print(f"State parameter: {state}")
+
+    # return success page to user
+    return HTMLResponse(content="Quicken authorization token received.", status_code=200)
+
+
 # HEALTH CHECK
 @app.get("/health")
 async def health_check() -> dict:
@@ -232,6 +270,7 @@ async def root() -> dict:
     }
 
 
+ # MAIN
 if __name__ == "__main__":
     import uvicorn
 

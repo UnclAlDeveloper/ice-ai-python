@@ -11,7 +11,7 @@ from playwright.sync_api import sync_playwright
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from common import generate_hash_code, get_existing_hash_codes, pause
+from common import generate_hash_code, get_existing_hash_codes, get_oauth_tokens, save_oauth_tokens, pause
 from listing_images import download_and_save_listing_images
 from models.auto_ads import ProspectListings
 from ai_analysis import process_ai_analysis_for_listing
@@ -60,11 +60,13 @@ class EbayDownloader(BaseModel):
         client_id = os.getenv("AUTO_ADS_EBAY_CLIENT_ID")
         dev_id = os.getenv("AUTO_ADS_EBAY_DEV_ID")
         client_secret = os.getenv("AUTO_ADS_EBAY_CLIENT_SECRET")
+        redirect_uri = os.getenv("AUTO_ADS_EBAY_REDIRECT_URL")
 
-        if not all([client_id, dev_id, client_secret]):
+        if not all([client_id, dev_id, client_secret, redirect_uri]):
             raise ValueError(
                 "Missing required eBay credentials. Ensure AUTO_ADS_EBAY_CLIENT_ID, "
-                "AUTO_ADS_EBAY_DEV_ID, and AUTO_ADS_EBAY_CLIENT_SECRET are set."
+                "AUTO_ADS_EBAY_DEV_ID, AUTO_ADS_EBAY_CLIENT_SECRET, and "
+                "AUTO_ADS_EBAY_REDIRECT_URL are set."
             )
 
         # configure application credentials
@@ -72,7 +74,7 @@ class EbayDownloader(BaseModel):
             "app_id": client_id,
             "cert_id": client_secret,
             "dev_id": dev_id,
-            "redirect_uri": "http://www.mindlessinvesting.com:8005/auto-ads-ebay-redirect",
+            "redirect_uri": redirect_uri,
         }
 
         # configure marketplace header for UK
@@ -103,12 +105,19 @@ class EbayDownloader(BaseModel):
         else:
             raise ValueError(f"Unsupported marketplace: {self.marketplace}")
 
-        # user configuration for application-only access
+        # load refresh token from the database if available
+        tokens = get_oauth_tokens("ebay")
+        refresh_token = tokens.refresh_token if tokens else ""
+        refresh_token_expiry = ""
+        if tokens and tokens.refresh_token_expiry:
+            refresh_token_expiry = tokens.refresh_token_expiry.isoformat()
+
+        # user configuration with tokens from database
         user = {
             "email_or_username": os.getenv("AUTO_ADS_EBAY_USERNAME"),
             "password": os.getenv("AUTO_ADS_EBAY_PASSWORD"),
-            "refresh_token": "",
-            "refresh_token_expiry": "",
+            "refresh_token": refresh_token or "",
+            "refresh_token_expiry": refresh_token_expiry,
         }
 
         # create and return the api instance

@@ -1,7 +1,12 @@
+import base64
 import hashlib
+import json
 import os
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 from urllib.parse import urlencode
+from urllib.request import Request as HttpRequest, urlopen
+from urllib.error import URLError, HTTPError
 
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -21,6 +26,38 @@ app = FastAPI(
 )
 
 
+# EBAY CONNECT
+@app.get("/ebay-connect")
+async def ebay_connect() -> RedirectResponse:
+    """
+    Initiate the eBay OAuth flow by redirecting to eBay's authorisation page.
+    After the user authorises, eBay redirects back to /auto-ads-ebay-redirect with
+    an authorisation code that can be exchanged for access and refresh tokens.
+    """
+
+    client_id = os.getenv("AUTO_ADS_EBAY_CLIENT_ID")
+    redirect_uri = os.getenv("AUTO_ADS_EBAY_REDIRECT_URL")
+    if not client_id or not redirect_uri:
+        raise HTTPException(
+            status_code=500,
+            detail="AUTO_ADS_EBAY_CLIENT_ID or AUTO_ADS_EBAY_REDIRECT_URL not configured",
+        )
+
+    # build the ebay oauth2 authorisation url
+    scopes = "https://api.ebay.com/oauth/api_scope https://api.ebay.com/oauth/api_scope/buy.browse"
+    params = urlencode({
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "scope": scopes,
+        "state": "auto-ads-connect",
+    })
+    auth_url = f"https://auth.ebay.com/oauth2/authorize?{params}"
+
+    print(f"Redirecting to eBay OAuth: {auth_url}")
+    return RedirectResponse(url=auth_url)
+
+
 # AUTO ADS EBAY REDIRECT
 @app.get("/auto-ads-ebay-redirect")
 async def auto_ads_ebay_redirect(
@@ -31,9 +68,15 @@ async def auto_ads_ebay_redirect(
 ) -> HTMLResponse:
     """
     Handle the OAuth redirect callback from eBay.
-    eBay redirects here after user authorises the application, providing an authorisation code
-    that can be exchanged for access and refresh tokens.
+    Exchanges the authorisation code for access and refresh tokens, then stores
+    them in the database for use by other processes.
     """
+
+    print("eBay redirect received - parameters:")
+    print(f"  code: {code[:20]}..." if code and len(code) > 20 else f"  code: {code}")
+    print(f"  state: {state}")
+    print(f"  error: {error}")
+    print(f"  error_description: {error_description}")
 
     # handle error response from ebay
     if error:
@@ -43,26 +86,81 @@ async def auto_ads_ebay_redirect(
             detail=f"eBay authorisation failed: {error_msg}",
         )
 
-    # validate required authorisation code
     if not code:
         raise HTTPException(
             status_code=400,
             detail="Missing authorisation code from eBay",
         )
 
-    # log the received authorisation code (in production, exchange this for tokens)
-    print(f"Received eBay authorisation code: {code[:20]}..." if len(code) > 20 else f"Received eBay authorisation code: {code}")
-    if state:
-        print(f"State parameter: {state}")
+    # exchange the authorisation code for tokens
+    client_id = os.getenv("AUTO_ADS_EBAY_CLIENT_ID")
+    client_secret = os.getenv("AUTO_ADS_EBAY_CLIENT_SECRET")
+    redirect_uri = os.getenv("AUTO_ADS_EBAY_REDIRECT_URL")
 
-    # return success page to user
-    html_content = f"""
+    if not client_id or not client_secret or not redirect_uri:
+        raise HTTPException(
+            status_code=500,
+            detail="eBay client credentials or redirect URL not configured",
+        )
+
+    # post to ebay's token endpoint with basic auth header
+    credentials = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
+    token_data = urlencode({
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": redirect_uri,
+    }).encode()
+
+    token_request = HttpRequest(
+        "https://api.ebay.com/identity/v1/oauth2/token",
+        data=token_data,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Authorization": f"Basic {credentials}",
+        },
+    )
+
+    try:
+        with urlopen(token_request) as response:
+            token_response = json.loads(response.read().decode())
+    except (HTTPError, URLError) as e:
+        error_body = ""
+        if hasattr(e, "read"):
+            error_body = e.read().decode()
+        print(f"eBay token exchange failed: {e} {error_body}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to exchange authorisation code for tokens: {e}",
+        )
+
+    access_token = token_response.get("access_token")
+    refresh_token = token_response.get("refresh_token")
+    expires_in = token_response.get("expires_in", 7200)
+    refresh_expires_in = token_response.get("refresh_token_expires_in", 47304000)
+
+    now = datetime.now(timezone.utc)
+    access_token_expiry = now + timedelta(seconds=expires_in)
+    refresh_token_expiry = now + timedelta(seconds=refresh_expires_in)
+
+    print("eBay token exchange successful")
+
+    # persist tokens to the database
+    save_oauth_tokens(
+        provider="ebay",
+        access_token=access_token,
+        access_token_expiry=access_token_expiry,
+        refresh_token=refresh_token,
+        refresh_token_expiry=refresh_token_expiry,
+    )
+
+    # return success page confirming the connection
+    html_content = """
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Auto Ads - eBay Authorisation</title>
+        <title>Auto Ads - eBay Connected</title>
         <style>
-            body {{
+            body {
                 font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
                 display: flex;
                 justify-content: center;
@@ -70,36 +168,25 @@ async def auto_ads_ebay_redirect(
                 height: 100vh;
                 margin: 0;
                 background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            }}
-            .container {{
+            }
+            .container {
                 background: white;
                 padding: 40px;
                 border-radius: 10px;
                 box-shadow: 0 10px 40px rgba(0, 0, 0, 0.2);
                 text-align: center;
                 max-width: 400px;
-            }}
-            h1 {{
-                color: #333;
-                margin-bottom: 10px;
-            }}
-            p {{
-                color: #666;
-                line-height: 1.6;
-            }}
-            .success {{
-                color: #22c55e;
-                font-size: 48px;
-                margin-bottom: 20px;
-            }}
+            }
+            h1 { color: #333; margin-bottom: 10px; }
+            p { color: #666; line-height: 1.6; }
+            .success { color: #22c55e; font-size: 48px; margin-bottom: 20px; }
         </style>
     </head>
     <body>
         <div class="container">
-            <div class="success">✓</div>
-            <h1>Authorisation Successful</h1>
-            <p>Your eBay account has been successfully connected to Auto Ads.</p>
-            <p>You can close this window and return to the application.</p>
+            <div class="success">&#10003;</div>
+            <h1>eBay Connected</h1>
+            <p>Tokens have been exchanged and saved to the database. You can close this window.</p>
         </div>
     </body>
     </html>
@@ -375,6 +462,7 @@ async def root() -> dict:
         "name": "Ice AI API",
         "version": "1.0.0",
         "endpoints": [
+            "/ebay-connect",
             "/auto-ads-ebay-redirect",
             "/autoads-ebay-marketplace-account-deletion",
             "/quickbooks-connect",

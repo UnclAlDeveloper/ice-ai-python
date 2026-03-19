@@ -399,4 +399,4 @@ def regenerate_all_ai_analyses(prompt_filename: str, listing_source: str, skip_r
 
 
 if __name__ == "__main__":
-    regenerate_all_ai_analyses("classic_car_prompt.md", "Car&Classic", 30)
+    regenerate_all_ai_analyses("van_prompt.md", "ManualEntry", 0)

@@ -10,6 +10,13 @@
             </Attribute>
           </value>
         </entry>
+        <entry key="C:\MindlessInvesting\Python\MICommonLibrary\Test\train_mismatches.csv">
+          <value>
+            <Attribute>
+              <option name="separator" value="," />
+            </Attribute>
+          </value>
+        </entry>
         <entry key="C:\MindlessInvesting\Python\MICommonLibrary\Test\validation_mismatches.csv">
           <value>
             <Attribute>

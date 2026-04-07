@@ -1,48 +1,1 @@
-"""
-Combine all Tide (UK) CSV files from Downloads into a single CSV.
-"""
-
-import csv
-from pathlib import Path
-
-DOWNLOADS = Path(r"C:\Users\Graeme\OneDrive\Downloads")
-OUTPUT = Path(r"c:\Ice-AI\python\tide_transactions.csv")
-PATTERN = "Tide_(UK) (*).csv"
-
-
-def main():
-    # find all matching files (glob: * matches the (*) part)
-    all_csvs = list(DOWNLOADS.glob("Tide_(UK) (*).csv"))
-    if not all_csvs:
-        raise SystemExit(f"No files matching '{PATTERN}' found in {DOWNLOADS}")
-
-    all_csvs.sort(key=lambda p: p.name)
-    rows_written = 0
-    header = None
-
-    with open(OUTPUT, "w", newline="", encoding="utf-8") as out:
-        writer = None
-        for path in all_csvs:
-            with open(path, "r", encoding="utf-8", errors="replace") as f:
-                reader = csv.reader(f)
-                first_row = next(reader, None)
-                if first_row is None:
-                    continue
-                if header is None:
-                    header = first_row
-                    writer = csv.writer(out)
-                    writer.writerow(header)
-                elif first_row != header:
-                    # skip duplicate header in subsequent files
-                    pass
-                else:
-                    pass  # header row, skip
-                for row in reader:
-                    writer.writerow(row)
-                    rows_written += 1
-
-    print(f"Combined {len(all_csvs)} file(s) -> {OUTPUT} ({rows_written} data rows)")
-
-
-if __name__ == "__main__":
-    main()
+"""Combine all Tide (UK) CSV files from Downloads into a single CSV."""import csvfrom pathlib import PathDOWNLOADS = Path(r"C:\Users\Graeme\OneDrive\Downloads")OUTPUT = Path(r"c:\Ice-AI\python\tide_transactions.csv")PATTERN = "Tide_(UK) (*).csv"def main():    # find all matching files (glob: * matches the (*) part)    all_csvs = list(DOWNLOADS.glob("Tide_(UK) (*).csv"))    if not all_csvs:        raise SystemExit(f"No files matching '{PATTERN}' found in {DOWNLOADS}")    all_csvs.sort(key=lambda p: p.name)    rows_written = 0    header = None    with open(OUTPUT, "w", newline="", encoding="utf-8") as out:        writer = None        for path in all_csvs:            with open(path, "r", encoding="utf-8", errors="replace") as f:                reader = csv.reader(f)                first_row = next(reader, None)                if first_row is None:                    continue                if header is None:                    header = first_row                    writer = csv.writer(out)                    writer.writerow(header)                elif first_row != header:                    # skip duplicate header in subsequent files                    pass                else:                    pass  # header row, skip                for row in reader:                    writer.writerow(row)                    rows_written += 1    print(f"Combined {len(all_csvs)} file(s) -> {OUTPUT} ({rows_written} data rows)")if __name__ == "__main__":    main()

@@ -1,0 +1,6 @@
+# Line endings: normalize text in the index; check out with LF (typical for shell and WSL).
+* text=auto eol=lf
+
+# Windows command scripts expect CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf

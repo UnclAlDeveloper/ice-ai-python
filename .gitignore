@@ -1,3 +1,7 @@
+# shared modules copied from /Common/python by deploy-python.sh
+AWSAccess.py
+Settings.py
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

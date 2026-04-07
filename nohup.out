@@ -1,0 +1,9 @@
+INFO:     Started server process [36464]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8005 (Press CTRL+C to quit)
+Loaded environment variables from /Ice-AI/.env.dev (environment: dev)
+Redirecting to eBay OAuth: https://auth.sandbox.ebay.com/oauth2/authorize?client_id=GraemeSm-AutoAds-SBX-eb475036b-5dbb733c&redirect_uri=Graeme_Smith-GraemeSm-AutoAd-mfxfs&response_type=code&scope=https%3A%2F%2Fapi.ebay.com%2Foauth%2Fapi_scope+https%3A%2F%2Fapi.ebay.com%2Foauth%2Fapi_scope%2Fbuy.browse+https%3A%2F%2Fapi.ebay.com%2Foauth%2Fapi_scope%2Fsell.inventory+https%3A%2F%2Fapi.ebay.com%2Foauth%2Fapi_scope%2Fsell.account&state=auto-ads-connect
+INFO:     127.0.0.1:47568 - "GET /ebay-connect HTTP/1.1" 307 Temporary Redirect
+Redirecting to eBay OAuth: https://auth.sandbox.ebay.com/oauth2/authorize?client_id=GraemeSm-AutoAds-SBX-eb475036b-5dbb733c&redirect_uri=Graeme_Smith-GraemeSm-AutoAd-mfxfs&response_type=code&scope=https%3A%2F%2Fapi.ebay.com%2Foauth%2Fapi_scope+https%3A%2F%2Fapi.ebay.com%2Foauth%2Fapi_scope%2Fbuy.browse+https%3A%2F%2Fapi.ebay.com%2Foauth%2Fapi_scope%2Fsell.inventory+https%3A%2F%2Fapi.ebay.com%2Foauth%2Fapi_scope%2Fsell.account&state=auto-ads-connect
+INFO:     127.0.0.1:34846 - "GET /ebay-connect HTTP/1.1" 307 Temporary Redirect

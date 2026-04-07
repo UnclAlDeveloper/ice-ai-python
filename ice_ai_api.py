@@ -18,6 +18,36 @@ from environments import load_environment
 load_environment()
 
 
+# EBAY OAUTH SCOPES
+# Space-separated scopes for authorise URL; must cover Browse (Python downloader) and Sell Inventory (website listings).
+EBAY_OAUTH_SCOPES = (
+    "https://api.ebay.com/oauth/api_scope "
+    "https://api.ebay.com/oauth/api_scope/buy.browse "
+    "https://api.ebay.com/oauth/api_scope/sell.inventory "
+    "https://api.ebay.com/oauth/api_scope/sell.account"
+)
+
+
+# EBAY OAUTH ENDPOINTS
+def _ebay_oauth_endpoints() -> tuple[str, str]:
+    """
+    Return (authorize_url_prefix, token_endpoint) for production or sandbox.
+    Sandbox is selected when AUTO_ADS_EBAY_API_ROOT contains 'sandbox' or AUTO_ADS_EBAY_SANDBOX is true.
+    """
+
+    root = (os.getenv("AUTO_ADS_EBAY_API_ROOT") or "").lower()
+    flag = (os.getenv("AUTO_ADS_EBAY_SANDBOX") or "").lower() in ("1", "true", "yes")
+    if "sandbox" in root or flag:
+        return (
+            "https://auth.sandbox.ebay.com/oauth2/authorize",
+            "https://api.sandbox.ebay.com/identity/v1/oauth2/token",
+        )
+    return (
+        "https://auth.ebay.com/oauth2/authorize",
+        "https://api.ebay.com/identity/v1/oauth2/token",
+    )
+
+
 # ICE AI API
 app = FastAPI(
     title="Ice AI API",
@@ -43,16 +73,15 @@ async def ebay_connect() -> RedirectResponse:
             detail="AUTO_ADS_EBAY_CLIENT_ID or AUTO_ADS_EBAY_REDIRECT_URL not configured",
         )
 
-    # build the ebay oauth2 authorisation url
-    scopes = "https://api.ebay.com/oauth/api_scope https://api.ebay.com/oauth/api_scope/buy.browse"
+    authorize_base, _token_url = _ebay_oauth_endpoints()
     params = urlencode({
         "client_id": client_id,
         "redirect_uri": redirect_uri,
         "response_type": "code",
-        "scope": scopes,
+        "scope": EBAY_OAUTH_SCOPES,
         "state": "auto-ads-connect",
     })
-    auth_url = f"https://auth.ebay.com/oauth2/authorize?{params}"
+    auth_url = f"{authorize_base}?{params}"
 
     print(f"Redirecting to eBay OAuth: {auth_url}")
     return RedirectResponse(url=auth_url)
@@ -111,8 +140,9 @@ async def auto_ads_ebay_redirect(
         "redirect_uri": redirect_uri,
     }).encode()
 
+    _authorize_base, token_endpoint = _ebay_oauth_endpoints()
     token_request = HttpRequest(
-        "https://api.ebay.com/identity/v1/oauth2/token",
+        token_endpoint,
         data=token_data,
         headers={
             "Content-Type": "application/x-www-form-urlencoded",
@@ -214,9 +244,10 @@ async def autoads_ebay_marketplace_account_deletion_challenge(
 
     # get verification token and endpoint from environment
     verification_token = os.getenv("AUTO_ADS_EBAY_VERIFICATION_TOKEN")
+    api_base_url = os.getenv("ICE_AI_API_URL", "")
     endpoint = os.getenv(
         "AUTO_ADS_EBAY_DELETION_ENDPOINT",
-        "https://ice-ai-api-dev.ice-group.ai/autoads-ebay-marketplace-account-deletion",
+        f"{api_base_url}/autoads-ebay-marketplace-account-deletion",
     )
 
     if not verification_token:

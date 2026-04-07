@@ -1,0 +1,11 @@
+.git/
+.idea/
+.vscode/
+__pycache__/
+*.pyc
+*.pyo
+nohup.out
+data/
+*.ipynb
+env.yml
+env_linux.yml

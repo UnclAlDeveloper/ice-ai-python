@@ -1,1 +1,212 @@
-import osimport refrom sqlalchemy import create_engine, textfrom environments import load_environmentCOLUMNS = [    "make_and_model",    "vat_status",    "location",    "body_type",    "cab_type",    "fuel_type",    "gearbox_type",    "wheelbase",    "engine_size",    "colour",    "emission_class",]# UPDATE SELECT LISTSdef update_select_lists():    """    For each target column in Autotrader prospect_listings, find distinct values    not already present in the lookups table and insert them as new lookup rows.    """    database_url = os.getenv("AUTO_ADS_DATABASE_URL")    schema = os.getenv("AUTO_ADS_DATABASE_SCHEMA", "aa")    engine = create_engine(database_url)    total_inserted = 0    with engine.begin() as conn:        for column in COLUMNS:            # get distinct non-null values from autotrader prospect_listings            prospect_result = conn.execute(                text(                    f"SELECT DISTINCT {column} FROM {schema}.prospect_listings"                    f" WHERE {column} IS NOT NULL AND listing_source = 'Autotrader'"                )            )            prospect_values = {row[0] for row in prospect_result}            # get existing codes from lookups for this lookup type            lookup_result = conn.execute(                text(f"SELECT code FROM {schema}.lookups WHERE lookup_type = :lookup_type"),                {"lookup_type": column},            )            existing_codes = {row[0] for row in lookup_result}            # determine which values are new            new_values = prospect_values - existing_codes            if new_values:                # batch insert new lookup rows                conn.execute(                    text(f"INSERT INTO {schema}.lookups (lookup_type, code) VALUES (:lookup_type, :code)"),                    [{"lookup_type": column, "code": value} for value in sorted(new_values)],                )            print(f"{column}: {len(new_values)} new value(s) inserted (of {len(prospect_values)} distinct)")            total_inserted += len(new_values)    print(f"\nDone. {total_inserted} total new lookup(s) inserted.")# PARSE SECTIONdef parse_section(markdown: str, section_name: str) -> dict[str, list[str]]:    """    Parse a top-level ## section from specs_and_features markdown, returning a    dict mapping ### subsection names to their list items.    """    result = {}    in_section = False    current_subsection = None    for line in markdown.splitlines():        stripped = line.strip()        if re.match(r"^## ", stripped):            if in_section:                # hit the next top-level section, stop                break            if stripped == f"## {section_name}":                in_section = True            continue        if not in_section:            continue        # track subsection headers        subsection_match = re.match(r"^### (.+)$", stripped)        if subsection_match:            current_subsection = subsection_match.group(1).strip()            result[current_subsection] = []            continue        # collect list items        item_match = re.match(r"^- (.+)$", stripped)        if item_match and current_subsection is not None:            result[current_subsection].append(item_match.group(1).strip())    return result# UPDATE FEATURES LOOKUPSdef update_features_lookups():    """    Parse the specs_and_features markdown from Autotrader prospect_listings,    extract the All Features section, and insert any new feature items into    the lookups table with lookup_type 'Feature - {subsection}'.    """    database_url = os.getenv("AUTO_ADS_DATABASE_URL")    schema = os.getenv("AUTO_ADS_DATABASE_SCHEMA", "aa")    engine = create_engine(database_url)    with engine.begin() as conn:        # fetch all non-null specs_and_features from autotrader listings        rows = conn.execute(            text(                f"SELECT specs_and_features FROM {schema}.prospect_listings"                f" WHERE specs_and_features IS NOT NULL AND listing_source = 'Autotrader'"            )        )        # collect all distinct (lookup_type, code) pairs across all listings        all_pairs = set()        for (markdown_text,) in rows:            sections = parse_section(markdown_text, "All Features")            for subsection, items in sections.items():                for item in items:                    all_pairs.add((f"Feature - {subsection}", item))        # get existing feature lookups        existing_result = conn.execute(            text(f"SELECT lookup_type, code FROM {schema}.lookups WHERE lookup_type LIKE 'Feature - %'")        )        existing_pairs = {(row[0], row[1]) for row in existing_result}        # determine new pairs and insert        new_pairs = all_pairs - existing_pairs        if new_pairs:            conn.execute(                text(f"INSERT INTO {schema}.lookups (lookup_type, code) VALUES (:lookup_type, :code)"),                [{"lookup_type": lt, "code": code} for lt, code in sorted(new_pairs)],            )        print(f"Features: {len(new_pairs)} new value(s) inserted (of {len(all_pairs)} distinct)")# UPDATE SPECS LOOKUPSdef update_specs_lookups():    """    Parse the specs_and_features markdown from Autotrader prospect_listings,    extract the Specs section, and insert any new spec names into the lookups    table with lookup_type 'Spec - {subsection}'. Only the label to the left    of the colon is used as the code.    """    database_url = os.getenv("AUTO_ADS_DATABASE_URL")    schema = os.getenv("AUTO_ADS_DATABASE_SCHEMA", "aa")    engine = create_engine(database_url)    with engine.begin() as conn:        # fetch all non-null specs_and_features from autotrader listings        rows = conn.execute(            text(                f"SELECT specs_and_features FROM {schema}.prospect_listings"                f" WHERE specs_and_features IS NOT NULL AND listing_source = 'Autotrader'"            )        )        # collect all distinct (lookup_type, code) pairs across all listings        all_pairs = set()        for (markdown_text,) in rows:            sections = parse_section(markdown_text, "Specs")            for subsection, items in sections.items():                for item in items:                    # use only the text to the left of the colon                    code = item.split(":")[0].strip()                    if code:                        all_pairs.add((f"Spec - {subsection}", code))        # get existing spec lookups        existing_result = conn.execute(            text(f"SELECT lookup_type, code FROM {schema}.lookups WHERE lookup_type LIKE 'Spec - %'")        )        existing_pairs = {(row[0], row[1]) for row in existing_result}        # determine new pairs and insert        new_pairs = all_pairs - existing_pairs        if new_pairs:            conn.execute(                text(f"INSERT INTO {schema}.lookups (lookup_type, code) VALUES (:lookup_type, :code)"),                [{"lookup_type": lt, "code": code} for lt, code in sorted(new_pairs)],            )        print(f"Specs: {len(new_pairs)} new value(s) inserted (of {len(all_pairs)} distinct)")if __name__ == "__main__":    load_environment()    update_select_lists()    update_features_lookups()    update_specs_lookups()
+import os
+import re
+
+from sqlalchemy import create_engine, text
+
+from environments import load_environment
+
+COLUMNS = [
+    "make_and_model",
+    "vat_status",
+    "location",
+    "body_type",
+    "cab_type",
+    "fuel_type",
+    "gearbox_type",
+    "wheelbase",
+    "engine_size",
+    "colour",
+    "emission_class",
+]
+
+
+# UPDATE SELECT LISTS
+def update_select_lists():
+    """
+    For each target column in Autotrader prospect_listings, find distinct values
+    not already present in the lookups table and insert them as new lookup rows.
+    """
+
+    database_url = os.getenv("AUTO_ADS_DATABASE_URL")
+    schema = os.getenv("AUTO_ADS_DATABASE_SCHEMA", "aa")
+    engine = create_engine(database_url)
+
+    total_inserted = 0
+
+    with engine.begin() as conn:
+        for column in COLUMNS:
+            # get distinct non-null values from autotrader prospect_listings
+            prospect_result = conn.execute(
+                text(
+                    f"SELECT DISTINCT {column} FROM {schema}.prospect_listings"
+                    f" WHERE {column} IS NOT NULL AND listing_source = 'Autotrader'"
+                )
+            )
+            prospect_values = {row[0] for row in prospect_result}
+
+            # get existing codes from lookups for this lookup type
+            lookup_result = conn.execute(
+                text(f"SELECT code FROM {schema}.lookups WHERE lookup_type = :lookup_type"),
+                {"lookup_type": column},
+            )
+            existing_codes = {row[0] for row in lookup_result}
+
+            # determine which values are new
+            new_values = prospect_values - existing_codes
+
+            if new_values:
+                # batch insert new lookup rows
+                conn.execute(
+                    text(f"INSERT INTO {schema}.lookups (lookup_type, code) VALUES (:lookup_type, :code)"),
+                    [{"lookup_type": column, "code": value} for value in sorted(new_values)],
+                )
+
+            print(f"{column}: {len(new_values)} new value(s) inserted (of {len(prospect_values)} distinct)")
+            total_inserted += len(new_values)
+
+    print(f"\nDone. {total_inserted} total new lookup(s) inserted.")
+
+
+# PARSE SECTION
+def parse_section(markdown: str, section_name: str) -> dict[str, list[str]]:
+    """
+    Parse a top-level ## section from specs_and_features markdown, returning a
+    dict mapping ### subsection names to their list items.
+    """
+
+    result = {}
+    in_section = False
+    current_subsection = None
+
+    for line in markdown.splitlines():
+        stripped = line.strip()
+
+        if re.match(r"^## ", stripped):
+            if in_section:
+                # hit the next top-level section, stop
+                break
+            if stripped == f"## {section_name}":
+                in_section = True
+            continue
+
+        if not in_section:
+            continue
+
+        # track subsection headers
+        subsection_match = re.match(r"^### (.+)$", stripped)
+        if subsection_match:
+            current_subsection = subsection_match.group(1).strip()
+            result[current_subsection] = []
+            continue
+
+        # collect list items
+        item_match = re.match(r"^- (.+)$", stripped)
+        if item_match and current_subsection is not None:
+            result[current_subsection].append(item_match.group(1).strip())
+
+    return result
+
+
+# UPDATE FEATURES LOOKUPS
+def update_features_lookups():
+    """
+    Parse the specs_and_features markdown from Autotrader prospect_listings,
+    extract the All Features section, and insert any new feature items into
+    the lookups table with lookup_type 'Feature - {subsection}'.
+    """
+
+    database_url = os.getenv("AUTO_ADS_DATABASE_URL")
+    schema = os.getenv("AUTO_ADS_DATABASE_SCHEMA", "aa")
+    engine = create_engine(database_url)
+
+    with engine.begin() as conn:
+        # fetch all non-null specs_and_features from autotrader listings
+        rows = conn.execute(
+            text(
+                f"SELECT specs_and_features FROM {schema}.prospect_listings"
+                f" WHERE specs_and_features IS NOT NULL AND listing_source = 'Autotrader'"
+            )
+        )
+
+        # collect all distinct (lookup_type, code) pairs across all listings
+        all_pairs = set()
+        for (markdown_text,) in rows:
+            sections = parse_section(markdown_text, "All Features")
+            for subsection, items in sections.items():
+                for item in items:
+                    all_pairs.add((f"Feature - {subsection}", item))
+
+        # get existing feature lookups
+        existing_result = conn.execute(
+            text(f"SELECT lookup_type, code FROM {schema}.lookups WHERE lookup_type LIKE 'Feature - %'")
+        )
+        existing_pairs = {(row[0], row[1]) for row in existing_result}
+
+        # determine new pairs and insert
+        new_pairs = all_pairs - existing_pairs
+
+        if new_pairs:
+            conn.execute(
+                text(f"INSERT INTO {schema}.lookups (lookup_type, code) VALUES (:lookup_type, :code)"),
+                [{"lookup_type": lt, "code": code} for lt, code in sorted(new_pairs)],
+            )
+
+        print(f"Features: {len(new_pairs)} new value(s) inserted (of {len(all_pairs)} distinct)")
+
+
+# UPDATE SPECS LOOKUPS
+def update_specs_lookups():
+    """
+    Parse the specs_and_features markdown from Autotrader prospect_listings,
+    extract the Specs section, and insert any new spec names into the lookups
+    table with lookup_type 'Spec - {subsection}'. Only the label to the left
+    of the colon is used as the code.
+    """
+
+    database_url = os.getenv("AUTO_ADS_DATABASE_URL")
+    schema = os.getenv("AUTO_ADS_DATABASE_SCHEMA", "aa")
+    engine = create_engine(database_url)
+
+    with engine.begin() as conn:
+        # fetch all non-null specs_and_features from autotrader listings
+        rows = conn.execute(
+            text(
+                f"SELECT specs_and_features FROM {schema}.prospect_listings"
+                f" WHERE specs_and_features IS NOT NULL AND listing_source = 'Autotrader'"
+            )
+        )
+
+        # collect all distinct (lookup_type, code) pairs across all listings
+        all_pairs = set()
+        for (markdown_text,) in rows:
+            sections = parse_section(markdown_text, "Specs")
+            for subsection, items in sections.items():
+                for item in items:
+                    # use only the text to the left of the colon
+                    code = item.split(":")[0].strip()
+                    if code:
+                        all_pairs.add((f"Spec - {subsection}", code))
+
+        # get existing spec lookups
+        existing_result = conn.execute(
+            text(f"SELECT lookup_type, code FROM {schema}.lookups WHERE lookup_type LIKE 'Spec - %'")
+        )
+        existing_pairs = {(row[0], row[1]) for row in existing_result}
+
+        # determine new pairs and insert
+        new_pairs = all_pairs - existing_pairs
+
+        if new_pairs:
+            conn.execute(
+                text(f"INSERT INTO {schema}.lookups (lookup_type, code) VALUES (:lookup_type, :code)"),
+                [{"lookup_type": lt, "code": code} for lt, code in sorted(new_pairs)],
+            )
+
+        print(f"Specs: {len(new_pairs)} new value(s) inserted (of {len(all_pairs)} distinct)")
+
+
+if __name__ == "__main__":
+    load_environment()
+    update_select_lists()
+    update_features_lookups()
+    update_specs_lookups()

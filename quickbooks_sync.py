@@ -1,1 +1,95 @@
-from typing import Anyfrom environments import load_environmentimport osload_environment()from intuitlib.client import AuthClientfrom quickbooks import QuickBooksfrom quickbooks.objects.account import Accountfrom common import get_oauth_tokens, save_oauth_tokens, delete_oauth_tokensdef get_qb_client() -> tuple[QuickBooks | Any, AuthClient, Any]:    # read static app credentials from environment    client_id = os.getenv("ICE_AI_QUICKBOOKS_CLIENT_ID")    client_secret = os.getenv("ICE_AI_QUICKBOOKS_CLIENT_SECRET")    redirect_uri = os.getenv("ICE_AI_QUICKBOOKS_REDIRECT_URL")    if not client_id or not client_secret:        raise ValueError(            "QuickBooks credentials missing. Set ICE_AI_QUICKBOOKS_CLIENT_ID and "            "ICE_AI_QUICKBOOKS_CLIENT_SECRET in your .env file (e.g. .env.dev)."        )    if not redirect_uri:        raise ValueError(            "QuickBooks redirect URL missing. Set ICE_AI_QUICKBOOKS_REDIRECT_URL "            "in your .env file (e.g. .env.dev)."        )    # load tokens and company id from the database    tokens = get_oauth_tokens("quickbooks")    if not tokens or not tokens.refresh_token:        raise ValueError(            f"QuickBooks tokens not found in the database. Complete the OAuth flow "            f"by visiting {ICE_AI_QUICKBOOKS_REDIRECT_URL}"        )    refresh_token = tokens.refresh_token    company_id = tokens.account_id    if not company_id:        raise ValueError(            "QuickBooks company ID (account_id) is missing from the database. "            "Re-run the OAuth flow via /quickbooks-connect."        )    # set up the auth client and quickbooks api client    auth_client = AuthClient(        client_id=client_id,        client_secret=client_secret,        environment="production",        redirect_uri=redirect_uri,    )    try:        client = QuickBooks(            auth_client=auth_client,            refresh_token=refresh_token,            company_id=company_id,        )        if auth_client.refresh_token and auth_client.refresh_token != refresh_token:            save_oauth_tokens(                provider="quickbooks",                refresh_token=auth_client.refresh_token,                access_token=auth_client.access_token,            )            print("Updated refresh token saved to database.")        return client, auth_client    except Exception as e:        # Check if it's an auth error        if "auth" in str(e).lower() or "token" in str(e).lower() or "unauthorized" in str(e).lower():            # Clear stale tokens            delete_oauth_tokens("quickbooks")            raise ValueError(                f"QuickBooks refresh token is invalid or expired. "                f"Please re-authenticate by visiting {redirect_uri}"            ) from e        raiseif __name__ == "__main__":    try:        client, auth_client = get_qb_client()        accounts = Account.all(qb=client)        print(f"Retrieved {len(accounts)} account(s).")    except Exception as e:        print(f"QuickBooks API error: {e}")pass
+from typing import Any
+
+from environments import load_environment
+import os
+
+load_environment()
+
+from intuitlib.client import AuthClient
+from quickbooks import QuickBooks
+from quickbooks.objects.account import Account
+
+from common import get_oauth_tokens, save_oauth_tokens, delete_oauth_tokens
+
+
+def get_qb_client() -> tuple[QuickBooks | Any, AuthClient, Any]:
+    # read static app credentials from environment
+    client_id = os.getenv("ICE_AI_QUICKBOOKS_CLIENT_ID")
+    client_secret = os.getenv("ICE_AI_QUICKBOOKS_CLIENT_SECRET")
+    redirect_uri = os.getenv("ICE_AI_QUICKBOOKS_REDIRECT_URL")
+
+    if not client_id or not client_secret:
+        raise ValueError(
+            "QuickBooks credentials missing. Set ICE_AI_QUICKBOOKS_CLIENT_ID and "
+            "ICE_AI_QUICKBOOKS_CLIENT_SECRET in your .env file (e.g. .env.dev)."
+        )
+    if not redirect_uri:
+        raise ValueError(
+            "QuickBooks redirect URL missing. Set ICE_AI_QUICKBOOKS_REDIRECT_URL "
+            "in your .env file (e.g. .env.dev)."
+        )
+
+    # load tokens and company id from the database
+    tokens = get_oauth_tokens("quickbooks")
+    if not tokens or not tokens.refresh_token:
+        raise ValueError(
+            f"QuickBooks tokens not found in the database. Complete the OAuth flow "
+            f"by visiting {ICE_AI_QUICKBOOKS_REDIRECT_URL}"
+        )
+
+    refresh_token = tokens.refresh_token
+    company_id = tokens.account_id
+
+    if not company_id:
+        raise ValueError(
+            "QuickBooks company ID (account_id) is missing from the database. "
+            "Re-run the OAuth flow via /quickbooks-connect."
+        )
+
+    # set up the auth client and quickbooks api client
+    auth_client = AuthClient(
+        client_id=client_id,
+        client_secret=client_secret,
+        environment="production",
+        redirect_uri=redirect_uri,
+    )
+
+    try:
+        client = QuickBooks(
+            auth_client=auth_client,
+            refresh_token=refresh_token,
+            company_id=company_id,
+        )
+
+        if auth_client.refresh_token and auth_client.refresh_token != refresh_token:
+            save_oauth_tokens(
+                provider="quickbooks",
+                refresh_token=auth_client.refresh_token,
+                access_token=auth_client.access_token,
+            )
+            print("Updated refresh token saved to database.")
+
+        return client, auth_client
+
+    except Exception as e:
+        # Check if it's an auth error
+        if "auth" in str(e).lower() or "token" in str(e).lower() or "unauthorized" in str(e).lower():
+            # Clear stale tokens
+            delete_oauth_tokens("quickbooks")
+            raise ValueError(
+                f"QuickBooks refresh token is invalid or expired. "
+                f"Please re-authenticate by visiting {redirect_uri}"
+            ) from e
+        raise
+
+
+if __name__ == "__main__":
+    try:
+        client, auth_client = get_qb_client()
+
+        accounts = Account.all(qb=client)
+        print(f"Retrieved {len(accounts)} account(s).")
+    except Exception as e:
+        print(f"QuickBooks API error: {e}")
+
+pass

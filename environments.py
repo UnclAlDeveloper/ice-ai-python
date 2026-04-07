@@ -1,1 +1,40 @@
-import osfrom pathlib import Pathfrom dotenv import load_dotenvdef load_environment():    """    Load environment variables from the appropriate .env file based on environment.    Loads ../.env.dev for dev (default) and staging, and ../.env.prod for production.    """    # get environment from env var, default to dev    env_name = os.getenv("ENVIRONMENT", "dev").lower()    # validate environment name    valid_environments = {"dev", "staging", "production"}    if env_name not in valid_environments:        raise ValueError(            f"Invalid environment value: {env_name}. Must be one of {valid_environments}"        )    # use .env.dev for dev and staging, .env.prod for production    if env_name in {"dev", "staging"}:        env_filename = ".env.dev"    else:        env_filename = ".env.prod"    # path to parent directory (one level up from this file's package)    current_file = Path(__file__).resolve()    parent_dir = current_file.parent.parent    env_file = parent_dir / env_filename    # load the environment file    if env_file.exists():        load_dotenv(env_file, override=True)        print(f"Loaded environment variables from {env_file} (environment: {env_name})")    else:        print(f"Warning: {env_file} not found. Using system environment variables only.")
+import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+
+def load_environment():
+    """
+    Load environment variables from the appropriate .env file based on environment.
+
+    Loads ../.env.dev for dev (default) and staging, and ../.env.prod for production.
+    """
+
+    # get environment from env var, default to dev
+    env_name = os.getenv("ENVIRONMENT", "dev").lower()
+
+    # validate environment name
+    valid_environments = {"dev", "staging", "production"}
+    if env_name not in valid_environments:
+        raise ValueError(
+            f"Invalid environment value: {env_name}. Must be one of {valid_environments}"
+        )
+
+    # use .env.dev for dev and staging, .env.prod for production
+    if env_name in {"dev", "staging"}:
+        env_filename = ".env.dev"
+    else:
+        env_filename = ".env.prod"
+
+    # path to parent directory (one level up from this file's package)
+    current_file = Path(__file__).resolve()
+    parent_dir = current_file.parent.parent
+    env_file = parent_dir / env_filename
+
+    # load the environment file
+    if env_file.exists():
+        load_dotenv(env_file, override=True)
+        print(f"Loaded environment variables from {env_file} (environment: {env_name})")
+    else:
+        print(f"Warning: {env_file} not found. Using system environment variables only.")

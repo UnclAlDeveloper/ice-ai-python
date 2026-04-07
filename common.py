@@ -1,1 +1,135 @@
-import hashlibimport osimport randomimport secretsimport timefrom datetime import datetime, timezonefrom typing import Optionalfrom sqlalchemy import create_engine, textfrom sqlalchemy.orm import Sessionfrom models.ice_ai import OauthTokens# PAUSEdef pause(min_seconds: float = 1.0, max_seconds: float = 3.0):    """    Wait a random amount of time to simulate human browsing behavior.    """    delay = random.uniform(min_seconds, max_seconds)    time.sleep(delay)# GET EXISTING HASH CODESdef get_existing_hash_codes(listing_source: str) -> set[str]:    """    Query database for existing hash_codes in prospect_listings filtered by    listing_source and restricted to rows with status 'New' or 'Viewed'.    """    database_url = os.getenv("AUTO_ADS_DATABASE_URL")    schema = os.getenv("AUTO_ADS_DATABASE_SCHEMA", "aa")    engine = create_engine(database_url)    with engine.connect() as conn:        result = conn.execute(            text(                f"SELECT hash_code FROM {schema}.prospect_listings "                f"WHERE listing_source = :listing_source "                f"AND status IN ('New', 'Viewed')"            ),            {"listing_source": listing_source},        )        return {row[0] for row in result}# GENERATE HASH CODEdef generate_hash_code(short_description: str) -> str:    """    Generate a 16-character hash code from the short description using MD5.    """    return hashlib.md5(short_description.encode()).hexdigest()[:16]# GENERATE IMAGE HASHdef generate_image_hash() -> str:    """    Generate a 16-character random hex string for use as an image filename.    """    return secrets.token_hex(8)# GET OAUTH TOKENSdef get_oauth_tokens(provider: str) -> Optional[OauthTokens]:    """    Read OAuth token data for a provider from the ia.oauth_tokens table.    Returns an OauthTokens instance, or None if no row exists.    """    database_url = os.getenv("ICE_AI_DATABASE_URL")    engine = create_engine(database_url)    with Session(engine) as session:        return session.get(OauthTokens, provider)# SAVE OAUTH TOKENSdef save_oauth_tokens(    provider: str,    account_id: Optional[str] = None,    access_token: Optional[str] = None,    access_token_expiry: Optional[datetime] = None,    refresh_token: Optional[str] = None,    refresh_token_expiry: Optional[datetime] = None,) -> None:    """    Upsert OAuth token data for a provider into the ia.oauth_tokens table.    Only non-None fields are updated so callers can update individual    columns without overwriting others.    """    database_url = os.getenv("ICE_AI_DATABASE_URL")    engine = create_engine(database_url)    with Session(engine) as session:        existing = session.get(OauthTokens, provider)        if existing is None:            existing = OauthTokens(provider=provider)            session.add(existing)        # only overwrite fields that the caller explicitly provided        if account_id is not None:            existing.account_id = account_id        if access_token is not None:            existing.access_token = access_token        if access_token_expiry is not None:            existing.access_token_expiry = access_token_expiry        if refresh_token is not None:            existing.refresh_token = refresh_token        if refresh_token_expiry is not None:            existing.refresh_token_expiry = refresh_token_expiry        existing.updated_at = datetime.now(timezone.utc)        session.commit()# DELETE OAUTH TOKENSdef delete_oauth_tokens(provider: str) -> None:    """    Remove the OAuth token row for a provider from the ia.oauth_tokens table.    No-op if the row does not exist.    """    database_url = os.getenv("ICE_AI_DATABASE_URL")    engine = create_engine(database_url)    with Session(engine) as session:        existing = session.get(OauthTokens, provider)        if existing is not None:            session.delete(existing)            session.commit()
+import hashlib
+import os
+import random
+import secrets
+import time
+from datetime import datetime, timezone
+from typing import Optional
+
+from sqlalchemy import create_engine, text
+from sqlalchemy.orm import Session
+
+from models.ice_ai import OauthTokens
+
+
+# PAUSE
+def pause(min_seconds: float = 1.0, max_seconds: float = 3.0):
+    """
+    Wait a random amount of time to simulate human browsing behavior.
+    """
+
+    delay = random.uniform(min_seconds, max_seconds)
+    time.sleep(delay)
+
+
+# GET EXISTING HASH CODES
+def get_existing_hash_codes(listing_source: str) -> set[str]:
+    """
+    Query database for existing hash_codes in prospect_listings filtered by
+    listing_source and restricted to rows with status 'New' or 'Viewed'.
+    """
+
+    database_url = os.getenv("AUTO_ADS_DATABASE_URL")
+    schema = os.getenv("AUTO_ADS_DATABASE_SCHEMA", "aa")
+
+    engine = create_engine(database_url)
+    with engine.connect() as conn:
+        result = conn.execute(
+            text(
+                f"SELECT hash_code FROM {schema}.prospect_listings "
+                f"WHERE listing_source = :listing_source "
+                f"AND status IN ('New', 'Viewed')"
+            ),
+            {"listing_source": listing_source},
+        )
+        return {row[0] for row in result}
+
+
+# GENERATE HASH CODE
+def generate_hash_code(short_description: str) -> str:
+    """
+    Generate a 16-character hash code from the short description using MD5.
+    """
+
+    return hashlib.md5(short_description.encode()).hexdigest()[:16]
+
+
+# GENERATE IMAGE HASH
+def generate_image_hash() -> str:
+    """
+    Generate a 16-character random hex string for use as an image filename.
+    """
+
+    return secrets.token_hex(8)
+
+
+# GET OAUTH TOKENS
+def get_oauth_tokens(provider: str) -> Optional[OauthTokens]:
+    """
+    Read OAuth token data for a provider from the ia.oauth_tokens table.
+    Returns an OauthTokens instance, or None if no row exists.
+    """
+
+    database_url = os.getenv("ICE_AI_DATABASE_URL")
+
+    engine = create_engine(database_url)
+    with Session(engine) as session:
+        return session.get(OauthTokens, provider)
+
+
+# SAVE OAUTH TOKENS
+def save_oauth_tokens(
+    provider: str,
+    account_id: Optional[str] = None,
+    access_token: Optional[str] = None,
+    access_token_expiry: Optional[datetime] = None,
+    refresh_token: Optional[str] = None,
+    refresh_token_expiry: Optional[datetime] = None,
+) -> None:
+    """
+    Upsert OAuth token data for a provider into the ia.oauth_tokens table.
+    Only non-None fields are updated so callers can update individual
+    columns without overwriting others.
+    """
+
+    database_url = os.getenv("ICE_AI_DATABASE_URL")
+
+    engine = create_engine(database_url)
+    with Session(engine) as session:
+        existing = session.get(OauthTokens, provider)
+
+        if existing is None:
+            existing = OauthTokens(provider=provider)
+            session.add(existing)
+
+        # only overwrite fields that the caller explicitly provided
+        if account_id is not None:
+            existing.account_id = account_id
+        if access_token is not None:
+            existing.access_token = access_token
+        if access_token_expiry is not None:
+            existing.access_token_expiry = access_token_expiry
+        if refresh_token is not None:
+            existing.refresh_token = refresh_token
+        if refresh_token_expiry is not None:
+            existing.refresh_token_expiry = refresh_token_expiry
+
+        existing.updated_at = datetime.now(timezone.utc)
+        session.commit()
+
+
+# DELETE OAUTH TOKENS
+def delete_oauth_tokens(provider: str) -> None:
+    """
+    Remove the OAuth token row for a provider from the ia.oauth_tokens table.
+    No-op if the row does not exist.
+    """
+
+    database_url = os.getenv("ICE_AI_DATABASE_URL")
+
+    engine = create_engine(database_url)
+    with Session(engine) as session:
+        existing = session.get(OauthTokens, provider)
+        if existing is not None:
+            session.delete(existing)
+            session.commit()

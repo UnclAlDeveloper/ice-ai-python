@@ -1,1 +1,39 @@
-from enum import StrEnum# LISTING SOURCEclass ListingSource(StrEnum):    """    Enumeration of listing sources with their corresponding database IDs.    """    AUTOTRADER = "Autotrader"    CAR_AND_CLASSIC = "Car&Classic"    EBAY = "eBay"    FACEBOOK = "Facebook"    GUMTREE = "Gumtree"    MANUAL_ENTRY = "ManualEntry"    ONLYVANS = "OnlyVans"# LISTING TABLEclass ListingTable(StrEnum):    """    Enumeration of listing tables with their corresponding database IDs.    """    PROSPECT = "Prospect"    RESALE = "Resale"# PROSPECT LISTING STATUSclass ProspectListingStatus(StrEnum):    """    Enumeration of prospect listing statuses with their corresponding database IDs.    """    NEW = "New"    VIEWED = "Viewed"    NOT_INTERESTED = "NotInterested"    INTERESTED = "Interested"    BOUGHT = "Bought"
+from enum import StrEnum
+
+
+# LISTING SOURCE
+class ListingSource(StrEnum):
+    """
+    Enumeration of listing sources with their corresponding database IDs.
+    """
+
+    AUTOTRADER = "Autotrader"
+    CAR_AND_CLASSIC = "Car&Classic"
+    EBAY = "eBay"
+    FACEBOOK = "Facebook"
+    GUMTREE = "Gumtree"
+    MANUAL_ENTRY = "ManualEntry"
+    ONLYVANS = "OnlyVans"
+
+
+# LISTING TABLE
+class ListingTable(StrEnum):
+    """
+    Enumeration of listing tables with their corresponding database IDs.
+    """
+
+    PROSPECT = "Prospect"
+    RESALE = "Resale"
+
+
+# PROSPECT LISTING STATUS
+class ProspectListingStatus(StrEnum):
+    """
+    Enumeration of prospect listing statuses with their corresponding database IDs.
+    """
+
+    NEW = "New"
+    VIEWED = "Viewed"
+    NOT_INTERESTED = "NotInterested"
+    INTERESTED = "Interested"
+    BOUGHT = "Bought"

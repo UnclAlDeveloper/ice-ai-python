@@ -22,7 +22,6 @@ load_environment()
 # Space-separated scopes for authorise URL; must cover Browse (Python downloader) and Sell Inventory (website listings).
 EBAY_OAUTH_SCOPES = (
     "https://api.ebay.com/oauth/api_scope "
-    "https://api.ebay.com/oauth/api_scope/buy.browse "
     "https://api.ebay.com/oauth/api_scope/sell.inventory "
     "https://api.ebay.com/oauth/api_scope/sell.account"
 )
@@ -74,13 +73,20 @@ async def ebay_connect() -> RedirectResponse:
         )
 
     authorize_base, _token_url = _ebay_oauth_endpoints()
-    params = urlencode({
+    raw_params = {
         "client_id": client_id,
         "redirect_uri": redirect_uri,
         "response_type": "code",
         "scope": EBAY_OAUTH_SCOPES,
         "state": "auto-ads-connect",
-    })
+    }
+
+    # log each parameter before encoding
+    print("eBay OAuth parameters (raw):")
+    for key, value in raw_params.items():
+        print(f"  {key}: {value}")
+
+    params = urlencode(raw_params)
     auth_url = f"{authorize_base}?{params}"
 
     print(f"Redirecting to eBay OAuth: {auth_url}")

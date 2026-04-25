@@ -1,21 +1,28 @@
 import base64
 import hashlib
 import json
+import logging
 import os
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 from urllib.parse import urlencode
 from urllib.request import Request as HttpRequest, urlopen
 from urllib.error import URLError, HTTPError
 
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from intuitlib.client import AuthClient
 
+from backup_databases import run_backups
 from common import save_oauth_tokens
 from environments import load_environment
 
 load_environment()
+
+logger = logging.getLogger(__name__)
 
 
 # EBAY OAUTH SCOPES
@@ -47,11 +54,49 @@ def _ebay_oauth_endpoints() -> tuple[str, str]:
     )
 
 
+# LIFESPAN
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    FastAPI lifespan that owns the nightly backup scheduler.
+
+    On startup, registers run_backups() to fire daily at 02:00 UTC and starts
+    the scheduler. On shutdown, stops the scheduler without waiting for any
+    in-flight job. The job is only registered when POSTGRESQL_BACKUPS_BUCKET
+    is configured so local development runs do not attempt nightly backups.
+    """
+
+    scheduler = AsyncIOScheduler(timezone="UTC")
+
+    # only register the nightly backup when a destination bucket is configured
+    if os.getenv("POSTGRESQL_BACKUPS_BUCKET"):
+        scheduler.add_job(
+            run_backups,
+            CronTrigger(hour=2, minute=0),
+            id="nightly-postgres-backup",
+            coalesce=True,
+            misfire_grace_time=3600,
+            max_instances=1,
+        )
+        logger.info("Nightly PostgreSQL backup scheduled for 02:00 UTC")
+    else:
+        logger.info(
+            "POSTGRESQL_BACKUPS_BUCKET not set; skipping nightly backup scheduling"
+        )
+
+    scheduler.start()
+    try:
+        yield
+    finally:
+        scheduler.shutdown(wait=False)
+
+
 # ICE AI API
 app = FastAPI(
     title="Ice AI API",
     description="API endpoints for Ice AI applications including Auto Ads eBay integration.",
     version="1.0.0",
+    lifespan=lifespan,
 )
 
 

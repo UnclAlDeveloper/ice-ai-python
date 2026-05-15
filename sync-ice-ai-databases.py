@@ -7,9 +7,12 @@ and auto-ads databases and saves them to the python/models directory.
 
 import os
 import re
-import subprocess
 import sys
+from importlib.metadata import entry_points
 from pathlib import Path
+
+from sqlalchemy import create_engine
+from sqlalchemy.schema import MetaData
 
 # add the python directory to sys.path so we can import environments
 script_dir = Path(str(__file__)).resolve().parent
@@ -106,7 +109,10 @@ def generate_models(
     database_url: str, schema: str, output_file: Path, database_name: str
 ) -> bool:
     """
-    Generate SQLAlchemy 2.0 dataclass models from a database using sqlacodegen-v2.
+    Generate SQLAlchemy 2.0 declarative models from a database using sqlacodegen-v2.
+
+    Runs sqlacodegen in-process so PyCharm's debugger does not inject pydevd into
+    child subprocesses (which causes ConnectionRefusedError when debugging).
     """
 
     print(f"\n{'='*60}")
@@ -115,44 +121,35 @@ def generate_models(
     print(f"Schema: {schema}")
     print(f"Output: {output_file}")
 
-    # build the sqlacodegen-v2 command
-    # using 'declarative' generator instead of 'dataclasses' to avoid
-    # "Column must be constructed with a non-blank name" errors with
-    # the legacy mapper_registry.mapped pattern
-    cmd = [
-        sys.executable,
-        "-m",
-        "sqlacodegen_v2",
-        "--generator",
-        "declarative",
-        "--schema",
-        schema,
-        "--outfile",
-        str(output_file),
-        database_url,
-    ]
-
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        # load the declarative generator (not dataclasses, to avoid blank-name errors)
+        generators = {
+            ep.name: ep for ep in entry_points(group="sqlacodegen_v2.generators")
+        }
+        if "declarative" not in generators:
+            raise ImportError("declarative generator not found in sqlacodegen_v2")
 
-        if result.stdout:
-            print(result.stdout)
+        generator_class = generators["declarative"].load()
+
+        # reflect schema and write generated models
+        engine = create_engine(database_url)
+        metadata = MetaData()
+        metadata.reflect(engine, schema, False, None)
+
+        generator = generator_class(metadata, engine, set())
+        output_file.write_text(generator.generate(), encoding="utf-8")
 
         print(f"Successfully generated models for {database_name}")
         return True
 
-    except subprocess.CalledProcessError as e:
-        print(f"Error generating models for {database_name}:")
-        print(f"  Return code: {e.returncode}")
-        if e.stdout:
-            print(f"  Stdout: {e.stdout}")
-        if e.stderr:
-            print(f"  Stderr: {e.stderr}")
-        return False
-
-    except FileNotFoundError:
+    except ImportError:
         print("Error: sqlacodegen-v2 is not installed.")
         print("Please install it with: pip install sqlacodegen-v2")
+        return False
+
+    except Exception as e:
+        print(f"Error generating models for {database_name}:")
+        print(f"  {type(e).__name__}: {e}")
         return False
 
 

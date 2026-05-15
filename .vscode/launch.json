@@ -10,7 +10,7 @@
             "request": "launch",
             "program": "${file}",
             "console": "integratedTerminal",
-            "python": "/opt/conda/envs/uncl-al-dev/bin/python"
+            "python": "/home/graeme/miniforge3/envs/ice-ai/bin/python"
         }
     ]
 }

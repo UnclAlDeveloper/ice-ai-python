@@ -17,6 +17,77 @@ from listing_images import download_and_save_listing_images
 from models.auto_ads import ProspectListings
 from models.enums import ListingSource, ProspectListingStatus
 
+UNAVAILABLE_ADVERT_TEXT = (
+    "This advert has now been removed through sale or otherwise"
+)
+
+
+# IS LISTING NO LONGER AVAILABLE
+def is_listing_no_longer_available(page: Page) -> bool:
+    """
+    Return True when the listing page shows that the advert has been removed.
+    """
+
+    unavailable_banner = page.get_by_text(UNAVAILABLE_ADVERT_TEXT, exact=False)
+    return unavailable_banner.count() > 0
+
+
+# UPDATE NEW LISTINGS AVAILABILITY
+def update_new_listings_availability(page: Page) -> None:
+    """
+    Visit each Car & Classic prospect listing with status New and mark any that are
+    no longer available as NotAvailable.
+    """
+
+    database_url = os.getenv("AUTO_ADS_DATABASE_URL")
+    engine = create_engine(database_url)
+    SessionLocal = sessionmaker(bind=engine)
+
+    with SessionLocal() as session:
+        new_listings = (
+            session.query(ProspectListings)
+            .filter(
+                ProspectListings.listing_source == ListingSource.CAR_AND_CLASSIC,
+                ProspectListings.status == ProspectListingStatus.NEW,
+            )
+            .order_by(ProspectListings.id)
+            .all()
+        )
+
+        if not new_listings:
+            print("No New Car & Classic listings to check for availability")
+            return
+
+        print(
+            f"Checking availability of {len(new_listings)} New Car & Classic listings..."
+        )
+
+        for listing in new_listings:
+            print(
+                f"Checking: {listing.make_and_model} - {listing.short_description[:50]}..."
+            )
+
+            # guard each visit so one bad listing does not abort the whole sweep
+            try:
+                page.goto(listing.url)
+                page.wait_for_load_state("domcontentloaded")
+
+                if is_listing_no_longer_available(page):
+                    listing.status = ProspectListingStatus.NOT_AVAILABLE
+                    listing.updated_at = datetime.now()
+                    session.commit()
+                    print(f"  Marked as NotAvailable: {listing.url}")
+                else:
+                    print("  Still available")
+            except Exception as e:
+                session.rollback()
+                print(f"  Error checking {listing.url}: {e}")
+
+            pause(2.0, 4.0)
+
+        print("Finished availability check for New listings")
+
+
 ICON_TO_FIELD = {
     "driving-wheel": "drive_configuration",
     "dial": "mileage_raw",
@@ -406,6 +477,8 @@ def car_and_classic():
 
         # wait for login to complete before navigating
         page.wait_for_load_state("load")
+
+        update_new_listings_availability(page)
 
         # navigate to saved searches
         pause()

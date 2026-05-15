@@ -33,6 +33,7 @@ class ProspectListingStatus(StrEnum):
     """
 
     NEW = "New"
+    NOT_AVAILABLE = "NotAvailable"
     VIEWED = "Viewed"
     NOT_INTERESTED = "NotInterested"
     INTERESTED = "Interested"

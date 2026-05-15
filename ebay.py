@@ -1,13 +1,24 @@
+import argparse
 import os
+import sys
+
+# parse --env before load_environment so the chosen env file is selected at import time
+_pre_parser = argparse.ArgumentParser(add_help=False)
+_pre_parser.add_argument("--env", choices=["dev", "prod"], default=None)
+_pre_args, _remaining_argv = _pre_parser.parse_known_args()
+if _pre_args.env is not None:
+    os.environ["ENVIRONMENT"] = "production" if _pre_args.env == "prod" else "dev"
+sys.argv[:] = [sys.argv[0]] + _remaining_argv
+
 from environments import load_environment
 load_environment()
 
 import shutil
-from datetime import datetime
-from typing import Generator, Optional
+from datetime import datetime, timezone
+from typing import Generator, Optional, Union
 
 from pydantic import BaseModel, PrivateAttr
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import Page, sync_playwright
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -18,6 +29,133 @@ from ai_analysis import process_ai_analysis_for_listing
 from models.enums import ListingSource, ProspectListingStatus
 
 from ebay_rest import API, Error
+from ebay_rest.date_time import DateTime
+
+UNAVAILABLE_ADVERT_TEXTS = (
+    "Bidding ended on",
+    "This listing ended on",
+    "This listing sold on",
+    "This listing was ended",
+)
+
+
+# PARSE DATETIME STRING
+def parse_datetime_string(value: str) -> datetime:
+    """
+    Parse a datetime string in eBay Z format or ISO 8601 with a timezone offset.
+    Always returns a UTC timezone-aware datetime.
+    """
+
+    try:
+        return DateTime.from_string(value)
+    except Error:
+        pass
+
+    # iso 8601 with +00:00 or a trailing Z
+    normalized = value.replace("Z", "+00:00")
+    parsed = datetime.fromisoformat(normalized)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+# FORMAT EBAY DATETIME STRING
+def format_ebay_datetime_string(value: Union[datetime, str]) -> str:
+    """
+    Format a datetime or string for the ebay_rest API (millisecond precision, Z suffix).
+    Accepts eBay Z strings and ISO 8601 strings with a timezone offset.
+    """
+
+    if isinstance(value, str):
+        dt = parse_datetime_string(value)
+    else:
+        dt = value
+
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+
+    return DateTime.to_string(dt)
+
+
+# ACCEPT EBAY COOKIE CONSENT IF PRESENT
+def accept_ebay_cookie_consent_if_present(page: Page) -> None:
+    """
+    Click 'Accept all' on the eBay GDPR cookie banner if visible, then wait
+    until the banner has disappeared. No-op if the banner is not present.
+    """
+
+    accept_btn = page.query_selector("#gdpr-banner-accept")
+    if accept_btn:
+        accept_btn.click()
+        page.wait_for_selector("#gdpr-banner", state="hidden", timeout=10000)
+
+
+# IS LISTING NO LONGER AVAILABLE
+def is_listing_no_longer_available(page: Page) -> bool:
+    """
+    Return True when the listing page shows that bidding or the listing has ended.
+    """
+
+    for text in UNAVAILABLE_ADVERT_TEXTS:
+        if page.get_by_text(text, exact=False).count() > 0:
+            return True
+    return False
+
+
+# UPDATE NEW LISTINGS AVAILABILITY
+def update_new_listings_availability(page: Page) -> None:
+    """
+    Visit each eBay prospect listing with status New and mark any that are
+    no longer available as NotAvailable.
+    """
+
+    database_url = os.getenv("AUTO_ADS_DATABASE_URL")
+    engine = create_engine(database_url)
+    SessionLocal = sessionmaker(bind=engine)
+
+    with SessionLocal() as session:
+        new_listings = (
+            session.query(ProspectListings)
+            .filter(
+                ProspectListings.listing_source == ListingSource.EBAY,
+                ProspectListings.status == ProspectListingStatus.NEW,
+            )
+            .order_by(ProspectListings.id)
+            .all()
+        )
+
+        if not new_listings:
+            print("No New eBay listings to check for availability")
+            return
+
+        print(f"Checking availability of {len(new_listings)} New eBay listings...")
+
+        for listing in new_listings:
+            print(
+                f"Checking: {listing.make_and_model} - {listing.short_description[:50]}..."
+            )
+
+            # guard each visit so one bad listing does not abort the whole sweep
+            try:
+                page.goto(listing.url, wait_until="domcontentloaded")
+                accept_ebay_cookie_consent_if_present(page)
+
+                if is_listing_no_longer_available(page):
+                    listing.status = ProspectListingStatus.NOT_AVAILABLE
+                    listing.updated_at = datetime.now()
+                    session.commit()
+                    print(f"  Marked as NotAvailable: {listing.url}")
+                else:
+                    print("  Still available")
+            except Exception as e:
+                session.rollback()
+                print(f"  Error checking {listing.url}: {e}")
+
+            pause(1.0, 2.0)
+
+        print("Finished availability check for New listings")
 
 
 # EBAY DOWNLOADER
@@ -110,7 +248,7 @@ class EbayDownloader(BaseModel):
         refresh_token = tokens.refresh_token if tokens else ""
         refresh_token_expiry = ""
         if tokens and tokens.refresh_token_expiry:
-            refresh_token_expiry = tokens.refresh_token_expiry.isoformat()
+            refresh_token_expiry = format_ebay_datetime_string(tokens.refresh_token_expiry)
 
         # user configuration with tokens from database
         user = {
@@ -235,10 +373,7 @@ class EbayDownloader(BaseModel):
         until the banner has disappeared. No-op if the banner is not present.
         """
 
-        accept_btn = self._page.query_selector("#gdpr-banner-accept")
-        if accept_btn:
-            accept_btn.click()
-            self._page.wait_for_selector("#gdpr-banner", state="hidden", timeout=10000)
+        accept_ebay_cookie_consent_if_present(self._page)
 
     def _extract_listing_details(self) -> dict:
         """
@@ -494,6 +629,8 @@ class EbayDownloader(BaseModel):
                 # launch browser once for all listings
                 self._browser = p.chromium.launch(headless=False)
                 self._page = self._browser.new_page()
+
+                update_new_listings_availability(self._page)
 
                 with SessionLocal() as session:
                     for listing in self.search_van_listings():

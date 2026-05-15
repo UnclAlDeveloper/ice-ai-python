@@ -22,6 +22,179 @@ from ai_analysis import (
 from models.auto_ads import ProspectListings
 from models.enums import ListingSource, ProspectListingStatus
 
+UNAVAILABLE_ADVERT_TEXT = (
+    "The advert you are looking for is no longer available"
+)
+
+
+# IS LISTING NO LONGER AVAILABLE
+def is_listing_no_longer_available(page: Page) -> bool:
+    """
+    Return True when the listing page shows that the advert is no longer available.
+    """
+
+    unavailable_banner = page.get_by_text(UNAVAILABLE_ADVERT_TEXT, exact=False)
+    return unavailable_banner.count() > 0
+
+
+# UPDATE NEW LISTINGS AVAILABILITY
+def update_new_listings_availability(page: Page) -> None:
+    """
+    Visit each Autotrader prospect listing with status New and mark any that are
+    no longer available as NotAvailable.
+    """
+
+    database_url = os.getenv("AUTO_ADS_DATABASE_URL")
+    engine = create_engine(database_url)
+    SessionLocal = sessionmaker(bind=engine)
+
+    with SessionLocal() as session:
+        new_listings = (
+            session.query(ProspectListings)
+            .filter(
+                ProspectListings.listing_source == ListingSource.AUTOTRADER,
+                ProspectListings.status == ProspectListingStatus.NEW,
+            )
+            .order_by(ProspectListings.id)
+            .all()
+        )
+
+        if not new_listings:
+            print("No New Autotrader listings to check for availability")
+            return
+
+        print(f"Checking availability of {len(new_listings)} New Autotrader listings...")
+
+        for listing in new_listings:
+            print(
+                f"Checking: {listing.make_and_model} - {listing.short_description[:50]}..."
+            )
+
+            # guard each visit so one bad listing does not abort the whole sweep
+            try:
+                page.goto(listing.url)
+                page.wait_for_load_state("domcontentloaded")
+
+                if is_listing_no_longer_available(page):
+                    listing.status = ProspectListingStatus.NOT_AVAILABLE
+                    listing.updated_at = datetime.now()
+                    session.commit()
+                    print(f"  Marked as NotAvailable: {listing.url}")
+                else:
+                    print("  Still available")
+            except Exception as e:
+                session.rollback()
+                print(f"  Error checking {listing.url}: {e}")
+
+            pause(2.0, 4.0)
+
+        print("Finished availability check for New listings")
+
+
+# DISMISS COOKIE CONSENT
+def dismiss_cookie_consent(page: Page) -> None:
+    """
+    Dismiss the AutoTrader cookie consent modal when it appears inside its iframe.
+    """
+
+    consent_iframe = page.frame_locator("iframe[id*='sp_message_iframe']")
+
+    reject_all_button = consent_iframe.get_by_role("button", name="Reject All")
+    if reject_all_button.count() > 0:
+        reject_all_button.click()
+        print("Clicked 'Reject All' on cookie consent")
+        return
+
+    essential_button = consent_iframe.get_by_role(
+        "button", name="Essential cookies only"
+    )
+    if essential_button.count() > 0:
+        essential_button.click()
+        print("Clicked 'Essential cookies only' on cookie consent")
+        return
+
+    all_buttons = consent_iframe.get_by_role("button")
+    button_count = all_buttons.count()
+    if button_count >= 3:
+        all_buttons.nth(1).click()
+        print("Clicked middle button on cookie consent")
+    elif button_count > 0:
+        print(
+            f"Warning: Found {button_count} buttons, expected 3. Clicking first button."
+        )
+        all_buttons.first.click()
+
+
+# LOGIN
+def login(page: Page) -> None:
+    """
+    Sign in to AutoTrader using credentials from environment variables.
+    """
+
+    sign_in_button = page.get_by_role("button", name="Sign in")
+    sign_in_button.click()
+    print("Clicked 'Sign in' button")
+    pause()
+
+    email = os.getenv("AUTOTRADER_EMAIL")
+    if not email:
+        raise ValueError("AUTOTRADER_EMAIL not found in environment variables")
+
+    email_input = page.get_by_test_id("enter-email-input")
+    try:
+        email_input.wait_for(state="visible", timeout=10000)
+    except Exception:
+        print(
+            "Waiting for 'are you human' verification to be completed manually..."
+        )
+        email_input.wait_for(state="visible", timeout=1200000)
+        print("'Are you human' verification completed")
+    email_input.fill(email)
+    print(f"Entered email address: {email}")
+    pause()
+
+    continue_button = page.get_by_test_id("create-username-continue-button")
+    continue_button.click()
+    print("Clicked 'Continue' button")
+    pause()
+
+    print(
+        "Waiting for next step (password, captcha, or email verification code)..."
+    )
+    password_input = page.get_by_test_id("password-entry-password-input")
+    home_indicator = page.get_by_test_id("header-saved-icon")
+    next_step = password_input.or_(home_indicator)
+    next_step.wait_for(state="visible", timeout=1200000)
+
+    if password_input.is_visible():
+        print("Password form appeared")
+
+        password = os.getenv("AUTOTRADER_PASSWORD")
+        if not password:
+            raise ValueError(
+                "AUTOTRADER_PASSWORD not found in environment variables"
+            )
+
+        password_input.fill(password)
+        print("Entered password")
+        pause()
+
+        sign_in_submit = page.get_by_test_id("password-entry-sign-in-button")
+        sign_in_submit.click()
+        print("Clicked 'Sign in' button")
+        pause()
+    else:
+        focus_lock_modal = page.locator('[data-focus-lock-disabled="false"]')
+        if focus_lock_modal.count() > 0:
+            print(
+                "Email verification code required. "
+                "Please enter the code sent to your email in the browser."
+            )
+            focus_lock_modal.wait_for(state="hidden", timeout=1200000)
+            print("Email verification code entered, proceeding to home page")
+        else:
+            print("Reached home page")
+
 
 # GET SPECS AND FEATURES
 def get_specs_and_features(page: Page) -> Optional[str]:
@@ -690,113 +863,12 @@ def main():
         print("Navigated to autotrader.co.uk")
         pause()
 
-        # dismiss the cookie consent modal (it's inside an iframe)
-        consent_iframe = page.frame_locator("iframe[id*='sp_message_iframe']")
-
-        # try to find and click "Reject All" button
-        reject_all_button = consent_iframe.get_by_role("button", name="Reject All")
-        if reject_all_button.count() > 0:
-            reject_all_button.click()
-            print("Clicked 'Reject All' on cookie consent")
-        else:
-            # try "Essential cookies only" button
-            essential_button = consent_iframe.get_by_role(
-                "button", name="Essential cookies only"
-            )
-            if essential_button.count() > 0:
-                essential_button.click()
-                print("Clicked 'Essential cookies only' on cookie consent")
-            else:
-                # get all buttons and click the middle one (should be 3 buttons)
-                all_buttons = consent_iframe.get_by_role("button")
-                button_count = all_buttons.count()
-                if button_count >= 3:
-                    # click the middle button (index 1)
-                    all_buttons.nth(1).click()
-                    print("Clicked middle button on cookie consent")
-                else:
-                    print(
-                        f"Warning: Found {button_count} buttons, expected 3. Clicking first button."
-                    )
-                    all_buttons.first.click()
-
+        dismiss_cookie_consent(page)
         pause()
 
-        # click the sign in button to navigate to the sign in screen
-        sign_in_button = page.get_by_role("button", name="Sign in")
-        sign_in_button.click()
-        print("Clicked 'Sign in' button")
-        pause()
+        login(page)
 
-        # load email from environment variables
-        email = os.getenv("AUTOTRADER_EMAIL")
-        if not email:
-            raise ValueError("AUTOTRADER_EMAIL not found in environment variables")
-
-        # wait for email input, handling possible 'are you human' verification
-        email_input = page.get_by_test_id("enter-email-input")
-        try:
-            email_input.wait_for(state="visible", timeout=10000)
-        except Exception:
-            # email input didn't appear quickly, likely an 'are you human' check
-            print(
-                "Waiting for 'are you human' verification to be completed manually..."
-            )
-            email_input.wait_for(state="visible", timeout=1200000)
-            print("'Are you human' verification completed")
-        email_input.fill(email)
-        print(f"Entered email address: {email}")
-        pause()
-
-        # click the Continue button
-        continue_button = page.get_by_test_id("create-username-continue-button")
-        continue_button.click()
-        print("Clicked 'Continue' button")
-        pause()
-
-        # wait for either password form or home page (verification code bypasses password)
-        print(
-            "Waiting for next step (password, captcha, or email verification code)..."
-        )
-        password_input = page.get_by_test_id("password-entry-password-input")
-        home_indicator = page.get_by_test_id("header-saved-icon")
-        next_step = password_input.or_(home_indicator)
-        next_step.wait_for(state="visible", timeout=1200000)
-
-        if password_input.is_visible():
-            # normal password flow
-            print("Password form appeared")
-
-            # load password from environment variable
-            password = os.getenv("AUTOTRADER_PASSWORD")
-            if not password:
-                raise ValueError(
-                    "AUTOTRADER_PASSWORD not found in environment variables"
-                )
-
-            # fill in the password field
-            password_input.fill(password)
-            print("Entered password")
-            pause()
-
-            # click the sign in button
-            sign_in_button = page.get_by_test_id("password-entry-sign-in-button")
-            sign_in_button.click()
-            print("Clicked 'Sign in' button")
-            pause()
-        else:
-            # home page header is visible but a focus-locked email verification code
-            # modal may be blocking it — wait for any such modal to be dismissed first
-            focus_lock_modal = page.locator('[data-focus-lock-disabled="false"]')
-            if focus_lock_modal.count() > 0:
-                print(
-                    "Email verification code required. "
-                    "Please enter the code sent to your email in the browser."
-                )
-                focus_lock_modal.wait_for(state="hidden", timeout=1200000)
-                print("Email verification code entered, proceeding to home page")
-            else:
-                print("Reached home page")
+        update_new_listings_availability(page)
 
         # click the Saved button
         saved_button = page.get_by_test_id("header-saved-icon")

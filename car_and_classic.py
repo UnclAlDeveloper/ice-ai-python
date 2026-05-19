@@ -1,10 +1,20 @@
+import argparse
 import os
 import re
 import shutil
+import sys
 from datetime import date, datetime
-from typing import Optional
+
+# parse --env before load_environment so the chosen env file is selected at import time
+_pre_parser = argparse.ArgumentParser(add_help=False)
+_pre_parser.add_argument("--env", choices=["dev", "prod"], default=None)
+_pre_args, _remaining_argv = _pre_parser.parse_known_args()
+if _pre_args.env is not None:
+    os.environ["ENVIRONMENT"] = "production" if _pre_args.env == "prod" else "dev"
+sys.argv[:] = [sys.argv[0]] + _remaining_argv
 
 from environments import load_environment
+
 load_environment()
 
 from playwright.sync_api import Page, sync_playwright
@@ -12,8 +22,17 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from ai_analysis import apply_ai_analysis, generate_ai_analysis
-from common import generate_hash_code, get_existing_hash_codes, pause
-from listing_images import download_and_save_listing_images
+from common import (
+    generate_hash_code,
+    get_existing_hash_codes,
+    goto_with_captcha_handling,
+    is_captcha_present,
+    is_http_not_found,
+    is_not_found_error,
+    pause,
+    wait_for_captcha_solve,
+)
+from listing_images import delete_listing_images, download_and_save_listing_images
 from models.auto_ads import ProspectListings
 from models.enums import ListingSource, ProspectListingStatus
 
@@ -69,21 +88,33 @@ def update_new_listings_availability(page: Page) -> None:
 
             # guard each visit so one bad listing does not abort the whole sweep
             try:
-                page.goto(listing.url)
-                page.wait_for_load_state("domcontentloaded")
+                response = goto_with_captcha_handling(page, listing.url)
 
-                if is_listing_no_longer_available(page):
+                if is_http_not_found(response) or is_listing_no_longer_available(page):
                     listing.status = ProspectListingStatus.NOT_AVAILABLE
                     listing.updated_at = datetime.now()
                     session.commit()
-                    print(f"  Marked as NotAvailable: {listing.url}")
+                    reason = "404" if is_http_not_found(response) else "unavailable"
+                    print(f"  Marked as NotAvailable ({reason}): {listing.url}")
+
+                    # drop the now-orphaned photos from s3 and the images table
+                    delete_listing_images(listing, session)
                 else:
                     print("  Still available")
             except Exception as e:
-                session.rollback()
-                print(f"  Error checking {listing.url}: {e}")
+                if is_not_found_error(e):
+                    listing.status = ProspectListingStatus.NOT_AVAILABLE
+                    listing.updated_at = datetime.now()
+                    session.commit()
+                    print(f"  Marked as NotAvailable (404): {listing.url}")
 
-            pause(2.0, 4.0)
+                    # drop the now-orphaned photos from s3 and the images table
+                    delete_listing_images(listing, session)
+                else:
+                    session.rollback()
+                    print(f"  Error checking {listing.url}: {e}")
+
+            pause(2.0, 8.0)
 
         print("Finished availability check for New listings")
 
@@ -146,6 +177,26 @@ def parse_mileage(raw: str) -> tuple[int | None, str]:
     return None, ""
 
 
+# DISMISS INERTIA ERROR DIALOG
+def dismiss_inertia_error_dialog(page: Page) -> bool:
+    """
+    Remove the Inertia.js error overlay dialog if one is open. The overlay
+    renders a full-page iframe that intercepts pointer events, so any
+    subsequent click on the underlying page silently times out until it is
+    cleared. Returns True if a dialog was dismissed.
+    """
+
+    dialog = page.locator("dialog#inertia-error-dialog")
+    if dialog.count() == 0:
+        return False
+
+    # the dialog exposes no visible close control, so detach it from the dom
+    page.evaluate(
+        "document.getElementById('inertia-error-dialog')?.remove()"
+    )
+    return True
+
+
 # EXTRACT GALLERY IMAGES
 def extract_gallery_images(page: Page) -> list[str]:
     """
@@ -156,6 +207,9 @@ def extract_gallery_images(page: Page) -> list[str]:
     """
 
     image_urls = []
+
+    # clear any inertia error overlay that would intercept the gallery click
+    dismiss_inertia_error_dialog(page)
 
     gallery_section = page.locator('section:has(h2:text("Gallery"))')
     if gallery_section.count() == 0:
@@ -354,6 +408,9 @@ def scrape_listings(page: Page):
     if use_new_section:
         print("New vehicles section detected — processing only new listings")
 
+    # remember the search-results url so we can recover after a per-listing failure
+    search_url = page.url
+
     while True:
         pause()
 
@@ -385,54 +442,94 @@ def scrape_listings(page: Page):
                 print(f"  [{i + 1}] {title} — already exists, skipping")
                 continue
 
-            # click into the listing detail page
-            articles.nth(i).locator("a").first.click()
-            page.wait_for_selector("section h1", state="visible", timeout=15000)
-            pause()
-
-            prospect_listing, image_urls = extract_listing_details(page, hash_code)
-            new_count += 1
-            print(f"  [{i + 1}] {title}")
-            print(f"      make_and_model: {prospect_listing.make_and_model}")
-            print(f"      year: {prospect_listing.year}")
-            print(f"      location: {prospect_listing.location}")
-            print(f"      images: {len(image_urls)}")
-
-            # save to database and download images
-            with SessionLocal() as session:
-                session.add(prospect_listing)
-                session.flush()
-                session.commit()
-                session.refresh(prospect_listing)
-
-                temp_image_dir = download_and_save_listing_images(
-                    image_urls,
-                    page,
-                    prospect_listing,
-                    session,
-                    temp_dir_prefix="car_and_classic_images_",
+            # process each listing inside a guard so one bad listing cannot
+            # abort the whole sweep; on failure we re-navigate to the search
+            # results so the next iteration starts from a known good state
+            try:
+                # navigate to the listing via its href instead of clicking the
+                # card, because the anchor is overlaid by a sibling that
+                # intercepts pointer events; goto_with_captcha_handling also
+                # pauses for any captcha shown in place of the detail page
+                href = articles.nth(i).locator("a").first.get_attribute("href")
+                listing_url = (
+                    href
+                    if href.startswith("http")
+                    else f"https://www.carandclassic.com{href}"
                 )
-
-                ai_analysis = generate_ai_analysis(
-                    "classic_car_prompt.md", prospect_listing, temp_image_dir
+                goto_with_captcha_handling(page, listing_url)
+                page.wait_for_selector(
+                    "section h1", state="visible", timeout=15000
                 )
-                apply_ai_analysis(prospect_listing, ai_analysis)
+                pause()
 
-                session.add(prospect_listing)
-                session.flush()
-                session.commit()
+                prospect_listing, image_urls = extract_listing_details(
+                    page, hash_code
+                )
+                new_count += 1
+                print(f"  [{i + 1}] {title}")
+                print(f"      make_and_model: {prospect_listing.make_and_model}")
+                print(f"      year: {prospect_listing.year}")
+                print(f"      location: {prospect_listing.location}")
+                print(f"      images: {len(image_urls)}")
 
-                if temp_image_dir and os.path.isdir(temp_image_dir):
-                    shutil.rmtree(temp_image_dir)
+                # save to database and download images
+                with SessionLocal() as session:
+                    session.add(prospect_listing)
+                    session.flush()
+                    session.commit()
+                    session.refresh(prospect_listing)
 
-            existing_hash_codes.add(hash_code)
+                    temp_image_dir = download_and_save_listing_images(
+                        image_urls,
+                        page,
+                        prospect_listing,
+                        session,
+                        temp_dir_prefix="car_and_classic_images_",
+                    )
 
-            # navigate back to the search results
-            page.go_back()
-            page.wait_for_selector(
-                '[data-testid="card-listing"]', state="attached", timeout=15000
-            )
-            pause()
+                    ai_analysis = generate_ai_analysis(
+                        "classic_car_prompt.md", prospect_listing, temp_image_dir
+                    )
+                    apply_ai_analysis(prospect_listing, ai_analysis)
+
+                    session.add(prospect_listing)
+                    session.flush()
+                    session.commit()
+
+                    if temp_image_dir and os.path.isdir(temp_image_dir):
+                        shutil.rmtree(temp_image_dir)
+
+                existing_hash_codes.add(hash_code)
+
+                # navigate back to the search results, handling any captcha
+                # that may interpose on the back-navigation
+                page.go_back()
+                if is_captcha_present(page):
+                    wait_for_captcha_solve(page)
+                page.wait_for_selector(
+                    '[data-testid="card-listing"]',
+                    state="attached",
+                    timeout=15000,
+                )
+                pause()
+            except Exception as e:
+                print(f"  [{i + 1}] {title} — error, skipping: {e}")
+
+                # re-load the search results so the next iteration can proceed
+                try:
+                    goto_with_captcha_handling(page, search_url)
+                    page.wait_for_selector(
+                        '[data-testid="card-listing"]',
+                        state="attached",
+                        timeout=15000,
+                    )
+                    pause()
+                except Exception as recovery_error:
+                    print(
+                        f"      Failed to recover to search results: "
+                        f"{recovery_error}"
+                    )
+                    raise
 
         # new-vehicles section has no pagination, so stop after one pass
         if use_new_section:
@@ -459,12 +556,10 @@ def car_and_classic():
     accept cookies, and log in using stored credentials.
     """
 
-    load_environment()
-
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=False)
         page = browser.new_page()
-        page.goto("https://www.carandclassic.com")
+        goto_with_captcha_handling(page, "https://www.carandclassic.com")
 
         pause()
         accept_cookies(page)
@@ -482,7 +577,9 @@ def car_and_classic():
 
         # navigate to saved searches
         pause()
-        page.goto("https://www.carandclassic.com/account/saved")
+        goto_with_captcha_handling(
+            page, "https://www.carandclassic.com/account/saved"
+        )
         page.wait_for_load_state("load")
 
         # click the first saved search link
@@ -498,8 +595,12 @@ def car_and_classic():
 
         scrape_listings(page)
 
-        # keep the browser open until the user closes it
-        page.wait_for_event("close", timeout=0)
+        # in interactive runs, keep the browser open until the user closes it
+        # so they can inspect state; in non-interactive runs (e.g. the scheduler
+        # subprocess) close immediately so the process exits and the next
+        # scheduled run is not blocked by max_instances=1
+        if sys.stdin.isatty():
+            page.wait_for_event("close", timeout=0)
         browser.close()
 
 

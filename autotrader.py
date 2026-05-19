@@ -1,8 +1,19 @@
+import argparse
 import os
 import re
 import shutil
+import sys
+import time
 from datetime import date, datetime
 from typing import Optional
+
+# parse --env before load_environment so the chosen env file is selected at import time
+_pre_parser = argparse.ArgumentParser(add_help=False)
+_pre_parser.add_argument("--env", choices=["dev", "prod"], default=None)
+_pre_args, _remaining_argv = _pre_parser.parse_known_args()
+if _pre_args.env is not None:
+    os.environ["ENVIRONMENT"] = "production" if _pre_args.env == "prod" else "dev"
+sys.argv[:] = [sys.argv[0]] + _remaining_argv
 
 from environments import load_environment
 
@@ -12,8 +23,17 @@ from playwright.sync_api import Page, sync_playwright
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
-from common import generate_hash_code, get_existing_hash_codes, pause
-from listing_images import download_and_save_listing_images
+from common import (
+    generate_hash_code,
+    get_existing_hash_codes,
+    goto_with_captcha_handling,
+    is_captcha_present,
+    is_http_not_found,
+    is_not_found_error,
+    pause,
+    wait_for_captcha_solve,
+)
+from listing_images import delete_listing_images, download_and_save_listing_images
 from ai_analysis import (
     apply_ai_analysis,
     generate_ai_analysis,
@@ -72,21 +92,33 @@ def update_new_listings_availability(page: Page) -> None:
 
             # guard each visit so one bad listing does not abort the whole sweep
             try:
-                page.goto(listing.url)
-                page.wait_for_load_state("domcontentloaded")
+                response = goto_with_captcha_handling(page, listing.url)
 
-                if is_listing_no_longer_available(page):
+                if is_http_not_found(response) or is_listing_no_longer_available(page):
                     listing.status = ProspectListingStatus.NOT_AVAILABLE
                     listing.updated_at = datetime.now()
                     session.commit()
-                    print(f"  Marked as NotAvailable: {listing.url}")
+                    reason = "404" if is_http_not_found(response) else "unavailable"
+                    print(f"  Marked as NotAvailable ({reason}): {listing.url}")
+
+                    # drop the now-orphaned photos from s3 and the images table
+                    delete_listing_images(listing, session)
                 else:
                     print("  Still available")
             except Exception as e:
-                session.rollback()
-                print(f"  Error checking {listing.url}: {e}")
+                if is_not_found_error(e):
+                    listing.status = ProspectListingStatus.NOT_AVAILABLE
+                    listing.updated_at = datetime.now()
+                    session.commit()
+                    print(f"  Marked as NotAvailable (404): {listing.url}")
 
-            pause(2.0, 4.0)
+                    # drop the now-orphaned photos from s3 and the images table
+                    delete_listing_images(listing, session)
+                else:
+                    session.rollback()
+                    print(f"  Error checking {listing.url}: {e}")
+
+            pause(2.0, 8.0)
 
         print("Finished availability check for New listings")
 
@@ -125,6 +157,46 @@ def dismiss_cookie_consent(page: Page) -> None:
         all_buttons.first.click()
 
 
+# POLL FOR LOGIN STATE
+def poll_for_login_state(
+    page: Page,
+    password_input,
+    verification_modal,
+    timeout_s: float = 30.0,
+    poll_ms: int = 200,
+) -> Optional[str]:
+    """
+    Poll for the first observable post-continue login state and return its
+    name. Returns 'password' as soon as the password form is visible,
+    'verification' as soon as the email verification code modal is visible,
+    or None on timeout. Polling reacts within poll_ms milliseconds, which is
+    important because the user may dismiss the modal faster than a single
+    long fixed-timeout wait would notice.
+    """
+
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+
+        # check the password form first as it is the prerequisite step when
+        # autotrader needs both credentials
+        try:
+            if password_input.is_visible():
+                return "password"
+        except Exception:
+            pass
+
+        try:
+            if verification_modal.is_visible():
+                return "verification"
+        except Exception:
+            pass
+
+        # short sleep keeps the loop responsive without busy-spinning
+        page.wait_for_timeout(poll_ms)
+
+    return None
+
+
 # LOGIN
 def login(page: Page) -> None:
     """
@@ -159,14 +231,21 @@ def login(page: Page) -> None:
     pause()
 
     print(
-        "Waiting for next step (password, captcha, or email verification code)..."
+        "Waiting for next step (password or email verification code)..."
     )
     password_input = page.get_by_test_id("password-entry-password-input")
     home_indicator = page.get_by_test_id("header-saved-icon")
-    next_step = password_input.or_(home_indicator)
-    next_step.wait_for(state="visible", timeout=1200000)
+    verification_modal = page.locator('[data-focus-lock-disabled="false"]').first
 
-    if password_input.is_visible():
+    # poll for the next state instead of waiting on each with a long timeout,
+    # so the script reacts within ~200ms when the user interacts with the
+    # modal. a multi-element or_() wait can't be used here because the home
+    # header renders behind the modal, causing a strict mode violation
+    detected = poll_for_login_state(
+        page, password_input, verification_modal, timeout_s=30.0
+    )
+
+    if detected == "password":
         print("Password form appeared")
 
         password = os.getenv("AUTOTRADER_PASSWORD")
@@ -183,17 +262,25 @@ def login(page: Page) -> None:
         sign_in_submit.click()
         print("Clicked 'Sign in' button")
         pause()
-    else:
-        focus_lock_modal = page.locator('[data-focus-lock-disabled="false"]')
-        if focus_lock_modal.count() > 0:
-            print(
-                "Email verification code required. "
-                "Please enter the code sent to your email in the browser."
-            )
-            focus_lock_modal.wait_for(state="hidden", timeout=1200000)
-            print("Email verification code entered, proceeding to home page")
-        else:
-            print("Reached home page")
+
+        # after the password, autotrader normally still asks for an emailed
+        # verification code, so poll again for the modal
+        detected = poll_for_login_state(
+            page, password_input, verification_modal, timeout_s=30.0
+        )
+
+    if detected == "verification":
+        print(
+            "Email verification code required. "
+            "Please enter the code sent to your email in the browser, then submit it."
+        )
+        # block until the user dismisses the modal — reacts immediately on close
+        verification_modal.wait_for(state="hidden", timeout=1200000)
+        print("Email verification code entered")
+
+    # final guard so the caller only proceeds once the home page is loaded
+    home_indicator.wait_for(state="visible", timeout=1200000)
+    print("Reached home page")
 
 
 # GET SPECS AND FEATURES
@@ -849,9 +936,6 @@ def main():
     Navigate to autotrader.co.uk using Playwright with visible browser.
     """
 
-    # load environment variables based on app type and environment setting
-    load_environment()
-
     # load existing hash codes from database at startup
     existing_hash_codes = get_existing_hash_codes(ListingSource.AUTOTRADER)
     print(f"Loaded {len(existing_hash_codes)} existing hash codes from database")
@@ -859,7 +943,7 @@ def main():
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=False)
         page = browser.new_page()
-        page.goto("https://www.autotrader.co.uk")
+        goto_with_captcha_handling(page, "https://www.autotrader.co.uk")
         print("Navigated to autotrader.co.uk")
         pause()
 
@@ -966,9 +1050,12 @@ def main():
                             )
                             continue
 
-                        # click to navigate to detail page
+                        # click to navigate to detail page, pausing for any
+                        # captcha that appears in place of the detail page
                         title_link.click()
                         page.wait_for_load_state("domcontentloaded")
+                        if is_captcha_present(page):
+                            wait_for_captcha_solve(page)
                         pause()
 
                         # extract full listing details
@@ -984,12 +1071,15 @@ def main():
                         # pause before navigating back
                         pause(2.0, 10.0)
 
-                        # navigate back using "Back to results" link
+                        # navigate back using "Back to results" link, handling
+                        # any captcha that interposes on the return navigation
                         back_button = page.locator(
                             'a[data-testid="back-to-search-link"]'
                         )
                         back_button.click()
                         page.wait_for_load_state("domcontentloaded")
+                        if is_captcha_present(page):
+                            wait_for_captcha_solve(page)
                         pause()
 
                         processed_listing_ids.add(listing_id)

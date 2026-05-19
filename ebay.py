@@ -22,8 +22,16 @@ from playwright.sync_api import Page, sync_playwright
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from common import generate_hash_code, get_existing_hash_codes, get_oauth_tokens, save_oauth_tokens, pause
-from listing_images import download_and_save_listing_images
+from common import (
+    generate_hash_code,
+    get_existing_hash_codes,
+    get_oauth_tokens,
+    is_http_not_found,
+    is_not_found_error,
+    pause,
+    save_oauth_tokens,
+)
+from listing_images import delete_listing_images, download_and_save_listing_images
 from models.auto_ads import ProspectListings
 from ai_analysis import process_ai_analysis_for_listing
 from models.enums import ListingSource, ProspectListingStatus
@@ -139,19 +147,41 @@ def update_new_listings_availability(page: Page) -> None:
 
             # guard each visit so one bad listing does not abort the whole sweep
             try:
-                page.goto(listing.url, wait_until="domcontentloaded")
-                accept_ebay_cookie_consent_if_present(page)
+                response = page.goto(listing.url, wait_until="domcontentloaded")
 
-                if is_listing_no_longer_available(page):
+                if is_http_not_found(response):
                     listing.status = ProspectListingStatus.NOT_AVAILABLE
                     listing.updated_at = datetime.now()
                     session.commit()
-                    print(f"  Marked as NotAvailable: {listing.url}")
+                    print(f"  Marked as NotAvailable (404): {listing.url}")
+
+                    # drop the now-orphaned photos from s3 and the images table
+                    delete_listing_images(listing, session)
                 else:
-                    print("  Still available")
+                    accept_ebay_cookie_consent_if_present(page)
+
+                    if is_listing_no_longer_available(page):
+                        listing.status = ProspectListingStatus.NOT_AVAILABLE
+                        listing.updated_at = datetime.now()
+                        session.commit()
+                        print(f"  Marked as NotAvailable (unavailable): {listing.url}")
+
+                        # drop the now-orphaned photos from s3 and the images table
+                        delete_listing_images(listing, session)
+                    else:
+                        print("  Still available")
             except Exception as e:
-                session.rollback()
-                print(f"  Error checking {listing.url}: {e}")
+                if is_not_found_error(e):
+                    listing.status = ProspectListingStatus.NOT_AVAILABLE
+                    listing.updated_at = datetime.now()
+                    session.commit()
+                    print(f"  Marked as NotAvailable (404): {listing.url}")
+
+                    # drop the now-orphaned photos from s3 and the images table
+                    delete_listing_images(listing, session)
+                else:
+                    session.rollback()
+                    print(f"  Error checking {listing.url}: {e}")
 
             pause(1.0, 2.0)
 

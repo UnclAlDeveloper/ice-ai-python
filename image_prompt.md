@@ -1,0 +1,1 @@
+Can you create a 128px x 128px crayon on canvas impression of the attached image with the registration number not visible.

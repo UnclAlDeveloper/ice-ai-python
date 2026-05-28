@@ -557,7 +557,7 @@ def car_and_classic():
     """
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False)
+        browser = p.chromium.launch(headless=True)
         page = browser.new_page()
         goto_with_captcha_handling(page, "https://www.carandclassic.com")
 

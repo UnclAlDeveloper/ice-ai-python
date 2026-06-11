@@ -19,19 +19,23 @@ from environments import load_environment
 
 load_environment()
 
-from playwright.sync_api import Page, sync_playwright
+from stealth_browser import (
+    Page,
+    goto_with_captcha_handling,
+    is_captcha_present,
+    launch_stealth_chromium,
+    sync_stealth_playwright,
+    wait_for_captcha_solve,
+)
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
 from common import (
     generate_hash_code,
     get_existing_hash_codes,
-    goto_with_captcha_handling,
-    is_captcha_present,
     is_http_not_found,
     is_not_found_error,
     pause,
-    wait_for_captcha_solve,
 )
 from listing_images import delete_listing_images, download_and_save_listing_images
 from ai_analysis import (
@@ -940,8 +944,8 @@ def main():
     existing_hash_codes = get_existing_hash_codes(ListingSource.AUTOTRADER)
     print(f"Loaded {len(existing_hash_codes)} existing hash codes from database")
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False)
+    with sync_stealth_playwright() as p:
+        browser = launch_stealth_chromium(p, headless=False)
         page = browser.new_page()
         goto_with_captcha_handling(page, "https://www.autotrader.co.uk")
         print("Navigated to autotrader.co.uk")

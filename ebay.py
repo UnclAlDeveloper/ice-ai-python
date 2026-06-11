@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from typing import Generator, Optional, Union
 
 from pydantic import BaseModel, PrivateAttr
-from playwright.sync_api import Page, sync_playwright
+from stealth_browser import Page, launch_stealth_chromium, sync_stealth_playwright
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -655,9 +655,9 @@ class EbayDownloader(BaseModel):
         listings = []
 
         try:
-            with sync_playwright() as p:
+            with sync_stealth_playwright() as p:
                 # launch browser once for all listings
-                self._browser = p.chromium.launch(headless=False)
+                self._browser = launch_stealth_chromium(p, headless=False)
                 self._page = self._browser.new_page()
 
                 update_new_listings_availability(self._page)

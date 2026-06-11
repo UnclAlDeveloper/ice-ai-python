@@ -1,44 +1,16 @@
 import hashlib
 import os
 import random
+import re
 import secrets
-import sys
 import time
 from datetime import datetime, timezone
 from typing import Optional
 
-from playwright.sync_api import Page
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session
 
 from models.ice_ai import OauthTokens
-
-CAPTCHA_URL_FRAGMENTS = (
-    "challenges.cloudflare.com",
-    "/cdn-cgi/challenge-platform",
-    "captcha",
-    "datadome",
-    "perimeterx",
-    "px-captcha",
-    "/_Incapsula_Resource",
-)
-
-CAPTCHA_TITLE_FRAGMENTS = (
-    "just a moment",
-    "attention required",
-    "verify you are human",
-    "are you human",
-    "access denied",
-    "you have been blocked",
-)
-
-CAPTCHA_TEXT_FRAGMENTS = (
-    "Verify you are human",
-    "Press & Hold",
-    "Please verify you are a human",
-    "Are you human",
-    "unusual traffic",
-)
 
 
 # PAUSE
@@ -78,150 +50,29 @@ def is_http_not_found(response) -> bool:
 # IS NOT FOUND ERROR
 def is_not_found_error(exc: BaseException) -> bool:
     """
-    Return True when an exception from navigation indicates the page was not found.
+    Return True when an exception from navigation indicates the page was not
+    found. Only explicit HTTP-404 phrasing is matched, so a '404' that merely
+    appears inside a listing URL or captcha-solver task id embedded in the
+    exception message cannot misclassify a listing as not found.
     """
 
     message = str(exc).lower()
-    return "404" in message or "not found" in message
 
-
-# IS CAPTCHA PRESENT
-def is_captcha_present(page: Page) -> bool:
-    """
-    Detect whether the current page is showing a captcha or anti-bot challenge
-    such as a Cloudflare interstitial, DataDome 'Press & Hold' challenge, or an
-    embedded hCaptcha/reCAPTCHA widget.
-    """
-
-    try:
-        # url-based detection covers cloudflare/datadome/perimeterx redirects
-        current_url = (page.url or "").lower()
-        if any(fragment in current_url for fragment in CAPTCHA_URL_FRAGMENTS):
-            return True
-
-        # title-based detection catches the typical interstitial titles
-        title = (page.title() or "").lower()
-        if any(fragment in title for fragment in CAPTCHA_TITLE_FRAGMENTS):
-            return True
-
-        # iframe-based detection catches embedded challenge widgets
-        challenge_iframe = page.locator(
-            'iframe[src*="challenges.cloudflare.com"], '
-            'iframe[src*="recaptcha"], '
-            'iframe[src*="hcaptcha"], '
-            'iframe[src*="datadome"], '
-            'iframe[src*="perimeterx"], '
-            'iframe[src*="captcha-delivery"]'
-        )
-        if challenge_iframe.count() > 0:
-            return True
-
-        # visible-text detection as a final fallback for provider-agnostic prompts
-        for fragment in CAPTCHA_TEXT_FRAGMENTS:
-            if page.get_by_text(fragment, exact=False).count() > 0:
-                return True
-    except Exception:
-        # if any probe fails (e.g. detached frame) assume no captcha so the
-        # caller can decide how to handle the underlying error
-        return False
-
-    return False
-
-
-# WAIT FOR CAPTCHA SOLVE
-def wait_for_captcha_solve(page: Page) -> None:
-    """
-    Pause execution while the user manually solves a captcha in the visible
-    browser window. Returns only once the captcha is no longer detected.
-    In non-interactive contexts (no controlling TTY on stdin, e.g. the
-    scheduler subprocess) raises RuntimeError immediately so the job fails
-    fast and the scheduler can move on, rather than blocking forever on
-    input() waiting for a human that will never arrive.
-    """
-
-    if not is_captcha_present(page):
-        return
-
-    # try to record the offending url for diagnostics in either branch
-    current_url = ""
-    try:
-        current_url = page.url or ""
-    except Exception:
-        pass
-
-    # fail fast when nobody can solve the challenge interactively; isatty()
-    # returns False under apscheduler subprocesses and most container runtimes
-    if not sys.stdin.isatty():
-        raise RuntimeError(
-            f"CAPTCHA encountered at {current_url!r} in a non-interactive run; "
-            "aborting because no human is available to solve it."
-        )
-
-    # show a clearly delimited prompt so it stands out in the console
-    print()
-    print("=" * 70)
-    print("CAPTCHA detected — manual intervention required.")
-    if current_url:
-        print(f"  Current URL: {current_url}")
-    print("Solve the challenge in the browser window, then press Enter here.")
-    print("=" * 70)
-    input()
-
-    # loop until the captcha is truly gone, in case the user pressed Enter early
-    while is_captcha_present(page):
-        input("Captcha still detected — solve it and press Enter to retry...")
-
-
-# GOTO WITH CAPTCHA HANDLING
-def goto_with_captcha_handling(
-    page: Page, url: str, max_retries: int = 3
-) -> Optional[object]:
-    """
-    Navigate to a url, transparently pausing for the user to solve any captcha
-    that interrupts the navigation. Returns the Playwright response from the
-    final successful page.goto call.
-    """
-
-    attempt = 0
-    last_error: Optional[Exception] = None
-
-    while attempt < max_retries:
-        attempt += 1
-        try:
-            response = page.goto(url)
-            page.wait_for_load_state("domcontentloaded")
-
-            # if a captcha appeared after a successful load, wait then retry
-            if is_captcha_present(page):
-                wait_for_captcha_solve(page)
-                continue
-
-            return response
-        except Exception as e:
-            last_error = e
-
-            # a mid-flight challenge redirect typically surfaces as ERR_ABORTED;
-            # if a captcha is now on the page, pause for the user and retry
-            if is_captcha_present(page):
-                wait_for_captcha_solve(page)
-                continue
-
-            # unrelated failure — let the caller decide
-            raise
-
-    # exhausted retries while still seeing a captcha
-    if last_error is not None:
-        raise last_error
-    raise RuntimeError(
-        f"Failed to navigate to {url} after {max_retries} captcha retries"
-    )
+    # match 404 only when phrased as an http status, never as a bare substring
+    if re.search(r"\b(?:http\s+)?404\s+not\s+found\b", message):
+        return True
+    if re.search(r"\bstatus(?:\s+code)?\s*[:=]?\s*404\b", message):
+        return True
+    return "page not found" in message
 
 
 # GET EXISTING HASH CODES
 def get_existing_hash_codes(listing_source: str) -> set[str]:
     """
     Query database for existing hash_codes in prospect_listings filtered by
-    listing_source and restricted to rows with status 'New' or 'Viewed'.
+    listing_source. Rows of every status are included because the hash_code
+    unique constraint is table-wide, so a listing that is e.g. NotAvailable
+    would still block an insert of the same hash.
     """
 
     database_url = os.getenv("AUTO_ADS_DATABASE_URL")
@@ -232,8 +83,33 @@ def get_existing_hash_codes(listing_source: str) -> set[str]:
         result = conn.execute(
             text(
                 f"SELECT hash_code FROM {schema}.prospect_listings "
+                f"WHERE listing_source = :listing_source"
+            ),
+            {"listing_source": listing_source},
+        )
+        return {row[0] for row in result}
+
+
+# GET EXISTING SOURCE IDS
+def get_existing_source_ids(listing_source: str) -> set[str]:
+    """
+    Query database for existing source_ids in prospect_listings filtered by
+    listing_source. The source_id is the site's own listing reference (e.g.
+    'C2085940' for Car & Classic), so it identifies a listing unambiguously
+    where titles, and therefore title-based hash codes, can collide. Rows of
+    every status are included so previously seen listings are never re-added.
+    """
+
+    database_url = os.getenv("AUTO_ADS_DATABASE_URL")
+    schema = os.getenv("AUTO_ADS_DATABASE_SCHEMA", "aa")
+
+    engine = create_engine(database_url)
+    with engine.connect() as conn:
+        result = conn.execute(
+            text(
+                f"SELECT source_id FROM {schema}.prospect_listings "
                 f"WHERE listing_source = :listing_source "
-                f"AND status IN ('New', 'Viewed')"
+                f"AND source_id IS NOT NULL"
             ),
             {"listing_source": listing_source},
         )

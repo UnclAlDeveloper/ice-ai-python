@@ -1,6 +1,8 @@
 sqlalchemy
 pydantic
 playwright
+playwright-stealth
+requests
 uvicorn
 fastapi
 python-dotenv

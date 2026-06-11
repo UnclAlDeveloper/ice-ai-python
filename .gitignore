@@ -1,4 +1,4 @@
-# shared modules copied from /Common/python by deploy-python.sh
+# shared modules copied from /Common-Library/python by deploy-python.sh
 AWSAccess.py
 Settings.py
 

@@ -3,7 +3,7 @@ import tempfile
 from datetime import datetime
 from typing import TYPE_CHECKING, Optional
 
-from playwright.sync_api import Page
+from stealth_browser import Page
 
 from AWSAccess import AWSAccess
 from common import generate_image_hash, pause
@@ -27,6 +27,39 @@ def _get_prospect_images_aws_access() -> AWSAccess:
         media_dir="images",
         sub_directory_name="prospects",
     )
+
+
+# DOWNLOAD IMAGE BYTES
+def _download_image_bytes(
+    page: Page, img_url: str, *, attempts: int = 3
+) -> Optional[tuple[bytes, str]]:
+    """
+    Fetch an image url through the browser's request context, retrying on
+    transient network failures such as TLS socket disconnects through the proxy.
+    Returns a (bytes, content_type) tuple on success, or None when every attempt
+    fails or returns a non-200 status / empty body.
+    """
+
+    last_error: object = None
+    for attempt in range(1, attempts + 1):
+        try:
+            response = page.request.get(img_url, timeout=30000)
+            if response.status != 200:
+                last_error = f"HTTP {response.status}"
+            else:
+                body = response.body()
+                if body:
+                    return body, response.headers.get("content-type", "")
+                last_error = "empty body"
+        except Exception as e:
+            last_error = e
+
+        # back off briefly before retrying a transient failure
+        if attempt < attempts:
+            pause(1.0, 3.0)
+
+    print(f"  Failed to download image after {attempts} attempts: {last_error}")
+    return None
 
 
 # DOWNLOAD AND SAVE LISTING IMAGES
@@ -59,20 +92,13 @@ def download_and_save_listing_images(
             if index > 0:
                 pause(0.5, 1.5)
 
-            # fetch the image via http request
-            response = page.request.get(img_url)
-            if response.status != 200:
-                print(f"Failed to fetch image {index}: HTTP {response.status}")
+            # fetch the image, retrying transient proxy/tls disconnects
+            download = _download_image_bytes(page, img_url)
+            if download is None:
                 continue
-
-            image_bytes = response.body()
-
-            # skip if no valid image data
-            if not image_bytes:
-                continue
+            image_bytes, content_type = download
 
             # determine file extension from content type or url
-            content_type = response.headers.get("content-type", "")
             if "jpeg" in content_type or "jpg" in content_type:
                 extension = "jpg"
             elif "png" in content_type:
@@ -138,6 +164,30 @@ def download_and_save_listing_images(
     if os.path.isdir(temp_dir):
         os.rmdir(temp_dir)
     return None
+
+
+# DELETE LISTING
+def delete_listing(
+    prospect_listing: ProspectListings,
+    session: "Session",
+) -> None:
+    """
+    Discard a prospect listing entirely: its images and their S3 objects (by
+    reusing delete_listing_images) followed by the listing row itself. Use this
+    when a listing was only partially saved so it is never persisted in an
+    incomplete state and can be re-fetched cleanly on a later run.
+    """
+
+    # capture the id before deletion so it can still be logged afterwards
+    listing_id = prospect_listing.id
+
+    # remove the associated images and their s3 objects first
+    delete_listing_images(prospect_listing, session)
+
+    # then remove the listing row itself
+    session.delete(prospect_listing)
+    session.commit()
+    print(f"Deleted listing {listing_id} and its images")
 
 
 # DELETE LISTING IMAGES

@@ -42,7 +42,6 @@ class ProspectListings(Base):
     __tablename__ = 'prospect_listings'
     __table_args__ = (
         PrimaryKeyConstraint('id', name='prospect_listings_pkey'),
-        UniqueConstraint('hash_code', name='prospect_listings_hash_code_unique'),
         Index('idx_prospect_listings_hash_code', 'hash_code'),
         {'schema': 'aa'}
     )
@@ -105,6 +104,8 @@ class ProspectListings(Base):
     month_of_first_registration = mapped_column(String)
     type_approval = mapped_column(String)
     revenue_weight = mapped_column(Integer)
+    status_checked_at = mapped_column(DateTime(True))
+    source_id = mapped_column(String)
 
 
 class ResaleListings(Base):

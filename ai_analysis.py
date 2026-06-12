@@ -13,10 +13,10 @@ from google import genai
 if TYPE_CHECKING:
     from sqlalchemy.orm import Session
 from google.genai import types
-from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from AWSAccess import AWSAccess
+from common import create_engine_with_retry, with_db_retry
 from environments import load_environment
 from models.auto_ads import Images, ProspectListings
 from models.enums import ListingTable
@@ -331,16 +331,21 @@ def regenerate_all_ai_analyses(prompt_filename: str, listing_source: str, skip_r
     load_environment()
 
     database_url = os.getenv("AUTO_ADS_DATABASE_URL")
-    engine = create_engine(database_url)
+    engine = create_engine_with_retry(database_url)
     SessionLocal = sessionmaker(bind=engine)
 
     with SessionLocal() as session:
-        prospect_listings = (
-            session.query(ProspectListings)
-            .filter(ProspectListings.listing_source == listing_source)
-            .order_by(ProspectListings.id)
-            .offset(skip_rows)
-            .all()
+        # retry the initial load so a transient db hiccup at startup does not
+        # abort the whole regeneration run
+        prospect_listings = with_db_retry(
+            lambda: (
+                session.query(ProspectListings)
+                .filter(ProspectListings.listing_source == listing_source)
+                .order_by(ProspectListings.id)
+                .offset(skip_rows)
+                .all()
+            ),
+            description="load prospect listings for ai regeneration",
         )
         total_count = len(prospect_listings)
         print(f"Found {total_count} prospect listings to process")

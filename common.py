@@ -1,3 +1,4 @@
+import functools
 import hashlib
 import os
 import random
@@ -5,12 +6,214 @@ import re
 import secrets
 import time
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Callable, Optional, TypeVar
 
 from sqlalchemy import create_engine, text
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from models.ice_ai import OauthTokens
+
+T = TypeVar("T")
+
+# message fragments seen on transient database connection failures (DNS hiccups,
+# server still starting, momentary network drops) that are worth retrying rather
+# than aborting; matched case-insensitively against the exception text
+TRANSIENT_DB_ERROR_FRAGMENTS = (
+    "temporary failure in name resolution",
+    "could not translate host name",
+    "name or service not known",
+    "could not connect to server",
+    "connection refused",
+    "server closed the connection unexpectedly",
+    "the database system is starting up",
+    "connection timed out",
+    "could not receive data from server",
+    "no route to host",
+    "network is unreachable",
+)
+
+# default retry budget for transient database failures: five attempts with
+# exponential backoff (1s, 2s, 4s, 8s) between them
+DB_RETRY_ATTEMPTS = int(os.getenv("DB_RETRY_ATTEMPTS", "5"))
+DB_RETRY_BASE_DELAY = float(os.getenv("DB_RETRY_BASE_DELAY", "1.0"))
+
+# escalating per-attempt timeouts (in milliseconds) for slow page/network
+# operations: a quick first try, then progressively longer waits (30s, 1m, 2m,
+# 4m) before finally giving up, so a transiently slow proxy exit or slow-loading
+# media is given more time rather than failing hard at a single 30s deadline
+TIMEOUT_BACKOFF_MS = (30000, 60000, 120000, 240000)
+
+
+# IS PLAYWRIGHT TIMEOUT
+def is_playwright_timeout(exc: BaseException) -> bool:
+    """
+    Return True when an exception is a Playwright timeout ('Timeout NNNNms
+    exceeded'), which means an operation simply ran out of time and may succeed
+    if retried with a longer deadline rather than being a hard failure.
+    """
+
+    message = str(exc)
+    return "Timeout" in message and "exceeded" in message
+
+
+# RUN WITH TIMEOUT BACKOFF
+def run_with_timeout_backoff(
+    operation: Callable[[int], T],
+    *,
+    description: str = "operation",
+    backoff: tuple[int, ...] = TIMEOUT_BACKOFF_MS,
+) -> T:
+    """
+    Run a Playwright operation that accepts a timeout (in milliseconds), retrying
+    it with progressively longer timeouts (30s, 1m, 2m, 4m by default) whenever
+    it times out. The operation callable is given the timeout to use for each
+    attempt. Only genuine timeouts are retried; any other error propagates
+    immediately because waiting longer would not help. The final timeout error
+    is re-raised once the whole backoff sequence is exhausted.
+    """
+
+    last_error: Optional[BaseException] = None
+    for index, timeout_ms in enumerate(backoff):
+        try:
+            return operation(timeout_ms)
+        except Exception as e:
+            # a non-timeout failure will not be cured by a longer deadline
+            if not is_playwright_timeout(e):
+                raise
+
+            last_error = e
+
+            # log and escalate while longer timeouts remain in the budget
+            if index < len(backoff) - 1:
+                next_timeout = backoff[index + 1]
+                print(
+                    f"  {description} timed out after {timeout_ms / 1000:.0f}s; "
+                    f"retrying with a {next_timeout / 1000:.0f}s timeout..."
+                )
+
+    # exhausted the backoff sequence while still timing out
+    assert last_error is not None
+    raise last_error
+
+
+# WAIT FOR SELECTOR WITH BACKOFF
+def wait_for_selector_with_backoff(
+    page,
+    selector: str,
+    *,
+    state: str = "attached",
+    description: Optional[str] = None,
+    backoff: tuple[int, ...] = TIMEOUT_BACKOFF_MS,
+):
+    """
+    Wait for a selector to reach the given state, escalating the timeout (30s,
+    1m, 2m, 4m by default) on each attempt so a slow page render gets more time
+    before failing. A thin wrapper over run_with_timeout_backoff for the very
+    common page.wait_for_selector call.
+    """
+
+    return run_with_timeout_backoff(
+        lambda timeout_ms: page.wait_for_selector(
+            selector, state=state, timeout=timeout_ms
+        ),
+        description=description or f"wait for {selector}",
+        backoff=backoff,
+    )
+
+
+# IS TRANSIENT DB ERROR
+def is_transient_db_error(exc: BaseException) -> bool:
+    """
+    Return True when an exception is a database OperationalError caused by a
+    transient connection problem (e.g. a momentary DNS resolution failure on
+    WSL2) rather than a genuine query or schema error. Callers use this to
+    decide when retrying the same operation is worthwhile.
+    """
+
+    if not isinstance(exc, OperationalError):
+        return False
+
+    message = str(exc).lower()
+    return any(fragment in message for fragment in TRANSIENT_DB_ERROR_FRAGMENTS)
+
+
+# WITH DB RETRY
+def with_db_retry(
+    operation: Callable[[], T],
+    *,
+    attempts: int = DB_RETRY_ATTEMPTS,
+    base_delay: float = DB_RETRY_BASE_DELAY,
+    description: str = "database operation",
+) -> T:
+    """
+    Run a database unit of work, retrying transient connection failures with
+    exponential backoff. Non-transient OperationalErrors (and any other
+    exception) propagate immediately, as does a transient error once the retry
+    budget is exhausted, so genuine faults are never silently swallowed.
+    """
+
+    for attempt in range(1, attempts + 1):
+        try:
+            return operation()
+        except OperationalError as e:
+            # only retry transient failures, and only while attempts remain
+            if attempt >= attempts or not is_transient_db_error(e):
+                raise
+
+            delay = base_delay * 2 ** (attempt - 1)
+            print(
+                f"Transient database error during {description} "
+                f"(attempt {attempt}/{attempts}); retrying in {delay:.0f}s..."
+            )
+            time.sleep(delay)
+
+    # unreachable: the loop either returns a value or raises on the last attempt
+    raise RuntimeError(f"with_db_retry exhausted attempts for {description}")
+
+
+# DB RETRY
+def db_retry(
+    func: Optional[Callable[..., T]] = None,
+    *,
+    attempts: int = DB_RETRY_ATTEMPTS,
+    base_delay: float = DB_RETRY_BASE_DELAY,
+) -> Callable:
+    """
+    Decorator that wraps a function performing a single database unit of work in
+    with_db_retry, so transient connection failures are retried with backoff.
+    Usable both bare (@db_retry) and with arguments (@db_retry(attempts=3)).
+    """
+
+    def decorator(target: Callable[..., T]) -> Callable[..., T]:
+
+        @functools.wraps(target)
+        def wrapper(*args, **kwargs) -> T:
+            return with_db_retry(
+                lambda: target(*args, **kwargs),
+                attempts=attempts,
+                base_delay=base_delay,
+                description=target.__name__,
+            )
+
+        return wrapper
+
+    # support both @db_retry and @db_retry(...) call styles
+    if func is not None:
+        return decorator(func)
+    return decorator
+
+
+# CREATE ENGINE WITH RETRY
+def create_engine_with_retry(database_url: str, **kwargs):
+    """
+    Create a SQLAlchemy engine with pool_pre_ping enabled so stale pooled
+    connections are detected and replaced transparently. This is a drop-in
+    replacement for create_engine at the scrapers' connection points.
+    """
+
+    kwargs.setdefault("pool_pre_ping", True)
+    return create_engine(database_url, **kwargs)
 
 
 # PAUSE
@@ -67,6 +270,7 @@ def is_not_found_error(exc: BaseException) -> bool:
 
 
 # GET EXISTING HASH CODES
+@db_retry
 def get_existing_hash_codes(listing_source: str) -> set[str]:
     """
     Query database for existing hash_codes in prospect_listings filtered by
@@ -78,7 +282,7 @@ def get_existing_hash_codes(listing_source: str) -> set[str]:
     database_url = os.getenv("AUTO_ADS_DATABASE_URL")
     schema = os.getenv("AUTO_ADS_DATABASE_SCHEMA", "aa")
 
-    engine = create_engine(database_url)
+    engine = create_engine_with_retry(database_url)
     with engine.connect() as conn:
         result = conn.execute(
             text(
@@ -91,6 +295,7 @@ def get_existing_hash_codes(listing_source: str) -> set[str]:
 
 
 # GET EXISTING SOURCE IDS
+@db_retry
 def get_existing_source_ids(listing_source: str) -> set[str]:
     """
     Query database for existing source_ids in prospect_listings filtered by
@@ -103,7 +308,7 @@ def get_existing_source_ids(listing_source: str) -> set[str]:
     database_url = os.getenv("AUTO_ADS_DATABASE_URL")
     schema = os.getenv("AUTO_ADS_DATABASE_SCHEMA", "aa")
 
-    engine = create_engine(database_url)
+    engine = create_engine_with_retry(database_url)
     with engine.connect() as conn:
         result = conn.execute(
             text(

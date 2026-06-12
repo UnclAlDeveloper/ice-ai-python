@@ -6,7 +6,12 @@ from typing import TYPE_CHECKING, Optional
 from stealth_browser import Page
 
 from AWSAccess import AWSAccess
-from common import generate_image_hash, pause
+from common import (
+    TIMEOUT_BACKOFF_MS,
+    generate_image_hash,
+    is_playwright_timeout,
+    pause,
+)
 from models.auto_ads import Images, ProspectListings
 from models.enums import ListingSource, ListingTable
 
@@ -31,19 +36,22 @@ def _get_prospect_images_aws_access() -> AWSAccess:
 
 # DOWNLOAD IMAGE BYTES
 def _download_image_bytes(
-    page: Page, img_url: str, *, attempts: int = 3
+    page: Page, img_url: str, *, backoff: tuple[int, ...] = TIMEOUT_BACKOFF_MS
 ) -> Optional[tuple[bytes, str]]:
     """
     Fetch an image url through the browser's request context, retrying on
     transient network failures such as TLS socket disconnects through the proxy.
-    Returns a (bytes, content_type) tuple on success, or None when every attempt
-    fails or returns a non-200 status / empty body.
+    Each attempt is given a progressively longer timeout (30s, 1m, 2m, 4m) so a
+    slow-loading image gets more time before being abandoned. Returns a (bytes,
+    content_type) tuple on success, or None when every attempt fails or returns
+    a non-200 status / empty body.
     """
 
     last_error: object = None
-    for attempt in range(1, attempts + 1):
+    attempts = len(backoff)
+    for index, timeout_ms in enumerate(backoff):
         try:
-            response = page.request.get(img_url, timeout=30000)
+            response = page.request.get(img_url, timeout=timeout_ms)
             if response.status != 200:
                 last_error = f"HTTP {response.status}"
             else:
@@ -54,8 +62,15 @@ def _download_image_bytes(
         except Exception as e:
             last_error = e
 
+            # note when a slow image is getting a longer deadline next time
+            if is_playwright_timeout(e) and index < attempts - 1:
+                print(
+                    f"  Image download timed out after {timeout_ms / 1000:.0f}s; "
+                    f"retrying with a {backoff[index + 1] / 1000:.0f}s timeout..."
+                )
+
         # back off briefly before retrying a transient failure
-        if attempt < attempts:
+        if index < attempts - 1:
             pause(1.0, 3.0)
 
     print(f"  Failed to download image after {attempts} attempts: {last_error}")

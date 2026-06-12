@@ -43,6 +43,7 @@ class ProspectListings(Base):
     __table_args__ = (
         PrimaryKeyConstraint('id', name='prospect_listings_pkey'),
         Index('idx_prospect_listings_hash_code', 'hash_code'),
+        Index('idx_prospect_listings_source_id', 'source_id'),
         {'schema': 'aa'}
     )
 
@@ -53,6 +54,7 @@ class ProspectListings(Base):
     url = mapped_column(String, nullable=False)
     listing_source = mapped_column(ENUM('Autotrader', 'Car&Classic', 'eBay', 'Facebook', 'Gumtree', 'ManualEntry', 'OnlyVans', name='listing_source', schema='aa'), nullable=False)
     status = mapped_column(ENUM('New', 'NotAvailable', 'Viewed', 'NotInterested', 'Interested', 'Bought', 'Sold', name='prospect_listing_status', schema='aa'), nullable=False)
+    listing_type = mapped_column(ENUM('Car', 'Van', 'Classic', 'Item', 'Boat', 'Yacht', name='listing_type', schema='aa'), nullable=False)
     created_at = mapped_column(DateTime(True))
     updated_at = mapped_column(DateTime(True))
     full_description = mapped_column(String)
@@ -120,6 +122,7 @@ class ResaleListings(Base):
     status = mapped_column(ENUM('Bought', 'Sold', name='resale_listing_status', schema='aa'), nullable=False)
     make_and_model = mapped_column(String, nullable=False)
     short_description = mapped_column(String, nullable=False)
+    listing_type = mapped_column(ENUM('Car', 'Van', 'Classic', 'Item', 'Boat', 'Yacht', name='listing_type', schema='aa'), nullable=False)
     created_at = mapped_column(DateTime(True))
     updated_at = mapped_column(DateTime(True))
     full_description = mapped_column(String)

@@ -32,16 +32,20 @@ from stealth_browser import (
     sync_stealth_playwright,
     wait_for_captcha_solve,
 )
-from sqlalchemy import create_engine, or_
+from sqlalchemy import or_
 from sqlalchemy.orm import sessionmaker
 
 from ai_analysis import apply_ai_analysis, generate_ai_analysis
 from common import (
+    create_engine_with_retry,
     generate_hash_code,
     get_existing_source_ids,
     is_http_not_found,
     is_not_found_error,
+    is_transient_db_error,
     pause,
+    wait_for_selector_with_backoff,
+    with_db_retry,
 )
 from listing_images import (
     delete_listing,
@@ -49,7 +53,7 @@ from listing_images import (
     download_and_save_listing_images,
 )
 from models.auto_ads import Images, ProspectListings
-from models.enums import ListingSource, ListingTable, ProspectListingStatus
+from models.enums import ListingSource, ListingTable, ListingType, ProspectListingStatus
 
 UNAVAILABLE_ADVERT_TEXT = (
     "This advert has now been removed through sale or otherwise"
@@ -70,6 +74,40 @@ PROXY_ROTATION_INTERVAL_MINUTES = float(
 # help (e.g. the Decodo account is out of bandwidth, suspended or misconfigured)
 MAX_CONSECUTIVE_SETUP_FAILURES = int(
     os.getenv("CAR_AND_CLASSIC_MAX_SETUP_FAILURES", "3")
+)
+
+# abort after this many consecutive transient database failures that even the
+# per-operation retries could not clear: a prolonged outage should eventually
+# surface rather than loop forever, but the budget is generous so brief blips
+# (e.g. WSL2 dns hiccups) only cause a wait-and-retry, never a lost run
+MAX_CONSECUTIVE_DB_FAILURES = int(
+    os.getenv("CAR_AND_CLASSIC_MAX_DB_FAILURES", "10")
+)
+
+# how many times to reload a listing during an availability check when the page
+# cannot be fetched at all (proxy/network "site can't be reached" failures)
+# before giving up; a transient blip should never abort the sweep, but a
+# persistently dead connection must eventually surface
+AVAILABILITY_MAX_LOAD_RETRIES = int(
+    os.getenv("CAR_AND_CLASSIC_AVAILABILITY_LOAD_RETRIES", "4")
+)
+
+# base seconds for the exponential back-off between availability reload attempts
+AVAILABILITY_LOAD_BACKOFF_SECONDS = float(
+    os.getenv("CAR_AND_CLASSIC_AVAILABILITY_LOAD_BACKOFF", "5")
+)
+
+# additional Chromium network error codes (beyond the proxy-specific set in
+# stealth_browser) that mean the listing page could not be fetched at all, so
+# its availability is unknown and must never be inferred from the failure
+SITE_UNREACHABLE_ERROR_FRAGMENTS = (
+    "ERR_NAME_NOT_RESOLVED",
+    "ERR_NAME_RESOLUTION_FAILED",
+    "ERR_INTERNET_DISCONNECTED",
+    "ERR_ADDRESS_UNREACHABLE",
+    "ERR_CONNECTION_REFUSED",
+    "ERR_NETWORK_CHANGED",
+    "ERR_SOCKET_NOT_CONNECTED",
 )
 
 
@@ -96,14 +134,103 @@ class ProxySessionExpired(Exception):
     """
 
 
+# IS SITE UNREACHABLE ERROR
+def is_site_unreachable_error(exc: BaseException) -> bool:
+    """
+    Return True when an exception means the listing page could not be fetched at
+    all: a proxy transport failure, a navigation timeout, a DNS failure or any
+    "site can't be reached" network error. A listing's availability can never be
+    inferred from these, so the caller retries with back-off and ultimately
+    raises rather than marking the listing NotAvailable.
+    """
+
+    if is_proxy_network_error(exc) or is_navigation_timeout(exc):
+        return True
+
+    message = str(exc)
+    return any(
+        fragment in message for fragment in SITE_UNREACHABLE_ERROR_FRAGMENTS
+    )
+
+
+# LOAD LISTING WITH BACKOFF
+def load_listing_with_backoff(page: Page, url: str):
+    """
+    Navigate to a listing url for an availability check, retrying transient
+    "site can't be reached" network/proxy failures with exponential back-off.
+    Returns the navigation response on success. A genuine 404 is raised
+    immediately because the advert really is gone, and a network failure that
+    survives every retry is re-raised so the caller can rotate the proxy or
+    abort rather than guess the listing's availability.
+    """
+
+    last_error: Exception | None = None
+
+    for attempt in range(1, AVAILABILITY_MAX_LOAD_RETRIES + 1):
+        try:
+            return goto_with_captcha_handling(page, url)
+        except CaptchaSolveError:
+            raise
+        except Exception as e:
+            # a genuine 404 means the advert is gone, so stop retrying
+            if is_not_found_error(e):
+                raise
+
+            # only transport-level failures are worth retrying; any other error
+            # is a real page/parse problem the caller should handle directly
+            if not is_site_unreachable_error(e):
+                raise
+
+            last_error = e
+            if attempt < AVAILABILITY_MAX_LOAD_RETRIES:
+                # exponential back-off gives a flapping proxy or connection time
+                # to recover before the next attempt
+                delay = AVAILABILITY_LOAD_BACKOFF_SECONDS * (2 ** (attempt - 1))
+                print(
+                    f"  Site unreachable (attempt {attempt}/"
+                    f"{AVAILABILITY_MAX_LOAD_RETRIES}): {e}; retrying in "
+                    f"{delay:.0f}s..."
+                )
+                time.sleep(delay)
+
+    # every retry failed: surface the error so availability is never guessed
+    raise last_error if last_error is not None else RuntimeError(
+        f"Failed to load {url} for availability check"
+    )
+
+
 # IS LISTING NO LONGER AVAILABLE
 def is_listing_no_longer_available(page: Page) -> bool:
     """
     Return True when the listing page shows that the advert has been removed.
+    Car & Classic detail pages are client-rendered, so this waits for either the
+    removed-advert banner or the normal listing's asking-price header to appear
+    before deciding, ensuring a slow render is never misread as available.
     """
 
-    unavailable_banner = page.get_by_text(UNAVAILABLE_ADVERT_TEXT, exact=False)
-    return unavailable_banner.count() > 0
+    # wait for whichever outcome renders first so a removed advert ends the wait
+    # immediately rather than paying the full timeout, while a live listing is
+    # confirmed by its asking-price header
+    removed_banner = page.get_by_text(UNAVAILABLE_ADVERT_TEXT, exact=False)
+    price_header = page.locator('header:has(span:text("Asking price"))')
+    try:
+        removed_banner.or_(price_header).first.wait_for(
+            state="attached", timeout=15000
+        )
+    except Exception:
+        pass
+
+    if removed_banner.count() > 0:
+        return True
+
+    # fall back to scanning the rendered html in case the banner markup changes
+    try:
+        if UNAVAILABLE_ADVERT_TEXT in page.content():
+            return True
+    except Exception:
+        pass
+
+    return False
 
 
 # UPDATE NEW LISTINGS AVAILABILITY
@@ -118,23 +245,29 @@ def update_new_listings_availability(page: Page, deadline: float | None = None) 
     """
 
     database_url = os.getenv("AUTO_ADS_DATABASE_URL")
-    engine = create_engine(database_url)
+    engine = create_engine_with_retry(database_url)
     SessionLocal = sessionmaker(bind=engine)
 
     with SessionLocal() as session:
         checked_before = datetime.now() - timedelta(hours=24)
-        new_listings = (
-            session.query(ProspectListings)
-            .filter(
-                ProspectListings.listing_source == ListingSource.CAR_AND_CLASSIC,
-                ProspectListings.status == ProspectListingStatus.NEW,
-                or_(
-                    ProspectListings.status_checked_at.is_(None),
-                    ProspectListings.status_checked_at < checked_before,
-                ),
-            )
-            .order_by(ProspectListings.status_checked_at.asc().nullsfirst())
-            .all()
+
+        # retry the initial load so a transient db hiccup at sweep start does
+        # not abort the whole availability check
+        new_listings = with_db_retry(
+            lambda: (
+                session.query(ProspectListings)
+                .filter(
+                    ProspectListings.listing_source == ListingSource.CAR_AND_CLASSIC,
+                    ProspectListings.status == ProspectListingStatus.NEW,
+                    or_(
+                        ProspectListings.status_checked_at.is_(None),
+                        ProspectListings.status_checked_at < checked_before,
+                    ),
+                )
+                .order_by(ProspectListings.status_checked_at.asc().nullsfirst())
+                .all()
+            ),
+            description="load New listings for availability check",
         )
 
         if not new_listings:
@@ -159,7 +292,9 @@ def update_new_listings_availability(page: Page, deadline: float | None = None) 
 
             # guard each visit so one bad listing does not abort the whole sweep
             try:
-                response = goto_with_captcha_handling(page, listing.url)
+                # reload with back-off so a transient proxy/network blip never
+                # gets misread as the advert being gone
+                response = load_listing_with_backoff(page, listing.url)
 
                 if is_http_not_found(response) or is_listing_no_longer_available(page):
                     listing.status = ProspectListingStatus.NOT_AVAILABLE
@@ -191,6 +326,17 @@ def update_new_listings_availability(page: Page, deadline: float | None = None) 
 
                     # drop the now-orphaned photos from s3 and the images table
                     delete_listing_images(listing, session)
+                elif is_site_unreachable_error(e):
+                    # the page could not be fetched even after back-off retries;
+                    # availability is unknown, so never mark NotAvailable. bubble
+                    # up so the outer loop rotates the proxy or aborts the run.
+                    session.rollback()
+                    print(
+                        f"  Site still unreachable after "
+                        f"{AVAILABILITY_MAX_LOAD_RETRIES} attempts; aborting "
+                        f"availability check: {e}"
+                    )
+                    raise
                 else:
                     session.rollback()
                     print(f"  Error checking {listing.url}: {e}")
@@ -345,7 +491,7 @@ def extract_gallery_images(page: Page) -> list[str]:
     if has_camera_icon:
         # click the last button to open the full gallery popup
         last_button.click()
-        pause()
+        pause(0.5, 1)
 
         # collect all image src urls from the popup panel
         popup_images = page.locator("#panel_sheet_images img")
@@ -358,7 +504,7 @@ def extract_gallery_images(page: Page) -> list[str]:
         close_button = page.locator('button:has(svg[data-icon="close"])').first
         if close_button.is_visible():
             close_button.click()
-            pause()
+            pause(0.5, 1)
     else:
         # all images are visible on the detail page already
         section_images = gallery_section.locator("img")
@@ -478,6 +624,7 @@ def extract_listing_details(
         hash_code=hash_code,
         source_id=source_id,
         listing_source=ListingSource.CAR_AND_CLASSIC,
+        listing_type=ListingType.CLASSIC,
         status=ProspectListingStatus.NEW,
         url=url,
         make_and_model=make_and_model,
@@ -526,7 +673,7 @@ def scrape_listings(
     print(f"Loaded {len(existing_source_ids)} existing source ids from database")
 
     database_url = os.getenv("AUTO_ADS_DATABASE_URL")
-    engine = create_engine(database_url)
+    engine = create_engine_with_retry(database_url)
     SessionLocal = sessionmaker(bind=engine)
 
     new_count = 0
@@ -539,8 +686,11 @@ def scrape_listings(
             f"(listing {resume.listing_index + 1})"
         )
         goto_with_captcha_handling(page, resume.search_url)
-        page.wait_for_selector(
-            '[data-testid="card-listing"]', state="attached", timeout=15000
+        wait_for_selector_with_backoff(
+            page,
+            '[data-testid="card-listing"]',
+            state="attached",
+            description="search results grid",
         )
         page_number = resume.page_number
         search_url = resume.search_url
@@ -626,8 +776,11 @@ def scrape_listings(
                     else f"https://www.carandclassic.com{href}"
                 )
                 goto_with_captcha_handling(page, listing_url)
-                page.wait_for_selector(
-                    "section h1", state="visible", timeout=15000
+                wait_for_selector_with_backoff(
+                    page,
+                    "section h1",
+                    state="visible",
+                    description="listing detail page",
                 )
                 pause()
 
@@ -643,10 +796,18 @@ def scrape_listings(
 
                 # save to database and download images
                 with SessionLocal() as session:
-                    session.add(prospect_listing)
-                    session.flush()
-                    session.commit()
-                    session.refresh(prospect_listing)
+                    # retry the initial persist so a transient db connection
+                    # failure (e.g. a momentary dns hiccup) does not drop the
+                    # listing; nothing is committed until this block succeeds
+                    def persist_listing():
+                        session.add(prospect_listing)
+                        session.flush()
+                        session.commit()
+                        session.refresh(prospect_listing)
+
+                    with_db_retry(
+                        persist_listing, description="persist prospect listing"
+                    )
 
                     temp_image_dir = download_and_save_listing_images(
                         image_urls,
@@ -705,10 +866,11 @@ def scrape_listings(
                 page.go_back()
                 if is_captcha_present(page):
                     wait_for_captcha_solve(page)
-                page.wait_for_selector(
+                wait_for_selector_with_backoff(
+                    page,
                     '[data-testid="card-listing"]',
                     state="attached",
-                    timeout=15000,
+                    description="search results grid",
                 )
                 pause()
             except CaptchaSolveError:
@@ -721,10 +883,11 @@ def scrape_listings(
                 # re-load the search results so the next iteration can proceed
                 try:
                     goto_with_captcha_handling(page, search_url)
-                    page.wait_for_selector(
+                    wait_for_selector_with_backoff(
+                        page,
                         '[data-testid="card-listing"]',
                         state="attached",
-                        timeout=15000,
+                        description="search results grid",
                     )
                     pause()
                 except Exception as recovery_error:
@@ -745,8 +908,11 @@ def scrape_listings(
         next_button = page.locator("a[data-next-page]")
         if next_button.is_visible():
             next_button.click()
-            page.wait_for_selector(
-                '[data-testid="card-listing"]', state="attached", timeout=15000
+            wait_for_selector_with_backoff(
+                page,
+                '[data-testid="card-listing"]',
+                state="attached",
+                description="search results grid",
             )
 
             # track the url of the page now being scraped, otherwise a
@@ -806,8 +972,11 @@ def _navigate_to_saved_search(page: Page) -> None:
     saved_search_link.click()
 
     # vue uses client-side routing so load events don't fire; wait for content
-    page.wait_for_selector(
-        '[data-testid="card-listing"]', state="attached", timeout=15000
+    wait_for_selector_with_backoff(
+        page,
+        '[data-testid="card-listing"]',
+        state="attached",
+        description="search results grid",
     )
 
 
@@ -832,6 +1001,7 @@ def car_and_classic():
         browser = None
         rotations = 0
         consecutive_setup_failures = 0
+        consecutive_db_failures = 0
 
         try:
             while True:
@@ -881,6 +1051,44 @@ def car_and_classic():
                             pass
                         browser = None
                 except Exception as e:
+                    # a transient database failure that even the per-operation
+                    # retries could not clear is not a proxy problem, so rotating
+                    # ports would not help; wait and retry the same session and
+                    # resume position instead of crashing the whole run
+                    if is_transient_db_error(e):
+                        consecutive_db_failures += 1
+                        if consecutive_db_failures >= MAX_CONSECUTIVE_DB_FAILURES:
+                            raise RuntimeError(
+                                f"Database unreachable after "
+                                f"{consecutive_db_failures} consecutive attempts "
+                                f"({e}). Aborting."
+                            ) from e
+
+                        # back off before relaunching, capped so a long outage
+                        # waits in reasonable steps rather than ballooning
+                        delay = min(60.0, 5.0 * consecutive_db_failures)
+                        print(
+                            f"\nTransient database error ({e}); waiting "
+                            f"{delay:.0f}s and resuming from the same position "
+                            f"(db retry {consecutive_db_failures}/"
+                            f"{MAX_CONSECUTIVE_DB_FAILURES})...\n"
+                        )
+
+                        # relaunch on the same proxy budget; resume state is
+                        # preserved so the scrape continues where it left off
+                        if browser is not None:
+                            try:
+                                browser.close()
+                            except Exception:
+                                pass
+                            browser = None
+
+                        time.sleep(delay)
+                        continue
+
+                    # any successful pass clears the transient-db streak
+                    consecutive_db_failures = 0
+
                     # only rotate for proxy/transport failures (including stalled
                     # navigations that time out) and unsolvable captchas, which
                     # indicate a blocked exit ip, and only up to the configured

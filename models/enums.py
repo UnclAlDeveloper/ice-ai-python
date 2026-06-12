@@ -1,6 +1,20 @@
 from enum import StrEnum
 
 
+# LISTING TYPE
+class ListingType(StrEnum):
+    """
+    Enumeration of listing types with their corresponding database values.
+    """
+
+    CAR = "Car"
+    VAN = "Van"
+    CLASSIC = "Classic"
+    ITEM = "Item"
+    BOAT = "Boat"
+    YACHT = "Yacht"
+
+
 # LISTING SOURCE
 class ListingSource(StrEnum):
     """

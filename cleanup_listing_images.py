@@ -5,9 +5,9 @@ from environments import load_environment
 # load env vars before importing listing_images so AWSAccess can read them at class definition
 load_environment()
 
-from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
+from common import create_engine_with_retry, with_db_retry
 from listing_images import delete_listing_images
 from models.auto_ads import ProspectListings
 from models.enums import ProspectListingStatus
@@ -29,14 +29,18 @@ def cleanup_listing_images() -> None:
     """
 
     database_url = os.getenv("AUTO_ADS_DATABASE_URL")
-    engine = create_engine(database_url)
+    engine = create_engine_with_retry(database_url)
 
     with Session(engine) as session:
-        # find every prospect listing that should have its images purged
-        listings_to_clean = (
-            session.query(ProspectListings)
-            .filter(ProspectListings.status.notin_(KEEP_STATUSES))
-            .all()
+        # find every prospect listing that should have its images purged,
+        # retrying a transient db hiccup at startup rather than aborting
+        listings_to_clean = with_db_retry(
+            lambda: (
+                session.query(ProspectListings)
+                .filter(ProspectListings.status.notin_(KEEP_STATUSES))
+                .all()
+            ),
+            description="load listings for image cleanup",
         )
 
         print(

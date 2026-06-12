@@ -19,10 +19,10 @@ from typing import Generator, Optional, Union
 
 from pydantic import BaseModel, PrivateAttr
 from stealth_browser import Page, launch_stealth_chromium, sync_stealth_playwright
-from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from common import (
+    create_engine_with_retry,
     generate_hash_code,
     get_existing_hash_codes,
     get_oauth_tokens,
@@ -30,11 +30,12 @@ from common import (
     is_not_found_error,
     pause,
     save_oauth_tokens,
+    with_db_retry,
 )
 from listing_images import delete_listing_images, download_and_save_listing_images
 from models.auto_ads import ProspectListings
 from ai_analysis import process_ai_analysis_for_listing
-from models.enums import ListingSource, ProspectListingStatus
+from models.enums import ListingSource, ListingType, ProspectListingStatus
 
 from ebay_rest import API, Error
 from ebay_rest.date_time import DateTime
@@ -120,18 +121,23 @@ def update_new_listings_availability(page: Page) -> None:
     """
 
     database_url = os.getenv("AUTO_ADS_DATABASE_URL")
-    engine = create_engine(database_url)
+    engine = create_engine_with_retry(database_url)
     SessionLocal = sessionmaker(bind=engine)
 
     with SessionLocal() as session:
-        new_listings = (
-            session.query(ProspectListings)
-            .filter(
-                ProspectListings.listing_source == ListingSource.EBAY,
-                ProspectListings.status == ProspectListingStatus.NEW,
-            )
-            .order_by(ProspectListings.id)
-            .all()
+        # retry the initial load so a transient db hiccup at sweep start does
+        # not abort the whole availability check
+        new_listings = with_db_retry(
+            lambda: (
+                session.query(ProspectListings)
+                .filter(
+                    ProspectListings.listing_source == ListingSource.EBAY,
+                    ProspectListings.status == ProspectListingStatus.NEW,
+                )
+                .order_by(ProspectListings.id)
+                .all()
+            ),
+            description="load New listings for availability check",
         )
 
         if not new_listings:
@@ -645,7 +651,7 @@ class EbayDownloader(BaseModel):
 
         # initialize database session for prospect_listing records
         database_url = os.getenv("AUTO_ADS_DATABASE_URL")
-        engine = create_engine(database_url)
+        engine = create_engine_with_retry(database_url)
         SessionLocal = sessionmaker(bind=engine)
 
         print(f"Initializing eBay API for marketplace: {self.marketplace}")
@@ -752,6 +758,7 @@ class EbayDownloader(BaseModel):
                             prospect_listing = ProspectListings(
                                 hash_code=hash_code,
                                 listing_source=ListingSource.EBAY,
+                                listing_type=ListingType.VAN,
                                 status=ProspectListingStatus.NEW,
                                 short_description=title,
                                 full_description=details.get("full_description"),

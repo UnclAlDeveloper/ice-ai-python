@@ -1,8 +1,9 @@
 import os
 import re
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 
+from common import create_engine_with_retry
 from environments import load_environment
 
 COLUMNS = [
@@ -29,7 +30,7 @@ def update_select_lists():
 
     database_url = os.getenv("AUTO_ADS_DATABASE_URL")
     schema = os.getenv("AUTO_ADS_DATABASE_SCHEMA", "aa")
-    engine = create_engine(database_url)
+    engine = create_engine_with_retry(database_url)
 
     total_inserted = 0
 
@@ -117,7 +118,7 @@ def update_features_lookups():
 
     database_url = os.getenv("AUTO_ADS_DATABASE_URL")
     schema = os.getenv("AUTO_ADS_DATABASE_SCHEMA", "aa")
-    engine = create_engine(database_url)
+    engine = create_engine_with_retry(database_url)
 
     with engine.begin() as conn:
         # fetch all non-null specs_and_features from autotrader listings
@@ -165,7 +166,7 @@ def update_specs_lookups():
 
     database_url = os.getenv("AUTO_ADS_DATABASE_URL")
     schema = os.getenv("AUTO_ADS_DATABASE_SCHEMA", "aa")
-    engine = create_engine(database_url)
+    engine = create_engine_with_retry(database_url)
 
     with engine.begin() as conn:
         # fetch all non-null specs_and_features from autotrader listings

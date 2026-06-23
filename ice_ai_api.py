@@ -3,7 +3,7 @@ import hashlib
 import json
 import logging
 import os
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 from urllib.parse import urlencode
@@ -15,10 +15,14 @@ from apscheduler.triggers.cron import CronTrigger
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from intuitlib.client import AuthClient
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from backup_databases import run_backups
 from common import save_oauth_tokens
 from environments import load_environment
+from mcp_auth import McpBearerAuthMiddleware, McpTokenStore
+from mcp_servers.elevenlabs_server import get_elevenlabs_mcp
+from mcp_servers.synthesia_server import mcp as synthesia_mcp
 
 load_environment()
 
@@ -54,16 +58,55 @@ def _ebay_oauth_endpoints() -> tuple[str, str]:
     )
 
 
+# MCP TRAILING SLASH MIDDLEWARE
+class McpTrailingSlashMiddleware:
+    """Serve the mounted MCP roots whether or not the client sends a trailing slash.
+
+    The MCP sub-apps are mounted at "/mcp/<name>" but only answer on the
+    "/mcp/<name>/" path. Cursor (and some other MCP clients) strip the trailing
+    slash from the configured server URL, so the bare path would normally trigger
+    a 307 redirect. Behind an HTTPS-terminating proxy that redirect is built with
+    the backend's internal "http" scheme, which clients refuse to follow. This
+    rewrites the bare mount path to its trailing-slash form before routing so the
+    request is served directly and no redirect is emitted.
+    """
+
+    def __init__(self, app: ASGIApp, mount_paths: tuple[str, ...]):
+        self._app = app
+        self._mount_paths = mount_paths
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        # only rewrite http requests that hit a mount root without its trailing slash
+        if scope["type"] == "http" and scope.get("path") in self._mount_paths:
+            scope = dict(scope)
+            scope["path"] = scope["path"] + "/"
+            raw_path = scope.get("raw_path")
+            if raw_path is not None:
+                scope["raw_path"] = raw_path + b"/"
+        await self._app(scope, receive, send)
+
+
+# MCP REMOTE SERVERS
+mcp_token_store = McpTokenStore()
+synthesia_mcp_app = synthesia_mcp.streamable_http_app()
+elevenlabs_mcp = get_elevenlabs_mcp()
+elevenlabs_mcp_app = elevenlabs_mcp.streamable_http_app()
+mcp_session_managers = [
+    synthesia_mcp.session_manager,
+    elevenlabs_mcp.session_manager,
+]
+
+
 # LIFESPAN
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
-    FastAPI lifespan that owns the nightly backup scheduler.
+    FastAPI lifespan for nightly backups and remote MCP session managers.
 
-    On startup, registers run_backups() to fire daily at 02:00 UTC and starts
-    the scheduler. On shutdown, stops the scheduler without waiting for any
-    in-flight job. The job is only registered when POSTGRESQL_BACKUPS_BUCKET
-    is configured so local development runs do not attempt nightly backups.
+    On startup, registers run_backups() to fire daily at 02:00 UTC when a
+    backup bucket is configured, starts the scheduler, and initializes MCP
+    Streamable HTTP session managers. On shutdown, stops the scheduler without
+    waiting for any in-flight job.
     """
 
     scheduler = AsyncIOScheduler(timezone="UTC")
@@ -85,10 +128,13 @@ async def lifespan(app: FastAPI):
         )
 
     scheduler.start()
-    try:
-        yield
-    finally:
-        scheduler.shutdown(wait=False)
+    async with AsyncExitStack() as stack:
+        for session_manager in mcp_session_managers:
+            await stack.enter_async_context(session_manager.run())
+        try:
+            yield
+        finally:
+            scheduler.shutdown(wait=False)
 
 
 # ICE AI API
@@ -98,6 +144,11 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+app.add_middleware(McpBearerAuthMiddleware, token_store=mcp_token_store)
+app.add_middleware(McpTrailingSlashMiddleware, mount_paths=("/mcp/synthesia", "/mcp/elevenlabs"))
+app.mount("/mcp/synthesia", synthesia_mcp_app)
+app.mount("/mcp/elevenlabs", elevenlabs_mcp_app)
 
 
 # EBAY CONNECT
@@ -550,6 +601,8 @@ async def root() -> dict:
             "/quickbooks-connect",
             "/quickbooks-redirect",
             "/health",
+            "/mcp/synthesia",
+            "/mcp/elevenlabs",
         ],
     }
 
@@ -558,6 +611,14 @@ async def root() -> dict:
 if __name__ == "__main__":
     import uvicorn
 
-    # run the api server
+    # run the api server, trusting proxy headers so the original https scheme is
+    # preserved when running behind a tls-terminating reverse proxy
     port = int(os.getenv("ICE_AI_API_PORT", "8005"))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    forwarded_allow_ips = os.getenv("UVICORN_FORWARDED_ALLOW_IPS", "*")
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=port,
+        proxy_headers=True,
+        forwarded_allow_ips=forwarded_allow_ips,
+    )

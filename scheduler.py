@@ -48,16 +48,17 @@ def run_scraper_subprocess(script_name: str) -> int:
 # RUN DAILY SCRAPES
 def run_daily_scrapes() -> None:
     """
-    Run the eBay scrape and then the Car & Classic scrape back-to-back under a
-    single daily trigger. The second scrape always runs even if the first one
-    exits non-zero, so a failure in one source never silently suppresses the
-    other. Both run sequentially because they both launch non-headless
-    Chromium and would fight over the same display if run concurrently.
+    Run the Autotrader classics scrape and then the Car & Classic scrape
+    back-to-back under a single daily trigger. The second scrape always runs
+    even if the first one exits non-zero, so a failure in one source never
+    silently suppresses the other. Both run sequentially because they both
+    launch non-headless Chromium and would fight over the same display if run
+    concurrently.
     """
 
-    # run the ebay scrape first; ignore its exit code for sequencing purposes
-    # so an ebay failure does not skip the car & classic scrape
-    run_scraper_subprocess("ebay.py")
+    # run the autotrader classics scrape first; ignore its exit code for
+    # sequencing purposes so a failure there does not skip car & classic
+    run_scraper_subprocess("autotrader_classics.py")
 
     # then run the car & classic scrape; its exit code is logged inside the
     # helper, and any uncaught exception here is logged by apscheduler
@@ -78,34 +79,37 @@ def main() -> int:
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
 
-    # schedule runs in UK local time so 06:00-07:00 tracks GMT/BST automatically;
-    # this is independent of ice_ai_api.py's scheduler, which stays on UTC
-    scheduler = BlockingScheduler(timezone="Europe/London")
+    # scheduling disabled — uncomment below to re-enable daily scrapes between
+    # 06:00 and 07:00 Europe/London (independent of ice_ai_api.py's scheduler)
+    #
+    # scheduler = BlockingScheduler(timezone="Europe/London")
+    #
+    # # jitter=3540 spreads the start uniformly across the next 59 minutes after
+    # # 06:00, so the chain lands somewhere inside the 06:00-07:00 window each day
+    # trigger = CronTrigger(hour=6, minute=0, timezone=scheduler.timezone)
+    # scheduler.add_job(
+    #     run_daily_scrapes,
+    #     trigger,
+    #     id="daily-scrapes",
+    #     coalesce=True,
+    #     max_instances=1,
+    #     misfire_grace_time=3600,
+    #     jitter=3540,
+    # )
+    #
+    # # compute next fire time directly from the trigger because jobs added before
+    # # the scheduler starts are still "pending" and their next_run_time attribute
+    # # is not populated until scheduler.start() runs
+    # next_run = trigger.get_next_fire_time(None, datetime.now(scheduler.timezone))
+    # logger.info("Daily scrape chain scheduled; next run at %s", next_run)
+    #
+    # # blocks the main thread; raises KeyboardInterrupt on SIGINT for clean exit
+    # try:
+    #     scheduler.start()
+    # except (KeyboardInterrupt, SystemExit):
+    #     logger.info("Scheduler shutting down")
 
-    # jitter=3540 spreads the start uniformly across the next 59 minutes after
-    # 06:00, so the chain lands somewhere inside the 06:00-07:00 window each day
-    trigger = CronTrigger(hour=6, minute=0, timezone=scheduler.timezone)
-    scheduler.add_job(
-        run_daily_scrapes,
-        trigger,
-        id="daily-scrapes",
-        coalesce=True,
-        max_instances=1,
-        misfire_grace_time=3600,
-        jitter=3540,
-    )
-
-    # compute next fire time directly from the trigger because jobs added before
-    # the scheduler starts are still "pending" and their next_run_time attribute
-    # is not populated until scheduler.start() runs
-    next_run = trigger.get_next_fire_time(None, datetime.now(scheduler.timezone))
-    logger.info("Daily scrape chain scheduled; next run at %s", next_run)
-
-    # blocks the main thread; raises KeyboardInterrupt on SIGINT for clean exit
-    try:
-        scheduler.start()
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("Scheduler shutting down")
+    logger.info("Daily scrape scheduler disabled; no jobs registered")
 
     return 0
 

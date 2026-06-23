@@ -1,11 +1,13 @@
 import argparse
 import os
+import random
 import re
 import shutil
 import sys
 import time
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 # parse --env before load_environment so the chosen env file is selected at import time
 _pre_parser = argparse.ArgumentParser(add_help=False)
@@ -143,12 +145,12 @@ NAVIGATION_TIMEOUT_MS = int(os.getenv("AUTOTRADER_NAVIGATION_TIMEOUT_MS", "30000
 class ScrapeResumeState:
     """
     Bookkeeping for where a listings scrape was interrupted so a proxy rotation
-    can resume on the same search-results page, scroll position, and listing
-    index rather than restarting from the top.
+    can resume on the same search and results page number rather than
+    restarting from the first page.
     """
 
     search_url: str | None = None
-    scroll_attempts: int = 0
+    page_number: int = 1
     processed_listing_ids: list[str] = field(default_factory=list)
 
 
@@ -271,16 +273,21 @@ def is_listing_no_longer_available(page: Page) -> bool:
 def update_new_listings_availability(
     page: Page,
     listing_type: ListingType,
+    limit: int,
     deadline: float | None = None,
 ) -> None:
     """
-    Visit each Autotrader prospect listing with status New and the given
-    listing_type that has not been checked within the past 24 hours, mark any
-    that are no longer available as NotAvailable, and stamp status_checked_at on
-    every completed check. When deadline (a time.monotonic value) is given,
+    Visit up to limit Autotrader prospect listings with status New and the
+    given listing_type that have not been checked within the past 24 hours, mark
+    any that are no longer available as NotAvailable, and stamp status_checked_at
+    on every completed check. When limit is zero or negative, returns immediately
+    without doing any work. When deadline (a time.monotonic value) is given,
     raises ProxySessionExpired between listings once it is reached so the proxy
     can be rotated without interrupting a listing.
     """
+
+    if limit <= 0:
+        return
 
     database_url = os.getenv("AUTO_ADS_DATABASE_URL")
     engine = create_engine_with_retry(database_url)
@@ -304,6 +311,7 @@ def update_new_listings_availability(
                     ),
                 )
                 .order_by(ProspectListings.status_checked_at.asc().nullsfirst())
+                .limit(limit)
                 .all()
             ),
             description="load New listings for availability check",
@@ -1382,7 +1390,8 @@ def _wait_for_search_results_ready(page: Page) -> None:
     """
     Wait until the search-results page has finished navigating and at least one
     listing card is visible. Cookie consent on a fresh proxy session can reload
-    the page after domcontentloaded, so callers should use this before scrolling.
+    the page after domcontentloaded, so callers should use this before reading
+    the listing cards.
     """
 
     page.wait_for_load_state("domcontentloaded", timeout=30000)
@@ -1391,57 +1400,50 @@ def _wait_for_search_results_ready(page: Page) -> None:
     )
 
 
-# EVALUATE ON SEARCH PAGE
-def _evaluate_on_search_page(page: Page, expression: str):
+# SEARCH RESULTS PRESENT
+def _search_results_present(page: Page, *, timeout_ms: int = 15000) -> bool:
     """
-    Run JavaScript on the search-results page, retrying when a late navigation
-    destroys the execution context (common right after proxy rotation or consent).
-    """
-
-    max_attempts = 3
-    last_error: Exception | None = None
-
-    for attempt in range(1, max_attempts + 1):
-        try:
-            page.wait_for_load_state("domcontentloaded", timeout=10000)
-            return page.evaluate(expression)
-        except Exception as exc:
-            last_error = exc
-            if (
-                "Execution context was destroyed" not in str(exc)
-                or attempt >= max_attempts
-            ):
-                raise
-            page.wait_for_timeout(500)
-
-    if last_error is not None:
-        raise last_error
-    raise RuntimeError("failed to evaluate on search page")
-
-
-# SCROLL SEARCH RESULTS PAGE
-def _scroll_search_results_page(page: Page) -> None:
-    """
-    Scroll the search-results page down by one viewport, waiting for the page
-    to settle and retrying when Playwright reports a destroyed execution context.
+    Return True when the current search-results page renders at least one
+    listing card within the timeout, and False when none appear. Paging past
+    the final results page yields a page with no cards, so the caller uses a
+    False return to detect the end of the result set and stop paginating.
     """
 
-    _evaluate_on_search_page(page, "window.scrollBy(0, window.innerHeight)")
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=30000)
+    except Exception:
+        pass
+
+    try:
+        page.locator(_SEARCH_RESULTS_LISTING_SELECTOR).first.wait_for(
+            state="visible", timeout=timeout_ms
+        )
+        return True
+    except Exception:
+        return False
 
 
-# RESTORE SEARCH SCROLL POSITION
-def _restore_search_scroll_position(page: Page, scroll_position: int) -> None:
+# WITH PAGE PARAM
+def _with_page_param(url: str, page_number: int) -> str:
     """
-    Re-scroll the search-results page to a saved viewport offset. Returning from
-    a listing detail page resets scroll to the top, so callers must restore the
-    position before continuing through the results list.
+    Return the search-results url with its page query parameter set to
+    page_number. AutoTrader's desktop search uses infinite scroll that only
+    lazy-loads one ~25-result chunk at a time, but the underlying page parameter
+    still resolves each chunk directly, so walking page=1, page=2, ... is the
+    reliable way to reach every listing. Page one omits the parameter to match
+    the canonical first-page url.
     """
 
-    _wait_for_search_results_ready(page)
-    for _ in range(scroll_position):
-        _scroll_search_results_page(page)
-        pause(min_seconds=1.0, max_seconds=2.0)
-        page.wait_for_timeout(1000)
+    parsed = urlparse(url)
+    query = [
+        (key, value)
+        for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+        if key != "page"
+    ]
+    if page_number > 1:
+        query.append(("page", str(page_number)))
+
+    return urlunparse(parsed._replace(query=urlencode(query)))
 
 
 # SCRAPE LISTINGS
@@ -1454,12 +1456,15 @@ def scrape_listings(
     resume: ScrapeResumeState | None = None,
 ) -> None:
     """
-    Scroll through Autotrader search results and save new listings of the given
-    type. When deadline (a time.monotonic value) is given, raises
-    ProxySessionExpired between listings once it is reached so the proxy can be
-    rotated without interrupting a partially-downloaded listing. When resume
-    carries a search_url from an interrupted run, navigates directly to that
-    page and continues from the saved scroll position and processed listing ids.
+    Walk every page of Autotrader search results and save new listings of the
+    given type. Autotrader's desktop search lazy-loads results in ~25-card
+    chunks via infinite scroll, so this paginates through the underlying
+    page=1, page=2, ... urls instead, stopping once a page renders no cards.
+    When deadline (a time.monotonic value) is given, raises ProxySessionExpired
+    between listings once it is reached so the proxy can be rotated without
+    interrupting a partially-downloaded listing. When resume carries a
+    search_url from an interrupted run, continues from the saved results page
+    number rather than starting over from page one.
     """
 
     existing_source_ids = get_existing_source_ids(ListingSource.AUTOTRADER)
@@ -1468,55 +1473,52 @@ def scrape_listings(
     processed_listing_ids = (
         set(resume.processed_listing_ids) if resume is not None else set()
     )
-    scroll_attempts = resume.scroll_attempts if resume is not None else 0
+    page_number = resume.page_number if resume is not None else 1
     prospect_listings = []
-    previous_height = 0
-    unchanged_height_scrolls = 0
+    previous_page_listing_ids: set[str] = set()
+    first_page_load = True
 
     if resume is not None and resume.search_url is not None:
+        search_url = resume.search_url
         print(
-            f"Resuming listings scrape after {scroll_attempts} scroll operation(s) "
+            f"Resuming listings scrape from results page {page_number} "
             f"({len(processed_listing_ids)} listings already processed)"
         )
-        goto_with_captcha_handling(page, resume.search_url)
-        pause()
 
-        # the rotated session is a fresh browser with no stored consent, so the
-        # cookie popup reappears and must be dismissed before it blocks scrolling
-        dismiss_cookie_consent(page, wait_for_banner=True)
-        pause()
-
-        # consent dismissal can reload the results page on a fresh proxy session
-        _wait_for_search_results_ready(page)
-        pause()
-
-        _restore_search_scroll_position(page, scroll_attempts)
-    else:
-        goto_with_captcha_handling(page, search_url)
-        print(f"Navigated to search results: {search_url}")
-        pause()
-        _wait_for_search_results_ready(page)
-        pause()
-
-    print(f"Scrolling to load all {listing_type.value.lower()} listings...\n")
+    print(f"Paginating to load all {listing_type.value.lower()} listings...\n")
 
     while True:
-        # scroll down by one page height
-        _scroll_search_results_page(page)
-        scroll_attempts += 1
-        pause(min_seconds=1.0, max_seconds=2.0)
+        # walk the underlying page parameter; the desktop ui hides pagination
+        # behind infinite scroll, but each page url still resolves its chunk
+        page_url = _with_page_param(search_url, page_number)
+        goto_with_captcha_handling(page, page_url)
 
-        # wait a bit for content to load
-        page.wait_for_timeout(1000)
+        # the first load of a (possibly rotated) session has no stored consent,
+        # so wait for the late cookie banner; later pages only need a cheap
+        # dismissal if one is somehow still on screen
+        dismiss_cookie_consent(page, wait_for_banner=first_page_load)
+        first_page_load = False
+        pause()
 
-        # snapshot listing card data before any detail-page navigation so
-        # element handles are not invalidated by leaving the search results
+        # an empty page means we have walked past the final results page, so
+        # the entire result set has been processed
+        if not _search_results_present(page):
+            print(
+                f"No listings on results page {page_number}; reached the end "
+                f"of the result set"
+            )
+            break
+
+        # snapshot every listing card on this page before navigating to any
+        # detail page so the element handles are not invalidated mid-loop
         listing_candidates: list[tuple[str, str, str | None, str]] = []
+        page_listing_ids: set[str] = set()
         list_items = page.locator(_SEARCH_RESULTS_LISTING_SELECTOR).all()
         for list_item in list_items:
             listing_id = list_item.get_attribute("data-testid")
-            if not listing_id or listing_id in processed_listing_ids:
+            if not listing_id:
                 continue
+            page_listing_ids.add(listing_id)
 
             title_link = list_item.locator('a[data-testid="search-listing-title"]')
             if title_link.count() == 0:
@@ -1538,17 +1540,33 @@ def scrape_listings(
                 (listing_id, listing_url, source_id, short_description)
             )
 
-        # process any new listings from the snapshot
+        # autotrader clamps an out-of-range page back to the last valid one, so
+        # an identical card set to the previous page means there are no more
+        if page_listing_ids and page_listing_ids == previous_page_listing_ids:
+            print(
+                f"Results page {page_number} repeats the previous page; "
+                f"reached the end of the result set"
+            )
+            break
+        previous_page_listing_ids = page_listing_ids
+
+        print(
+            f"\nResults page {page_number}: {len(listing_candidates)} listings"
+        )
+
+        # process every new listing on this page from the snapshot
         for listing_id, listing_url, source_id, short_description in (
             listing_candidates
         ):
             if listing_id in processed_listing_ids:
                 continue
 
-            # record position before each listing so proxy rotation can resume here
+            # record the current page before each listing so a proxy rotation
+            # resumes on this page; already-saved listings are skipped on resume
+            # because existing source ids are reloaded from the database
             if resume is not None:
                 resume.search_url = search_url
-                resume.scroll_attempts = scroll_attempts
+                resume.page_number = page_number
                 resume.processed_listing_ids = list(processed_listing_ids)
 
             # rotate the proxy between listings, never mid-download, once the
@@ -1566,16 +1584,16 @@ def scrape_listings(
                 processed_listing_ids.add(listing_id)
                 continue
 
-            # a new listing: announce it so the on-screen single-van detail view
-            # matches the log and is not mistaken for a stuck search-results page
+            # a new listing: announce it so the on-screen single detail view
+            # matches the log and is not mistaken for a stuck results page
             print(
                 f"\nProcessing new listing (source_id: {source_id}): "
                 f"{short_description[:60]}\n  {listing_url}"
             )
 
             # process each listing inside a guard so one bad listing cannot
-            # abort the whole sweep; on failure we re-navigate to the search
-            # results so the next iteration starts from a known good state
+            # abort the whole sweep; every candidate url comes from the snapshot
+            # so a failure just moves on to the next without re-reading the page
             try:
                 # navigate to the detail page via href, pausing for any captcha
                 # that appears in place of the detail page
@@ -1594,27 +1612,19 @@ def scrape_listings(
                 if prospect_listing is None:
                     print("skipping...")
                     processed_listing_ids.add(listing_id)
-                    _restore_search_scroll_position(page, scroll_attempts)
                     continue
 
                 prospect_listings.append(prospect_listing)
-
-                pause(2.0, 10.0)
-
-                # navigate back using "Back to results" link, handling any
-                # captcha that interposes on the return navigation
-                back_button = page.locator('a[data-testid="back-to-search-link"]')
-                back_button.click()
-                page.wait_for_load_state("domcontentloaded")
-                if is_captcha_present(page):
-                    wait_for_captcha_solve(page)
-                pause()
-
                 processed_listing_ids.add(listing_id)
                 if source_id is not None:
                     existing_source_ids.add(source_id)
 
-                _restore_search_scroll_position(page, scroll_attempts)
+                # after each newly saved listing, run a randomized availability sweep
+                update_new_listings_availability(
+                    page, listing_type, random.randint(5, 20), deadline
+                )
+
+                pause(2.0, 10.0)
             except CaptchaSolveError:
                 # an unsolved challenge will block the rest of the sweep on
                 # this exit ip too, so bubble up for a proxy rotation
@@ -1622,42 +1632,14 @@ def scrape_listings(
             except Exception as e:
                 print(f"  Error processing listing, skipping: {e}")
 
-                # re-load the search results so the next iteration can proceed
-                try:
-                    goto_with_captcha_handling(page, search_url)
-                    pause()
-                    _restore_search_scroll_position(page, scroll_attempts)
-                except Exception as recovery_error:
-                    print(
-                        f"      Failed to recover to search results: "
-                        f"{recovery_error}"
-                    )
-                    raise
+        # advance to the next results page
+        page_number += 1
+        if resume is not None:
+            resume.page_number = page_number
+            resume.processed_listing_ids = list(processed_listing_ids)
+        pause(min_seconds=1.0, max_seconds=2.0)
 
-        # check if we've reached the bottom
-        current_height = _evaluate_on_search_page(
-            page, "document.body.scrollHeight"
-        )
-        current_scroll = _evaluate_on_search_page(
-            page, "window.scrollY + window.innerHeight"
-        )
-        if current_scroll >= current_height:
-            break
-
-        # stop when infinite scroll has not grown after several scroll attempts
-        if current_height == previous_height:
-            unchanged_height_scrolls += 1
-            if unchanged_height_scrolls >= 3:
-                print(
-                    "Scroll height unchanged after multiple attempts; "
-                    "assuming all listings are loaded"
-                )
-                break
-        else:
-            unchanged_height_scrolls = 0
-        previous_height = current_height
-
-    print(f"\nFinished scrolling after {scroll_attempts} scroll operations")
+    print(f"\nFinished after walking {page_number} results page(s)")
     print(f"Processed {len(processed_listing_ids)} listings")
     print(f"Found {len(prospect_listings)} new listings")
 
@@ -1670,7 +1652,7 @@ def _open_session(playwright) -> tuple:
     session yields a new exit IP. Returns the browser and its page.
     """
 
-    browser = launch_stealth_chromium(playwright, headless=False, use_proxy=True)
+    browser = launch_stealth_chromium(playwright, headless=True, use_proxy=True)
     page = new_stealth_page(browser)
 
     # allow long per-listing actions but keep navigation short for proxy rotation
@@ -1710,25 +1692,12 @@ def run_autotrader(config: AutotraderScrapeConfig) -> None:
                     deadline = time.monotonic() + PROXY_ROTATION_INTERVAL_MINUTES * 60
 
                     if scrape_resume.search_url is None:
-                        # land on autotrader and record consent before visiting
-                        # individual listing pages during the availability sweep
+                        # land on autotrader and record consent before scraping
                         goto_with_captcha_handling(page, config.landing_url)
                         print(f"Navigated to {config.landing_url}")
                         pause()
                         dismiss_cookie_consent(page, wait_for_banner=True)
                         pause()
-
-                        update_new_listings_availability(
-                            page, config.listing_type, deadline
-                        )
-
-                        # availability leaves the browser on a listing page, so
-                        # return to the landing page without re-waiting for a new
-                        # consent banner unless one is already visible
-                        goto_with_captcha_handling(page, config.landing_url)
-                        print(f"Returned to {config.landing_url}")
-                        pause()
-                        dismiss_cookie_consent(page)
 
                         search_url = apply_search_filters(
                             page,
@@ -1736,8 +1705,7 @@ def run_autotrader(config: AutotraderScrapeConfig) -> None:
                         )
                     else:
                         print(
-                            "Skipping availability check — resuming listings "
-                            "scrape after proxy rotation"
+                            "Resuming listings scrape after proxy rotation"
                         )
                         search_url = scrape_resume.search_url
 

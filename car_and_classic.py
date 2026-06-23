@@ -1,5 +1,6 @@
 import argparse
 import os
+import random
 import re
 import shutil
 import sys
@@ -10,9 +11,13 @@ from datetime import date, datetime, timedelta
 # parse --env before load_environment so the chosen env file is selected at import time
 _pre_parser = argparse.ArgumentParser(add_help=False)
 _pre_parser.add_argument("--env", choices=["dev", "prod"], default=None)
+_pre_parser.add_argument("--headless", choices=["true", "false"], default=None)
 _pre_args, _remaining_argv = _pre_parser.parse_known_args()
 if _pre_args.env is not None:
     os.environ["ENVIRONMENT"] = "production" if _pre_args.env == "prod" else "dev"
+is_headless = True
+if _pre_args.env is not None:
+    is_headless = False if _pre_args.headless == "false" else True
 sys.argv[:] = [sys.argv[0]] + _remaining_argv
 
 from environments import load_environment
@@ -42,8 +47,10 @@ from common import (
     get_existing_source_ids,
     is_http_not_found,
     is_not_found_error,
+    is_playwright_timeout,
     is_transient_db_error,
     pause,
+    run_with_timeout_backoff,
     wait_for_selector_with_backoff,
     with_db_retry,
 )
@@ -55,8 +62,18 @@ from listing_images import (
 from models.auto_ads import Images, ProspectListings
 from models.enums import ListingSource, ListingTable, ListingType, ProspectListingStatus
 
-UNAVAILABLE_ADVERT_TEXT = (
-    "This advert has now been removed through sale or otherwise"
+UNAVAILABLE_ADVERT_TEXTS = (
+    "This advert has now been removed through sale or otherwise",
+)
+
+# title or h1 patterns that indicate a listing is sold or under offer
+TITLE_SOLD_OR_UNDER_OFFER = re.compile(
+    r"(?i)\bunder\s+offer\b|\b(?:already\s+)?sold\b"
+)
+
+# conservative sold phrases in the first description paragraph only
+DESCRIPTION_SOLD_PHRASE = re.compile(
+    r"(?i)\b(?:now sold|already sold|has been sold|is sold)\b"
 )
 
 # how many times to rotate to a fresh Decodo proxy port and resume scraping,
@@ -199,50 +216,220 @@ def load_listing_with_backoff(page: Page, url: str):
     )
 
 
+# IS TITLE SOLD OR UNDER OFFER
+def is_title_sold_or_under_offer(title: str) -> bool:
+    """
+    Return True when a search-card title or listing h1 clearly indicates the
+    vehicle is sold or under offer.
+    """
+
+    return bool(TITLE_SOLD_OR_UNDER_OFFER.search(title))
+
+
+# GET ADVERT TYPE
+def _get_advert_type(page: Page) -> str | None:
+    """
+    Read the Advert type value from the Advert Details section, if present.
+    """
+
+    details = page.locator('section:has(h2:text("Advert Details"))')
+    if details.count() == 0:
+        return None
+
+    match = re.search(
+        r"Advert type:\s*([^\n]+)",
+        details.first.inner_text(),
+    )
+    return match.group(1).strip() if match else None
+
+
+# HAS DESCRIPTION SOLD PHRASE
+def _has_description_sold_phrase(page: Page) -> bool:
+    """
+    Return True when the first description paragraph contains an explicit sold
+    phrase such as 'now sold' or 'already sold'.
+    """
+
+    desc_article = page.locator('article:has(h2:text("Description"))')
+    if desc_article.count() == 0:
+        return False
+
+    first_para = desc_article.locator("p").first
+    if first_para.count() == 0:
+        return False
+
+    return bool(DESCRIPTION_SOLD_PHRASE.search(first_para.inner_text()))
+
+
+# LISTING DETAIL OUTCOME LOCATOR
+def _listing_detail_outcome_locator(page: Page):
+    """
+    Locator for whichever element confirms a Car & Classic detail page has
+    finished rendering: the removed-advert banner, asking-price header, or h1.
+    """
+
+    removed_banner = page.get_by_text(
+        UNAVAILABLE_ADVERT_TEXTS[0], exact=False
+    )
+    for text in UNAVAILABLE_ADVERT_TEXTS[1:]:
+        removed_banner = removed_banner.or_(
+            page.get_by_text(text, exact=False)
+        )
+    price_header = page.locator('header:has(span:text("Asking price"))')
+    listing_h1 = page.locator("section h1")
+    return removed_banner.or_(price_header).or_(listing_h1)
+
+
+# WAIT FOR LISTING DETAIL PAGE
+def wait_for_listing_detail_page(page: Page) -> None:
+    """
+    Wait until a Car & Classic listing detail page has finished rendering.
+    Removed adverts never show section h1, so waiting for h1 alone would time
+    out on unavailable listings instead of recognising the removed-advert banner.
+    """
+
+    outcome = _listing_detail_outcome_locator(page)
+
+    def wait_for_outcome(timeout_ms: int) -> None:
+        outcome.first.wait_for(state="attached", timeout=timeout_ms)
+
+    run_with_timeout_backoff(
+        wait_for_outcome,
+        description="listing detail page",
+    )
+
+
 # IS LISTING NO LONGER AVAILABLE
 def is_listing_no_longer_available(page: Page) -> bool:
     """
-    Return True when the listing page shows that the advert has been removed.
-    Car & Classic detail pages are client-rendered, so this waits for either the
-    removed-advert banner or the normal listing's asking-price header to appear
-    before deciding, ensuring a slow render is never misread as available.
+    Return True when the listing page shows the advert has been sold, is under
+    offer, or has been removed. Car & Classic detail pages are client-rendered,
+    so this waits for a removed-advert banner, asking-price header, or h1 to
+    appear before deciding, ensuring a slow render is never misread as available.
     """
 
     # wait for whichever outcome renders first so a removed advert ends the wait
     # immediately rather than paying the full timeout, while a live listing is
-    # confirmed by its asking-price header
-    removed_banner = page.get_by_text(UNAVAILABLE_ADVERT_TEXT, exact=False)
+    # confirmed by its asking-price header or at least its h1 title
+    outcome = _listing_detail_outcome_locator(page)
     price_header = page.locator('header:has(span:text("Asking price"))')
     try:
-        removed_banner.or_(price_header).first.wait_for(
-            state="attached", timeout=15000
-        )
+        outcome.first.wait_for(state="attached", timeout=15000)
     except Exception:
         pass
 
-    if removed_banner.count() > 0:
-        return True
+    for text in UNAVAILABLE_ADVERT_TEXTS:
+        if page.get_by_text(text, exact=False).count() > 0:
+            return True
 
     # fall back to scanning the rendered html in case the banner markup changes
     try:
-        if UNAVAILABLE_ADVERT_TEXT in page.content():
+        content = page.content()
+        if any(text in content for text in UNAVAILABLE_ADVERT_TEXTS):
             return True
     except Exception:
         pass
 
+    h1 = page.locator("section h1").first
+    if h1.count() > 0:
+        h1_text = h1.text_content() or ""
+        if is_title_sold_or_under_offer(h1_text):
+            return True
+
+    if _has_description_sold_phrase(page):
+        return True
+
+    # a For Sale classified with no asking price is no longer purchasable
+    if (
+        price_header.count() == 0
+        and _get_advert_type(page) == "For Sale"
+    ):
+        return True
+
     return False
 
 
+# PERSIST UNAVAILABLE LISTING STUB
+def persist_unavailable_listing_stub(
+    session,
+    hash_code: str,
+    source_id: str | None,
+    url: str,
+    make_and_model: str,
+    short_description: str | None = None,
+) -> None:
+    """
+    Save a minimal NotAvailable prospect row so future scrapes skip this
+    source_id without downloading images or running AI analysis.
+    """
+
+    current_datetime = datetime.now()
+
+    prospect_listing = ProspectListings(
+        hash_code=hash_code,
+        source_id=source_id,
+        listing_source=ListingSource.CAR_AND_CLASSIC,
+        listing_type=ListingType.CLASSIC,
+        status=ProspectListingStatus.NOT_AVAILABLE,
+        url=url,
+        make_and_model=make_and_model,
+        short_description=short_description or make_and_model,
+        created_at=current_datetime,
+        updated_at=current_datetime,
+        status_checked_at=current_datetime,
+    )
+
+    def persist():
+        session.add(prospect_listing)
+        session.commit()
+
+    with_db_retry(persist, description="persist unavailable listing stub")
+
+
+# RETURN TO SEARCH RESULTS
+def _return_to_search_results(page: Page, search_url: str) -> None:
+    """
+    Navigate back to the saved-search results grid after visiting a listing.
+    Falls back to a direct goto when browser back fails.
+    """
+
+    try:
+        page.go_back()
+        if is_captcha_present(page):
+            wait_for_captcha_solve(page)
+        wait_for_selector_with_backoff(
+            page,
+            '[data-testid="card-listing"]',
+            state="attached",
+            description="search results grid",
+        )
+    except Exception:
+        goto_with_captcha_handling(page, search_url)
+        wait_for_selector_with_backoff(
+            page,
+            '[data-testid="card-listing"]',
+            state="attached",
+            description="search results grid",
+        )
+    pause()
+
+
 # UPDATE NEW LISTINGS AVAILABILITY
-def update_new_listings_availability(page: Page, deadline: float | None = None) -> None:
+def update_new_listings_availability(
+    page: Page, limit: int, deadline: float | None = None
+) -> None:
     """
-    Visit each Car & Classic prospect listing with status New that has not been
-    checked within the past 24 hours, mark any that are no longer available as
-    NotAvailable, and stamp status_checked_at on every completed check. When
-    deadline (a time.monotonic value) is given, raises ProxySessionExpired
-    between listings once it is reached so the proxy can be rotated without
-    interrupting a listing.
+    Visit up to limit Car & Classic prospect listings with status New that have
+    not been checked within the past 24 hours, mark any that are no longer
+    available as NotAvailable, and stamp status_checked_at on every completed
+    check. When limit is zero or negative, returns immediately without doing any
+    work. When deadline (a time.monotonic value) is given, raises
+    ProxySessionExpired between listings once it is reached so the proxy can
+    be rotated without interrupting a listing.
     """
+
+    if limit <= 0:
+        return
 
     database_url = os.getenv("AUTO_ADS_DATABASE_URL")
     engine = create_engine_with_retry(database_url)
@@ -265,6 +452,7 @@ def update_new_listings_availability(page: Page, deadline: float | None = None) 
                     ),
                 )
                 .order_by(ProspectListings.status_checked_at.asc().nullsfirst())
+                .limit(limit)
                 .all()
             ),
             description="load New listings for availability check",
@@ -394,28 +582,6 @@ def accept_cookies(page: Page, timeout: float = 15000):
                 .forEach((el) => el.remove());
         }"""
     )
-
-
-# LOGIN
-def login(page: Page):
-    """
-    Fill in the login popup with credentials from environment variables and submit.
-    """
-
-    email = os.getenv("CAR_AND_CLASSIC_EMAIL")
-    password = os.getenv("CAR_AND_CLASSIC_PASSWORD")
-
-    # enter email address
-    pause()
-    page.locator('[data-testid="input-email"]').fill(email)
-
-    # enter password (target the first matching input)
-    pause()
-    page.locator('[data-testid="input-password"]').first.fill(password)
-
-    # submit the login form
-    pause()
-    page.locator('button[type="submit"]:has-text("Log in")').click()
 
 
 # EXTRACT SOURCE ID
@@ -644,7 +810,6 @@ def extract_listing_details(
         basic_history_check=basic_history_check,
         created_at=current_datetime,
         updated_at=current_datetime,
-        status_checked_at=current_datetime,
     )
 
     return prospect_listing, image_urls
@@ -762,6 +927,32 @@ def scrape_listings(
                 f"{title}|{source_id}" if source_id else title
             )
 
+            listing_url = (
+                href
+                if href.startswith("http")
+                else f"https://www.carandclassic.com{href}"
+            )
+
+            # skip sold/under-offer listings from the card title without a
+            # detail-page visit when the marker is already visible
+            if is_title_sold_or_under_offer(title):
+                print(
+                    f"  [{i + 1}] {title} — sold/under offer (card title), "
+                    f"skipping"
+                )
+                with SessionLocal() as session:
+                    persist_unavailable_listing_stub(
+                        session,
+                        hash_code,
+                        source_id,
+                        listing_url,
+                        title,
+                        title,
+                    )
+                if source_id is not None:
+                    existing_source_ids.add(source_id)
+                continue
+
             # process each listing inside a guard so one bad listing cannot
             # abort the whole sweep; on failure we re-navigate to the search
             # results so the next iteration starts from a known good state
@@ -770,23 +961,46 @@ def scrape_listings(
                 # card, because the anchor is overlaid by a sibling that
                 # intercepts pointer events; goto_with_captcha_handling also
                 # pauses for any captcha shown in place of the detail page
-                listing_url = (
-                    href
-                    if href.startswith("http")
-                    else f"https://www.carandclassic.com{href}"
-                )
-                goto_with_captcha_handling(page, listing_url)
-                wait_for_selector_with_backoff(
-                    page,
-                    "section h1",
-                    state="visible",
-                    description="listing detail page",
-                )
+                response = goto_with_captcha_handling(page, listing_url)
+                wait_for_listing_detail_page(page)
                 pause()
+
+                if is_http_not_found(response) or is_listing_no_longer_available(
+                    page
+                ):
+                    reason = (
+                        "404"
+                        if is_http_not_found(response)
+                        else "unavailable"
+                    )
+                    print(
+                        f"  [{i + 1}] {title} — NotAvailable ({reason}), "
+                        f"skipping"
+                    )
+                    h1 = page.locator("section h1").first
+                    make_and_model = (
+                        h1.text_content().strip()
+                        if h1.count() > 0
+                        else title
+                    )
+                    with SessionLocal() as session:
+                        persist_unavailable_listing_stub(
+                            session,
+                            hash_code,
+                            source_id,
+                            listing_url,
+                            make_and_model,
+                            title,
+                        )
+                    if source_id is not None:
+                        existing_source_ids.add(source_id)
+                    _return_to_search_results(page, search_url)
+                    continue
 
                 prospect_listing, image_urls = extract_listing_details(
                     page, hash_code, source_id
                 )
+                prospect_listing.status_checked_at = datetime.now()
                 new_count += 1
                 print(f"  [{i + 1}] {title}")
                 print(f"      make_and_model: {prospect_listing.make_and_model}")
@@ -861,23 +1075,47 @@ def scrape_listings(
                 if source_id is not None:
                     existing_source_ids.add(source_id)
 
-                # navigate back to the search results, handling any captcha
-                # that may interpose on the back-navigation
-                page.go_back()
-                if is_captcha_present(page):
-                    wait_for_captcha_solve(page)
-                wait_for_selector_with_backoff(
-                    page,
-                    '[data-testid="card-listing"]',
-                    state="attached",
-                    description="search results grid",
+                # after each newly saved listing, run a tiny randomized availability sweep
+                update_new_listings_availability(
+                    page, random.randint(0, 2), deadline
                 )
-                pause()
+
+                _return_to_search_results(page, search_url)
             except CaptchaSolveError:
                 # an unsolved challenge will block the rest of the sweep on
                 # this exit ip too, so bubble up for a proxy rotation
                 raise
             except Exception as e:
+                # a removed advert has no section h1; if a wait timed out but
+                # the unavailable banner is present, save a stub rather than
+                # burning the full backoff budget and skipping without a record
+                if is_playwright_timeout(e) and is_listing_no_longer_available(
+                    page
+                ):
+                    print(
+                        f"  [{i + 1}] {title} — NotAvailable (unavailable), "
+                        f"skipping"
+                    )
+                    h1 = page.locator("section h1").first
+                    make_and_model = (
+                        h1.text_content().strip()
+                        if h1.count() > 0
+                        else title
+                    )
+                    with SessionLocal() as session:
+                        persist_unavailable_listing_stub(
+                            session,
+                            hash_code,
+                            source_id,
+                            listing_url,
+                            make_and_model,
+                            title,
+                        )
+                    if source_id is not None:
+                        existing_source_ids.add(source_id)
+                    _return_to_search_results(page, search_url)
+                    continue
+
                 print(f"  [{i + 1}] {title} — error, skipping: {e}")
 
                 # re-load the search results so the next iteration can proceed
@@ -925,53 +1163,93 @@ def scrape_listings(
     print(f"\nFinished — {page_number} page(s) scraped, {new_count} new listing(s).")
 
 
-# OPEN LOGGED IN SESSION
-def _open_logged_in_session(playwright) -> tuple:
+# OPEN SESSION
+def _open_session(playwright) -> tuple:
     """
-    Launch a fresh proxied Chromium session, accept cookies, and log in with the
-    stored credentials. Each launch advances to the next Decodo port via
+    Launch a fresh proxied Chromium session on the Car & Classic search page and
+    accept cookies. Each launch advances to the next Decodo port via
     round-robin, so calling this again after a dead sticky session yields a new
-    exit IP. Returns the browser and its logged-in page.
+    exit IP. Returns the browser and its page.
     """
 
-    browser = launch_stealth_chromium(playwright, headless=False, use_proxy=True)
+    browser = launch_stealth_chromium(playwright, headless=is_headless, use_proxy=True)
     page = new_stealth_page(browser)
 
-    # land on the home page, solving any captcha that interrupts the load
-    goto_with_captcha_handling(page, "https://www.carandclassic.com")
+    # land on the search page, solving any captcha that interrupts the load
+    goto_with_captcha_handling(page, "https://www.carandclassic.com/search")
 
     pause()
     accept_cookies(page)
 
-    # open the login screen and submit the stored credentials
-    pause()
-    page.locator('[data-testid="nav-login"]').click()
-    login(page)
-    page.wait_for_load_state("load")
-
     return browser, page
 
 
-# NAVIGATE TO SAVED SEARCH
-def _navigate_to_saved_search(page: Page) -> None:
+# APPLY SEARCH FILTERS
+def _apply_search_filters(page: Page) -> None:
     """
-    From a logged-in session, open the saved searches list and click into the
-    first saved search so its results grid is loaded and ready to scrape.
+    Open the All filters overlay on the search page, select Cars, United
+    Kingdom, Advert and Private seller type, apply the filters, then sort the
+    results by Newest listed so the grid is ready to scrape.
     """
 
+    # open the all filters overlay
     pause()
-    goto_with_captcha_handling(
-        page, "https://www.carandclassic.com/account/saved"
+    page.locator('button:has(span:text-is("All filters"))').first.click()
+    wait_for_selector_with_backoff(
+        page,
+        'section:has(h2:text-is("Category"))',
+        state="attached",
+        description="all filters overlay",
     )
-    page.wait_for_load_state("load")
 
-    # click the first saved search link
+    # select category, country, listing type and seller type
     pause()
-    saved_search_link = page.locator(".grid a").first
-    saved_search_link.wait_for(state="visible")
-    saved_search_link.click()
+    page.locator(
+        'section:has(h2:text-is("Category")) button:has(span:text-is("Cars"))'
+    ).click()
 
-    # vue uses client-side routing so load events don't fire; wait for content
+    pause()
+    page.locator(
+        'section:has(h2:text-is("Country")) '
+        'button:has(span:text-is("United Kingdom"))'
+    ).click()
+
+    pause()
+    page.locator(
+        'section:has(h2:text-is("Listing type")) '
+        'button:has(span:text-is("Advert"))'
+    ).click()
+
+    pause()
+    page.locator(
+        'section:has(h2:text-is("Seller type")) '
+        'button:has(span:text-is("Private"))'
+    ).click()
+
+    # apply the selected filters and wait for the results grid
+    pause()
+    page.locator('button:has-text("Show"):has-text("results")').click()
+    wait_for_selector_with_backoff(
+        page,
+        '[data-testid="card-listing"]',
+        state="attached",
+        description="search results grid",
+    )
+
+    # open the sort overlay and choose newest listed
+    pause()
+    page.locator(
+        'button:has(svg[data-icon="sort"]):has(span:text-is("Sort"))'
+    ).click()
+    wait_for_selector_with_backoff(
+        page,
+        'button:has(span:text-is("Newest listed"))',
+        state="attached",
+        description="sort overlay",
+    )
+
+    pause()
+    page.locator('button:has(span:text-is("Newest listed"))').click()
     wait_for_selector_with_backoff(
         page,
         '[data-testid="card-listing"]',
@@ -983,11 +1261,11 @@ def _navigate_to_saved_search(page: Page) -> None:
 # CAR AND CLASSIC
 def car_and_classic():
     """
-    Scrape new Car & Classic saved-search listings inside a proxy-rotation loop.
+    Scrape new Car & Classic search listings inside a proxy-rotation loop.
     When a Decodo sticky session expires mid-run (surfacing as navigation
-    timeouts) the browser is relaunched on a fresh proxy port, re-logged in, and
-    the sweep resumes on the same search-results page (page= query param) where
-    it was interrupted; already-saved listings are skipped because scrape_listings
+    timeouts) the browser is relaunched on a fresh proxy port and the sweep
+    resumes on the same search-results page (page= query param) where it was
+    interrupted; already-saved listings are skipped because scrape_listings
     reloads the existing source ids from the database on each pass.
     """
 
@@ -1009,20 +1287,17 @@ def car_and_classic():
                 # failures before that point are "setup" failures
                 established = False
                 try:
-                    browser, page = _open_logged_in_session(p)
+                    browser, page = _open_session(p)
 
                     # schedule a proactive rotation so the sticky proxy session
                     # is replaced before its 60 minute ttl can expire mid-run
                     deadline = time.monotonic() + PROXY_ROTATION_INTERVAL_MINUTES * 60
 
                     if scrape_resume.search_url is None:
-                        update_new_listings_availability(page, deadline)
-                        _navigate_to_saved_search(page)
+                        _apply_search_filters(page)
                     else:
-                        # availability was checked before the interrupted scrape
                         print(
-                            "Skipping availability check — resuming listings "
-                            "scrape after proxy rotation"
+                            "Resuming listings scrape after proxy rotation"
                         )
 
                     # session is usable; setup succeeded

@@ -1,24 +1,14 @@
-import argparse
 import os
 import random
 import re
 import shutil
-import sys
 import time
-from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
-# parse --env before load_environment so the chosen env file is selected at import time
-_pre_parser = argparse.ArgumentParser(add_help=False)
-_pre_parser.add_argument("--env", choices=["dev", "prod"], default=None)
-_pre_parser.add_argument("--headless", choices=["true", "false"], default=None)
-_pre_args, _remaining_argv = _pre_parser.parse_known_args()
-if _pre_args.env is not None:
-    os.environ["ENVIRONMENT"] = "production" if _pre_args.env == "prod" else "dev"
-is_headless = True
-if _pre_args.env is not None:
-    is_headless = False if _pre_args.headless == "false" else True
-sys.argv[:] = [sys.argv[0]] + _remaining_argv
+from runtime_flags import resolve_runtime_flags
+
+is_headless = resolve_runtime_flags()
 
 from environments import load_environment
 
@@ -27,28 +17,19 @@ load_environment()
 from stealth_browser import (
     CaptchaSolveError,
     Page,
-    check_proxy_health,
     goto_with_captcha_handling,
-    is_captcha_present,
-    is_navigation_timeout,
-    is_proxy_network_error,
     launch_stealth_chromium,
     new_stealth_page,
-    sync_stealth_playwright,
-    wait_for_captcha_solve,
 )
-from sqlalchemy import or_
 from sqlalchemy.orm import sessionmaker
 
-from ai_analysis import apply_ai_analysis, generate_ai_analysis
+from ai_analysis import process_ai_analysis_for_listing
 from common import (
     create_engine_with_retry,
     generate_hash_code,
     get_existing_source_ids,
     is_http_not_found,
-    is_not_found_error,
     is_playwright_timeout,
-    is_transient_db_error,
     pause,
     run_with_timeout_backoff,
     wait_for_selector_with_backoff,
@@ -56,15 +37,26 @@ from common import (
 )
 from listing_images import (
     delete_listing,
-    delete_listing_images,
     download_and_save_listing_images,
 )
 from models.auto_ads import Images, ProspectListings
 from models.enums import ListingSource, ListingTable, ListingType, ProspectListingStatus
+from scraper_driver import (
+    ProxyRotationConfig,
+    ProxySessionExpired,
+    ScrapeResumeState,
+    persist_unavailable_listing_stub,
+    run_with_proxy_rotation,
+    search_results_present,
+    update_new_listings_availability,
+    with_page_param,
+)
 
 UNAVAILABLE_ADVERT_TEXTS = (
     "This advert has now been removed through sale or otherwise",
 )
+
+CONFIG = ProxyRotationConfig.from_env_prefix("CAR_AND_CLASSIC")
 
 # title or h1 patterns that indicate a listing is sold or under offer
 TITLE_SOLD_OR_UNDER_OFFER = re.compile(
@@ -75,145 +67,6 @@ TITLE_SOLD_OR_UNDER_OFFER = re.compile(
 DESCRIPTION_SOLD_PHRASE = re.compile(
     r"(?i)\b(?:now sold|already sold|has been sold|is sold)\b"
 )
-
-# how many times to rotate to a fresh Decodo proxy port and resume scraping,
-# covering both scheduled rotations and rotations forced by a dead session
-MAX_PROXY_ROTATIONS = int(os.getenv("CAR_AND_CLASSIC_MAX_PROXY_ROTATIONS", "20"))
-
-# proactively rotate the proxy after this many minutes so the Decodo sticky
-# session (60 minute TTL) is replaced well before it can expire mid-run
-PROXY_ROTATION_INTERVAL_MINUTES = float(
-    os.getenv("CAR_AND_CLASSIC_PROXY_ROTATION_MINUTES", "25")
-)
-
-# abort after this many consecutive failures to even open the site through the
-# proxy: a navigation HTTP error across several ports means rotating will not
-# help (e.g. the Decodo account is out of bandwidth, suspended or misconfigured)
-MAX_CONSECUTIVE_SETUP_FAILURES = int(
-    os.getenv("CAR_AND_CLASSIC_MAX_SETUP_FAILURES", "3")
-)
-
-# abort after this many consecutive transient database failures that even the
-# per-operation retries could not clear: a prolonged outage should eventually
-# surface rather than loop forever, but the budget is generous so brief blips
-# (e.g. WSL2 dns hiccups) only cause a wait-and-retry, never a lost run
-MAX_CONSECUTIVE_DB_FAILURES = int(
-    os.getenv("CAR_AND_CLASSIC_MAX_DB_FAILURES", "10")
-)
-
-# how many times to reload a listing during an availability check when the page
-# cannot be fetched at all (proxy/network "site can't be reached" failures)
-# before giving up; a transient blip should never abort the sweep, but a
-# persistently dead connection must eventually surface
-AVAILABILITY_MAX_LOAD_RETRIES = int(
-    os.getenv("CAR_AND_CLASSIC_AVAILABILITY_LOAD_RETRIES", "4")
-)
-
-# base seconds for the exponential back-off between availability reload attempts
-AVAILABILITY_LOAD_BACKOFF_SECONDS = float(
-    os.getenv("CAR_AND_CLASSIC_AVAILABILITY_LOAD_BACKOFF", "5")
-)
-
-# additional Chromium network error codes (beyond the proxy-specific set in
-# stealth_browser) that mean the listing page could not be fetched at all, so
-# its availability is unknown and must never be inferred from the failure
-SITE_UNREACHABLE_ERROR_FRAGMENTS = (
-    "ERR_NAME_NOT_RESOLVED",
-    "ERR_NAME_RESOLUTION_FAILED",
-    "ERR_INTERNET_DISCONNECTED",
-    "ERR_ADDRESS_UNREACHABLE",
-    "ERR_CONNECTION_REFUSED",
-    "ERR_NETWORK_CHANGED",
-    "ERR_SOCKET_NOT_CONNECTED",
-)
-
-
-# SCRAPE RESUME STATE
-@dataclass
-class ScrapeResumeState:
-    """
-    Bookkeeping for where a listings scrape was interrupted so a proxy rotation
-    can resume on the same search-results page (including its page= query param)
-    and listing index rather than restarting from page 1.
-    """
-
-    search_url: str | None = None
-    page_number: int = 1
-    listing_index: int = 0
-
-
-# PROXY SESSION EXPIRED
-class ProxySessionExpired(Exception):
-    """
-    Raised between listings once the proxy rotation interval has elapsed, so the
-    caller can relaunch on a fresh Decodo port without ever interrupting an
-    in-progress listing download.
-    """
-
-
-# IS SITE UNREACHABLE ERROR
-def is_site_unreachable_error(exc: BaseException) -> bool:
-    """
-    Return True when an exception means the listing page could not be fetched at
-    all: a proxy transport failure, a navigation timeout, a DNS failure or any
-    "site can't be reached" network error. A listing's availability can never be
-    inferred from these, so the caller retries with back-off and ultimately
-    raises rather than marking the listing NotAvailable.
-    """
-
-    if is_proxy_network_error(exc) or is_navigation_timeout(exc):
-        return True
-
-    message = str(exc)
-    return any(
-        fragment in message for fragment in SITE_UNREACHABLE_ERROR_FRAGMENTS
-    )
-
-
-# LOAD LISTING WITH BACKOFF
-def load_listing_with_backoff(page: Page, url: str):
-    """
-    Navigate to a listing url for an availability check, retrying transient
-    "site can't be reached" network/proxy failures with exponential back-off.
-    Returns the navigation response on success. A genuine 404 is raised
-    immediately because the advert really is gone, and a network failure that
-    survives every retry is re-raised so the caller can rotate the proxy or
-    abort rather than guess the listing's availability.
-    """
-
-    last_error: Exception | None = None
-
-    for attempt in range(1, AVAILABILITY_MAX_LOAD_RETRIES + 1):
-        try:
-            return goto_with_captcha_handling(page, url)
-        except CaptchaSolveError:
-            raise
-        except Exception as e:
-            # a genuine 404 means the advert is gone, so stop retrying
-            if is_not_found_error(e):
-                raise
-
-            # only transport-level failures are worth retrying; any other error
-            # is a real page/parse problem the caller should handle directly
-            if not is_site_unreachable_error(e):
-                raise
-
-            last_error = e
-            if attempt < AVAILABILITY_MAX_LOAD_RETRIES:
-                # exponential back-off gives a flapping proxy or connection time
-                # to recover before the next attempt
-                delay = AVAILABILITY_LOAD_BACKOFF_SECONDS * (2 ** (attempt - 1))
-                print(
-                    f"  Site unreachable (attempt {attempt}/"
-                    f"{AVAILABILITY_MAX_LOAD_RETRIES}): {e}; retrying in "
-                    f"{delay:.0f}s..."
-                )
-                time.sleep(delay)
-
-    # every retry failed: surface the error so availability is never guessed
-    raise last_error if last_error is not None else RuntimeError(
-        f"Failed to load {url} for availability check"
-    )
 
 
 # IS TITLE SOLD OR UNDER OFFER
@@ -349,189 +202,7 @@ def is_listing_no_longer_available(page: Page) -> bool:
     return False
 
 
-# PERSIST UNAVAILABLE LISTING STUB
-def persist_unavailable_listing_stub(
-    session,
-    hash_code: str,
-    source_id: str | None,
-    url: str,
-    make_and_model: str,
-    short_description: str | None = None,
-) -> None:
-    """
-    Save a minimal NotAvailable prospect row so future scrapes skip this
-    source_id without downloading images or running AI analysis.
-    """
-
-    current_datetime = datetime.now()
-
-    prospect_listing = ProspectListings(
-        hash_code=hash_code,
-        source_id=source_id,
-        listing_source=ListingSource.CAR_AND_CLASSIC,
-        listing_type=ListingType.CLASSIC,
-        status=ProspectListingStatus.NOT_AVAILABLE,
-        url=url,
-        make_and_model=make_and_model,
-        short_description=short_description or make_and_model,
-        created_at=current_datetime,
-        updated_at=current_datetime,
-        status_checked_at=current_datetime,
-    )
-
-    def persist():
-        session.add(prospect_listing)
-        session.commit()
-
-    with_db_retry(persist, description="persist unavailable listing stub")
-
-
-# RETURN TO SEARCH RESULTS
-def _return_to_search_results(page: Page, search_url: str) -> None:
-    """
-    Navigate back to the saved-search results grid after visiting a listing.
-    Falls back to a direct goto when browser back fails.
-    """
-
-    try:
-        page.go_back()
-        if is_captcha_present(page):
-            wait_for_captcha_solve(page)
-        wait_for_selector_with_backoff(
-            page,
-            '[data-testid="card-listing"]',
-            state="attached",
-            description="search results grid",
-        )
-    except Exception:
-        goto_with_captcha_handling(page, search_url)
-        wait_for_selector_with_backoff(
-            page,
-            '[data-testid="card-listing"]',
-            state="attached",
-            description="search results grid",
-        )
-    pause()
-
-
-# UPDATE NEW LISTINGS AVAILABILITY
-def update_new_listings_availability(
-    page: Page, limit: int, deadline: float | None = None
-) -> None:
-    """
-    Visit up to limit Car & Classic prospect listings with status New that have
-    not been checked within the past 24 hours, mark any that are no longer
-    available as NotAvailable, and stamp status_checked_at on every completed
-    check. When limit is zero or negative, returns immediately without doing any
-    work. When deadline (a time.monotonic value) is given, raises
-    ProxySessionExpired between listings once it is reached so the proxy can
-    be rotated without interrupting a listing.
-    """
-
-    if limit <= 0:
-        return
-
-    database_url = os.getenv("AUTO_ADS_DATABASE_URL")
-    engine = create_engine_with_retry(database_url)
-    SessionLocal = sessionmaker(bind=engine)
-
-    with SessionLocal() as session:
-        checked_before = datetime.now() - timedelta(hours=24)
-
-        # retry the initial load so a transient db hiccup at sweep start does
-        # not abort the whole availability check
-        new_listings = with_db_retry(
-            lambda: (
-                session.query(ProspectListings)
-                .filter(
-                    ProspectListings.listing_source == ListingSource.CAR_AND_CLASSIC,
-                    ProspectListings.status == ProspectListingStatus.NEW,
-                    or_(
-                        ProspectListings.status_checked_at.is_(None),
-                        ProspectListings.status_checked_at < checked_before,
-                    ),
-                )
-                .order_by(ProspectListings.status_checked_at.asc().nullsfirst())
-                .limit(limit)
-                .all()
-            ),
-            description="load New listings for availability check",
-        )
-
-        if not new_listings:
-            print("No New Car & Classic listings to check for availability")
-            return
-
-        print(
-            f"Checking availability of {len(new_listings)} New Car & Classic listings..."
-        )
-
-        for listing in new_listings:
-            # rotate the proxy between listings, never mid-check, once the
-            # session has outlived the rotation interval
-            if deadline is not None and time.monotonic() >= deadline:
-                raise ProxySessionExpired(
-                    "proxy rotation interval elapsed during availability check"
-                )
-
-            print(
-                f"Checking: {listing.make_and_model} - {listing.short_description[:50]}..."
-            )
-
-            # guard each visit so one bad listing does not abort the whole sweep
-            try:
-                # reload with back-off so a transient proxy/network blip never
-                # gets misread as the advert being gone
-                response = load_listing_with_backoff(page, listing.url)
-
-                if is_http_not_found(response) or is_listing_no_longer_available(page):
-                    listing.status = ProspectListingStatus.NOT_AVAILABLE
-                    listing.updated_at = datetime.now()
-                    listing.status_checked_at = datetime.now()
-                    session.commit()
-                    reason = "404" if is_http_not_found(response) else "unavailable"
-                    print(f"  Marked as NotAvailable ({reason}): {listing.url}")
-
-                    # drop the now-orphaned photos from s3 and the images table
-                    delete_listing_images(listing, session)
-                else:
-                    listing.status_checked_at = datetime.now()
-                    session.commit()
-                    print("  Still available")
-            except CaptchaSolveError:
-                # an unsolved challenge will block every remaining listing on
-                # this exit ip too, so bubble up for a proxy rotation instead
-                # of misclassifying this listing as unavailable
-                session.rollback()
-                raise
-            except Exception as e:
-                if is_not_found_error(e):
-                    listing.status = ProspectListingStatus.NOT_AVAILABLE
-                    listing.updated_at = datetime.now()
-                    listing.status_checked_at = datetime.now()
-                    session.commit()
-                    print(f"  Marked as NotAvailable (404): {listing.url}")
-
-                    # drop the now-orphaned photos from s3 and the images table
-                    delete_listing_images(listing, session)
-                elif is_site_unreachable_error(e):
-                    # the page could not be fetched even after back-off retries;
-                    # availability is unknown, so never mark NotAvailable. bubble
-                    # up so the outer loop rotates the proxy or aborts the run.
-                    session.rollback()
-                    print(
-                        f"  Site still unreachable after "
-                        f"{AVAILABILITY_MAX_LOAD_RETRIES} attempts; aborting "
-                        f"availability check: {e}"
-                    )
-                    raise
-                else:
-                    session.rollback()
-                    print(f"  Error checking {listing.url}: {e}")
-
-            pause(2.0, 8.0)
-
-        print("Finished availability check for New listings")
+_SEARCH_RESULTS_CARD_SELECTOR = '[data-testid="card-listing"]'
 
 
 ICON_TO_FIELD = {
@@ -582,6 +253,102 @@ def accept_cookies(page: Page, timeout: float = 15000):
                 .forEach((el) => el.remove());
         }"""
     )
+
+
+# DISMISS BLOCKING OVERLAYS
+def _dismiss_blocking_overlays(page: Page, *, cookie_timeout: float = 3000) -> None:
+    """
+    Clear cookie-consent and inertia error overlays that intercept pointer
+    events on the search results page before opening sort or filter controls.
+    """
+
+    accept_cookies(page, timeout=cookie_timeout)
+    dismiss_inertia_error_dialog(page)
+
+
+_NEWEST_LISTED_SORT_APPLIED_SELECTOR = (
+    'button:has(svg[data-icon="clock"]):has(span:text-is("Newest listed"))'
+)
+_SORT_MENU_BUTTON_SELECTOR = 'button:has(svg[data-icon="sort"])'
+
+
+# IS SORTED BY NEWEST
+def _is_sorted_by_newest(page: Page) -> bool:
+    """
+    Return True when the results page is sorted by newest listed, either from
+    the sort=latest query parameter or from the sort control showing a clock
+    icon with the Newest listed label after the selection is applied.
+    """
+
+    params = dict(parse_qsl(urlparse(page.url).query, keep_blank_values=True))
+    if params.get("sort") == "latest":
+        return True
+
+    return page.locator(_NEWEST_LISTED_SORT_APPLIED_SELECTOR).count() > 0
+
+
+# APPLY NEWEST LISTED SORT
+def _apply_newest_listed_sort(page: Page) -> None:
+    """
+    Open the sort overlay and choose Newest listed, dismissing any cookie or
+    inertia overlays first. When the control already shows Newest listed with
+    the clock icon, the selection is left unchanged.
+    """
+
+    for attempt in range(2):
+        _dismiss_blocking_overlays(page)
+        pause()
+
+        if _is_sorted_by_newest(page):
+            return
+
+        page.locator(_SORT_MENU_BUTTON_SELECTOR).first.click()
+        wait_for_selector_with_backoff(
+            page,
+            'button:has(span:text-is("Newest listed"))',
+            state="attached",
+            description="sort overlay",
+        )
+
+        pause()
+        page.locator('button:has(span:text-is("Newest listed"))').click()
+        wait_for_selector_with_backoff(
+            page,
+            '[data-testid="card-listing"]',
+            state="attached",
+            description="search results grid",
+        )
+
+        if _is_sorted_by_newest(page):
+            return
+
+        print(
+            "Newest listed sort did not apply "
+            f"(attempt {attempt + 1}/2); retrying after clearing overlays"
+        )
+
+    raise RuntimeError(
+        "Failed to apply Newest listed sort after clearing cookie overlays"
+    )
+
+
+# CANONICAL NEWEST SEARCH URL
+def _canonical_newest_search_url(url: str) -> str:
+    """
+    Return the page-one search url with sort=latest and source=modal-sort set,
+    preserving every other filter query parameter from url.
+    """
+
+    parsed = urlparse(url)
+    pairs = [
+        (key, value)
+        for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+        if key not in ("sort", "source", "page")
+    ]
+    pairs.append(("sort", "latest"))
+    pairs.append(("source", "modal-sort"))
+
+    return urlunparse(parsed._replace(query=urlencode(pairs)))
 
 
 # EXTRACT SOURCE ID
@@ -815,23 +582,56 @@ def extract_listing_details(
     return prospect_listing, image_urls
 
 
+# SNAPSHOT LISTING CANDIDATES
+def _snapshot_listing_candidates(
+    page: Page, *, use_new_section: bool
+) -> list[tuple[str, str, str | None, str]]:
+    """
+    Collect every listing card on the current results page before navigating to
+    any detail page, returning (card_id, listing_url, source_id, title) tuples.
+    """
+
+    if use_new_section:
+        articles = page.locator("div.lg\\:grid-cols-3.grid.grid-cols-1").locator(
+            _SEARCH_RESULTS_CARD_SELECTOR
+        )
+    else:
+        articles = page.locator(_SEARCH_RESULTS_CARD_SELECTOR)
+
+    listing_candidates: list[tuple[str, str, str | None, str]] = []
+    for i in range(articles.count()):
+        card = articles.nth(i)
+        title = card.locator("h2").text_content().strip()
+        href = card.locator("a").first.get_attribute("href")
+        source_id = extract_source_id(href)
+        listing_url = (
+            href
+            if href.startswith("http")
+            else f"https://www.carandclassic.com{href}"
+        )
+        card_id = source_id or listing_url
+        listing_candidates.append((card_id, listing_url, source_id, title))
+
+    return listing_candidates
+
+
 # SCRAPE LISTINGS
 def scrape_listings(
     page: Page,
+    search_url: str,
     deadline: float | None = None,
     resume: ScrapeResumeState | None = None,
 ):
     """
-    Iterate through all pages of search results. For each article, extract the
-    listing's source id from its URL and skip if already in the database.
-    Otherwise navigate to the detail page, extract a ProspectListings record,
-    save it to the database, and download images to local temp and S3. Advances
-    through pages via the next-page link. When deadline (a time.monotonic
-    value) is given, raises ProxySessionExpired between listings once it is
-    reached so the proxy can be rotated without interrupting a
-    partially-downloaded listing. When resume carries a search_url from an
-    interrupted run, navigates directly to that page (including page= in the
-    query string) and continues from the saved listing index.
+    Walk every page of Car & Classic search results and save new listings.
+    Each results page is loaded via the page= query parameter on the canonical
+    search url (including sort=latest), listing cards are snapshotted, then each
+    candidate is visited directly without returning to the grid between items.
+    When deadline (a time.monotonic value) is given, raises ProxySessionExpired
+    between listings once it is reached so the proxy can be rotated without
+    interrupting a partially-downloaded listing. When resume carries a
+    search_url from an interrupted run, continues from the saved results page
+    number rather than starting over from page one.
     """
 
     existing_source_ids = get_existing_source_ids(ListingSource.CAR_AND_CLASSIC)
@@ -842,53 +642,68 @@ def scrape_listings(
     SessionLocal = sessionmaker(bind=engine)
 
     new_count = 0
-    start_index = 0
+    processed_ids = resume.processed_ids if resume is not None else set()
+    page_number = resume.page_number if resume is not None else 1
+    previous_page_listing_ids: set[str] = set()
+    use_new_section: bool | None = None
 
-    # after a proxy rotation, open the saved search-results page directly
     if resume is not None and resume.search_url is not None:
+        search_url = with_page_param(resume.search_url, 1)
         print(
-            f"Resuming listings scrape at page {resume.page_number} "
-            f"(listing {resume.listing_index + 1})"
+            f"Resuming listings scrape at page {page_number} "
+            f"({len(processed_ids)} listings already processed)"
         )
-        goto_with_captcha_handling(page, resume.search_url)
-        wait_for_selector_with_backoff(
-            page,
-            '[data-testid="card-listing"]',
-            state="attached",
-            description="search results grid",
-        )
-        page_number = resume.page_number
-        search_url = resume.search_url
-        start_index = resume.listing_index
-    else:
-        page_number = 1
-        search_url = page.url
 
-    # check if a "new vehicles" grid section is present above the main listings
-    new_vehicles_grid = page.locator("div.lg\\:grid-cols-3.grid.grid-cols-1")
-    use_new_section = new_vehicles_grid.count() > 0
-
-    if use_new_section:
-        print("New vehicles section detected — processing only new listings")
+    print("Paginating to load all Car & Classic listings...\n")
 
     while True:
+        page_url = with_page_param(search_url, page_number)
+        goto_with_captcha_handling(page, page_url)
         pause()
 
-        # scope articles to the new-vehicles grid if present, otherwise all
-        if use_new_section:
-            articles = new_vehicles_grid.locator('[data-testid="card-listing"]')
-        else:
-            articles = page.locator('[data-testid="card-listing"]')
+        if not search_results_present(page, _SEARCH_RESULTS_CARD_SELECTOR):
+            print(
+                f"No listings on results page {page_number}; reached the end "
+                f"of the result set"
+            )
+            break
 
-        count = articles.count()
-        print(f"\n--- Page {page_number} ({count} listings) ---")
+        if use_new_section is None:
+            new_vehicles_grid = page.locator(
+                "div.lg\\:grid-cols-3.grid.grid-cols-1"
+            )
+            use_new_section = new_vehicles_grid.count() > 0
+            if use_new_section:
+                print("New vehicles section detected — processing only new listings")
 
-        for i in range(start_index, count):
+        listing_candidates = _snapshot_listing_candidates(
+            page, use_new_section=use_new_section
+        )
+        page_listing_ids = {card_id for card_id, _, _, _ in listing_candidates}
+
+        if page_listing_ids and page_listing_ids == previous_page_listing_ids:
+            print(
+                f"Results page {page_number} repeats the previous page; "
+                f"reached the end of the result set"
+            )
+            break
+        previous_page_listing_ids = page_listing_ids
+
+        print(
+            f"\n--- Page {page_number} ({len(listing_candidates)} listings) ---"
+        )
+
+        for index, (card_id, listing_url, source_id, title) in enumerate(
+            listing_candidates, start=1
+        ):
+            if card_id in processed_ids:
+                continue
+
             # record position before each listing so proxy rotation can resume here
             if resume is not None:
                 resume.search_url = search_url
                 resume.page_number = page_number
-                resume.listing_index = i
+                resume.processed_ids = processed_ids
 
             # rotate the proxy between listings, never mid-download, once the
             # session has outlived the rotation interval; raised before any
@@ -898,26 +713,9 @@ def scrape_listings(
                     "proxy rotation interval elapsed during listing scrape"
                 )
 
-            # re-query articles after each navigation back
-            if use_new_section:
-                new_vehicles_grid = page.locator(
-                    "div.lg\\:grid-cols-3.grid.grid-cols-1"
-                )
-                articles = new_vehicles_grid.locator(
-                    '[data-testid="card-listing"]'
-                )
-            else:
-                articles = page.locator('[data-testid="card-listing"]')
-
-            title = articles.nth(i).locator("h2").text_content().strip()
-
-            # dedupe on the site's own listing reference taken from the card's
-            # href, because titles are generic on car & classic and different
-            # listings can share the same title (and thus title-based hash)
-            href = articles.nth(i).locator("a").first.get_attribute("href")
-            source_id = extract_source_id(href)
             if source_id is not None and source_id in existing_source_ids:
-                print(f"  [{i + 1}] {title} — already exists, skipping")
+                print(f"  [{index}] {title} — already exists, skipping")
+                processed_ids.add(card_id)
                 continue
 
             # include the source id in the hash input so two different
@@ -927,35 +725,32 @@ def scrape_listings(
                 f"{title}|{source_id}" if source_id else title
             )
 
-            listing_url = (
-                href
-                if href.startswith("http")
-                else f"https://www.carandclassic.com{href}"
-            )
-
             # skip sold/under-offer listings from the card title without a
             # detail-page visit when the marker is already visible
             if is_title_sold_or_under_offer(title):
                 print(
-                    f"  [{i + 1}] {title} — sold/under offer (card title), "
+                    f"  [{index}] {title} — sold/under offer (card title), "
                     f"skipping"
                 )
                 with SessionLocal() as session:
                     persist_unavailable_listing_stub(
                         session,
-                        hash_code,
-                        source_id,
-                        listing_url,
-                        title,
-                        title,
+                        listing_source=ListingSource.CAR_AND_CLASSIC,
+                        listing_type=ListingType.CLASSIC,
+                        hash_code=hash_code,
+                        source_id=source_id,
+                        url=listing_url,
+                        make_and_model=title,
+                        short_description=title,
                     )
                 if source_id is not None:
                     existing_source_ids.add(source_id)
+                processed_ids.add(card_id)
                 continue
 
             # process each listing inside a guard so one bad listing cannot
-            # abort the whole sweep; on failure we re-navigate to the search
-            # results so the next iteration starts from a known good state
+            # abort the whole sweep; every candidate url comes from the snapshot
+            # so a failure just moves on to the next without re-reading the page
             try:
                 # navigate to the listing via its href instead of clicking the
                 # card, because the anchor is overlaid by a sibling that
@@ -974,7 +769,7 @@ def scrape_listings(
                         else "unavailable"
                     )
                     print(
-                        f"  [{i + 1}] {title} — NotAvailable ({reason}), "
+                        f"  [{index}] {title} — NotAvailable ({reason}), "
                         f"skipping"
                     )
                     h1 = page.locator("section h1").first
@@ -986,15 +781,17 @@ def scrape_listings(
                     with SessionLocal() as session:
                         persist_unavailable_listing_stub(
                             session,
-                            hash_code,
-                            source_id,
-                            listing_url,
-                            make_and_model,
-                            title,
+                            listing_source=ListingSource.CAR_AND_CLASSIC,
+                            listing_type=ListingType.CLASSIC,
+                            hash_code=hash_code,
+                            source_id=source_id,
+                            url=listing_url,
+                            make_and_model=make_and_model,
+                            short_description=title,
                         )
                     if source_id is not None:
                         existing_source_ids.add(source_id)
-                    _return_to_search_results(page, search_url)
+                    processed_ids.add(card_id)
                     continue
 
                 prospect_listing, image_urls = extract_listing_details(
@@ -1002,7 +799,7 @@ def scrape_listings(
                 )
                 prospect_listing.status_checked_at = datetime.now()
                 new_count += 1
-                print(f"  [{i + 1}] {title}")
+                print(f"  [{index}] {title}")
                 print(f"      make_and_model: {prospect_listing.make_and_model}")
                 print(f"      year: {prospect_listing.year}")
                 print(f"      location: {prospect_listing.location}")
@@ -1060,27 +857,29 @@ def scrape_listings(
                             f"({saved_image_count}/{len(image_urls)} images saved)"
                         )
 
-                    ai_analysis = generate_ai_analysis(
-                        "classic_car_prompt.md", prospect_listing, temp_image_dir
+                    process_ai_analysis_for_listing(
+                        "classic_car_prompt.md",
+                        prospect_listing,
+                        session,
+                        temp_image_dir,
                     )
-                    apply_ai_analysis(prospect_listing, ai_analysis)
-
-                    session.add(prospect_listing)
-                    session.flush()
-                    session.commit()
 
                     if temp_image_dir and os.path.isdir(temp_image_dir):
                         shutil.rmtree(temp_image_dir)
 
                 if source_id is not None:
                     existing_source_ids.add(source_id)
+                processed_ids.add(card_id)
 
                 # after each newly saved listing, run a tiny randomized availability sweep
                 update_new_listings_availability(
-                    page, random.randint(0, 2), deadline
+                    page,
+                    listing_source=ListingSource.CAR_AND_CLASSIC,
+                    is_unavailable_fn=is_listing_no_longer_available,
+                    limit=random.randint(0, 2),
+                    config=CONFIG,
+                    deadline=deadline,
                 )
-
-                _return_to_search_results(page, search_url)
             except CaptchaSolveError:
                 # an unsolved challenge will block the rest of the sweep on
                 # this exit ip too, so bubble up for a proxy rotation
@@ -1093,7 +892,7 @@ def scrape_listings(
                     page
                 ):
                     print(
-                        f"  [{i + 1}] {title} — NotAvailable (unavailable), "
+                        f"  [{index}] {title} — NotAvailable (unavailable), "
                         f"skipping"
                     )
                     h1 = page.locator("section h1").first
@@ -1105,60 +904,30 @@ def scrape_listings(
                     with SessionLocal() as session:
                         persist_unavailable_listing_stub(
                             session,
-                            hash_code,
-                            source_id,
-                            listing_url,
-                            make_and_model,
-                            title,
+                            listing_source=ListingSource.CAR_AND_CLASSIC,
+                            listing_type=ListingType.CLASSIC,
+                            hash_code=hash_code,
+                            source_id=source_id,
+                            url=listing_url,
+                            make_and_model=make_and_model,
+                            short_description=title,
                         )
                     if source_id is not None:
                         existing_source_ids.add(source_id)
-                    _return_to_search_results(page, search_url)
+                    processed_ids.add(card_id)
                     continue
 
-                print(f"  [{i + 1}] {title} — error, skipping: {e}")
-
-                # re-load the search results so the next iteration can proceed
-                try:
-                    goto_with_captcha_handling(page, search_url)
-                    wait_for_selector_with_backoff(
-                        page,
-                        '[data-testid="card-listing"]',
-                        state="attached",
-                        description="search results grid",
-                    )
-                    pause()
-                except Exception as recovery_error:
-                    print(
-                        f"      Failed to recover to search results: "
-                        f"{recovery_error}"
-                    )
-                    raise
-
-        # only the first page after a resume may start partway through
-        start_index = 0
+                print(f"  [{index}] {title} — error, skipping: {e}")
 
         # new-vehicles section has no pagination, so stop after one pass
         if use_new_section:
             break
 
-        # check for a next-page link
-        next_button = page.locator("a[data-next-page]")
-        if next_button.is_visible():
-            next_button.click()
-            wait_for_selector_with_backoff(
-                page,
-                '[data-testid="card-listing"]',
-                state="attached",
-                description="search results grid",
-            )
-
-            # track the url of the page now being scraped, otherwise a
-            # per-listing failure would recover to page 1 and re-scrape it
-            search_url = page.url
-            page_number += 1
-        else:
-            break
+        page_number += 1
+        if resume is not None:
+            resume.page_number = page_number
+            resume.processed_ids = processed_ids
+        pause(min_seconds=1.0, max_seconds=2.0)
 
     print(f"\nFinished — {page_number} page(s) scraped, {new_count} new listing(s).")
 
@@ -1185,12 +954,16 @@ def _open_session(playwright) -> tuple:
 
 
 # APPLY SEARCH FILTERS
-def _apply_search_filters(page: Page) -> None:
+def _apply_search_filters(page: Page) -> str:
     """
     Open the All filters overlay on the search page, select Cars, United
     Kingdom, Advert and Private seller type, apply the filters, then sort the
-    results by Newest listed so the grid is ready to scrape.
+    results by Newest listed so the grid is ready to scrape. Returns the
+    canonical page-one search url including sort=latest.
     """
+
+    _dismiss_blocking_overlays(page, cookie_timeout=15000)
+    pause()
 
     # open the all filters overlay
     pause()
@@ -1236,26 +1009,9 @@ def _apply_search_filters(page: Page) -> None:
         description="search results grid",
     )
 
-    # open the sort overlay and choose newest listed
-    pause()
-    page.locator(
-        'button:has(svg[data-icon="sort"]):has(span:text-is("Sort"))'
-    ).click()
-    wait_for_selector_with_backoff(
-        page,
-        'button:has(span:text-is("Newest listed"))',
-        state="attached",
-        description="sort overlay",
-    )
+    _apply_newest_listed_sort(page)
 
-    pause()
-    page.locator('button:has(span:text-is("Newest listed"))').click()
-    wait_for_selector_with_backoff(
-        page,
-        '[data-testid="card-listing"]',
-        state="attached",
-        description="search results grid",
-    )
+    return _canonical_newest_search_url(page.url)
 
 
 # CAR AND CLASSIC
@@ -1269,155 +1025,18 @@ def car_and_classic():
     reloads the existing source ids from the database on each pass.
     """
 
-    scrape_resume = ScrapeResumeState()
+    def setup(page: Page, resume: ScrapeResumeState) -> None:
+        resume.search_url = _apply_search_filters(page)
 
-    with sync_stealth_playwright() as p:
-        # verify the proxy is reachable before launching so a dead/expired proxy
-        # account fails fast with a clear message rather than opaque page errors
-        check_proxy_health(p)
+    def scrape(page: Page, deadline: float, resume: ScrapeResumeState) -> None:
+        scrape_listings(page, resume.search_url, deadline, resume)
 
-        browser = None
-        rotations = 0
-        consecutive_setup_failures = 0
-        consecutive_db_failures = 0
-
-        try:
-            while True:
-                # track whether this attempt got far enough to start scraping;
-                # failures before that point are "setup" failures
-                established = False
-                try:
-                    browser, page = _open_session(p)
-
-                    # schedule a proactive rotation so the sticky proxy session
-                    # is replaced before its 60 minute ttl can expire mid-run
-                    deadline = time.monotonic() + PROXY_ROTATION_INTERVAL_MINUTES * 60
-
-                    if scrape_resume.search_url is None:
-                        _apply_search_filters(page)
-                    else:
-                        print(
-                            "Resuming listings scrape after proxy rotation"
-                        )
-
-                    # session is usable; setup succeeded
-                    established = True
-                    consecutive_setup_failures = 0
-
-                    scrape_listings(page, deadline, scrape_resume)
-                    break
-                except ProxySessionExpired as e:
-                    # scheduled rotation: relaunch on a fresh port between listings
-                    if rotations >= MAX_PROXY_ROTATIONS:
-                        raise
-
-                    rotations += 1
-                    print(
-                        f"\nScheduled proxy rotation after "
-                        f"{PROXY_ROTATION_INTERVAL_MINUTES} min ({e}); relaunching "
-                        f"on a new Decodo port and resuming "
-                        f"(rotation {rotations}/{MAX_PROXY_ROTATIONS})...\n"
-                    )
-
-                    if browser is not None:
-                        try:
-                            browser.close()
-                        except Exception:
-                            pass
-                        browser = None
-                except Exception as e:
-                    # a transient database failure that even the per-operation
-                    # retries could not clear is not a proxy problem, so rotating
-                    # ports would not help; wait and retry the same session and
-                    # resume position instead of crashing the whole run
-                    if is_transient_db_error(e):
-                        consecutive_db_failures += 1
-                        if consecutive_db_failures >= MAX_CONSECUTIVE_DB_FAILURES:
-                            raise RuntimeError(
-                                f"Database unreachable after "
-                                f"{consecutive_db_failures} consecutive attempts "
-                                f"({e}). Aborting."
-                            ) from e
-
-                        # back off before relaunching, capped so a long outage
-                        # waits in reasonable steps rather than ballooning
-                        delay = min(60.0, 5.0 * consecutive_db_failures)
-                        print(
-                            f"\nTransient database error ({e}); waiting "
-                            f"{delay:.0f}s and resuming from the same position "
-                            f"(db retry {consecutive_db_failures}/"
-                            f"{MAX_CONSECUTIVE_DB_FAILURES})...\n"
-                        )
-
-                        # relaunch on the same proxy budget; resume state is
-                        # preserved so the scrape continues where it left off
-                        if browser is not None:
-                            try:
-                                browser.close()
-                            except Exception:
-                                pass
-                            browser = None
-
-                        time.sleep(delay)
-                        continue
-
-                    # any successful pass clears the transient-db streak
-                    consecutive_db_failures = 0
-
-                    # only rotate for proxy/transport failures (including stalled
-                    # navigations that time out) and unsolvable captchas, which
-                    # indicate a blocked exit ip, and only up to the configured
-                    # budget; anything else is a genuine error
-                    if (
-                        not (
-                            is_proxy_network_error(e)
-                            or is_navigation_timeout(e)
-                            or isinstance(e, CaptchaSolveError)
-                        )
-                        or rotations >= MAX_PROXY_ROTATIONS
-                    ):
-                        raise
-
-                    # if we cannot even open the site, rotating ports is unlikely
-                    # to help: a navigation HTTP error across several ports points
-                    # to a proxy account/credentials/bandwidth problem, so bail out
-                    # quickly with an actionable message instead of churning ports
-                    if not established:
-                        consecutive_setup_failures += 1
-                        if consecutive_setup_failures >= MAX_CONSECUTIVE_SETUP_FAILURES:
-                            raise RuntimeError(
-                                f"Proxy failed to open the site on "
-                                f"{consecutive_setup_failures} consecutive sessions "
-                                f"({e}). This usually means the Decodo proxy is out "
-                                "of bandwidth, suspended or misconfigured, or its "
-                                "exit IPs are blocked outright; rotating ports will "
-                                "not help. Aborting."
-                            ) from e
-
-                    rotations += 1
-                    print(
-                        f"\nProxy session appears dead or blocked ({e}); rotating "
-                        f"to a new Decodo port and resuming "
-                        f"(rotation {rotations}/{MAX_PROXY_ROTATIONS})...\n"
-                    )
-
-                    # tear down the dead session before relaunching on a new port
-                    if browser is not None:
-                        try:
-                            browser.close()
-                        except Exception:
-                            pass
-                        browser = None
-
-            # in interactive runs, keep the browser open until the user closes it
-            # so they can inspect state; in non-interactive runs (e.g. the
-            # scheduler subprocess) close immediately so the process exits and the
-            # next scheduled run is not blocked by max_instances=1
-            if sys.stdin.isatty():
-                page.wait_for_event("close", timeout=0)
-        finally:
-            if browser is not None:
-                browser.close()
+    run_with_proxy_rotation(
+        config=CONFIG,
+        open_session=_open_session,
+        setup=setup,
+        scrape=scrape,
+    )
 
 
 if __name__ == "__main__":

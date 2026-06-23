@@ -315,7 +315,10 @@ def process_ai_analysis_for_listing(
         session.flush()
         session.commit()
     except Exception as e:
-        pass
+        print(
+            f"  AI analysis failed for listing {prospect_listing.id} "
+            f"({prospect_listing.make_and_model}): {e}"
+        )
 
     return prospect_listing
 

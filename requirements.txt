@@ -15,3 +15,5 @@ boto3
 dill
 pandas
 apscheduler
+mcp[cli]>=1.6.0
+elevenlabs-mcp>=0.9.1

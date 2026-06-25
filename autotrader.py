@@ -30,7 +30,6 @@ from common import (
     generate_hash_code,
     get_existing_source_ids,
     is_http_not_found,
-    pause,
     wait_for_selector_with_backoff,
     with_db_retry,
 )
@@ -131,10 +130,157 @@ def is_listing_no_longer_available(page: Page) -> bool:
 
 # CONSENT DISMISS BUTTONS
 _CONSENT_DISMISS_BUTTONS = (
+    ("Essential Cookies Only", "button.sp_choice_type_13"),
     ("Reject All", "button.sp_choice_type_13"),
-    ("Essential Cookies Only", None),
     ("Accept All", "button.sp_choice_type_11"),
 )
+
+# CONSENT IFRAME SELECTORS
+_CONSENT_IFRAME_SELECTORS = (
+    "iframe[id*='sp_message_iframe']",
+    "iframe[id*='sp_message']",
+    "iframe[src*='sourcepoint']",
+    "iframe[src*='privacy-mgmt']",
+)
+
+# CONSENT NOTICE SELECTORS
+_CONSENT_NOTICE_SELECTORS = (
+    "#notice",
+    "text=We use cookies on our site",
+)
+
+# CONSENT MINIMAL CHOICE SELECTORS
+_CONSENT_MINIMAL_CHOICE_SELECTORS = (
+    "button.sp_choice_type_13",
+    'button[aria-label="Essential Cookies Only"]',
+    'button[title="Essential Cookies Only"]',
+    'button[aria-label="Reject All"]',
+    'button[title="Reject All"]',
+)
+
+# CONSENT APPEAR TIMEOUT S
+_CONSENT_APPEAR_TIMEOUT_S = 20.0
+
+# CONSENT DISMISS TIMEOUT S
+_CONSENT_DISMISS_TIMEOUT_S = 15.0
+
+# CONSENT CLEAR TIMEOUT S
+_CONSENT_CLEAR_TIMEOUT_S = 10.0
+
+# CONSENT JS CLICK
+_CONSENT_JS_CLICK = """
+() => {
+    const selectors = [
+        "button.sp_choice_type_13",
+        'button[aria-label="Essential Cookies Only"]',
+        'button[title="Essential Cookies Only"]',
+        'button[aria-label="Reject All"]',
+        'button[title="Reject All"]',
+        "button.sp_choice_type_11",
+        'button[aria-label="Accept All"]',
+        'button[title="Accept All"]',
+    ];
+    for (const selector of selectors) {
+        const button = document.querySelector(selector);
+        if (button) {
+            button.click();
+            return selector;
+        }
+    }
+    return null;
+}
+"""
+
+
+# ITER CONSENT SEARCH ROOTS
+def _iter_consent_search_roots(page: Page):
+    """
+    Yield every page, frame, and iframe root that may host Sourcepoint consent
+    UI, including unnamed iframes that do not match the usual id patterns.
+    """
+
+    yield page
+
+    seen_frames: set[tuple[str, str]] = set()
+    for frame in page.frames:
+        frame_key = (frame.url, frame.name)
+        if frame_key in seen_frames:
+            continue
+        seen_frames.add(frame_key)
+        yield frame
+
+    seen_iframe_locators: set[str] = set()
+    for iframe_selector in _CONSENT_IFRAME_SELECTORS:
+        if iframe_selector in seen_iframe_locators:
+            continue
+        seen_iframe_locators.add(iframe_selector)
+        yield page.frame_locator(iframe_selector)
+
+    try:
+        iframe_count = page.locator("iframe").count()
+    except Exception:
+        iframe_count = 0
+
+    for index in range(iframe_count):
+        locator_key = f"iframe::{index}"
+        if locator_key in seen_iframe_locators:
+            continue
+        seen_iframe_locators.add(locator_key)
+        yield page.frame_locator("iframe").nth(index)
+
+
+# LOCATOR IS PRESENT
+def _locator_is_present(locator) -> bool:
+    """Return True when a locator resolves to at least one element."""
+
+    try:
+        return locator.count() > 0
+    except Exception:
+        return False
+
+
+# LOCATOR IS VISIBLE
+def _locator_is_visible(locator) -> bool:
+    """Return True when a locator resolves to a visible element."""
+
+    try:
+        return locator.count() > 0 and locator.first.is_visible()
+    except Exception:
+        return False
+
+
+# CONSENT NOTICE LOCATORS
+def _consent_notice_locators(page: Page):
+    """
+    Yield locators that may resolve to the Sourcepoint consent modal on the
+    main page, inside consent frames, or inside any iframe root.
+    """
+
+    for root in _iter_consent_search_roots(page):
+        for selector in _CONSENT_NOTICE_SELECTORS:
+            yield root.locator(selector)
+
+    yield page.locator("[id*='sp_message_container'] #notice")
+
+
+# CONSENT DISMISS BUTTON LOCATORS
+def _consent_dismiss_button_locators(page: Page, button_name: str, css_fallback: str | None):
+    """
+    Yield locators for a consent dismiss button across every consent search
+    root on the page.
+    """
+
+    for root in _iter_consent_search_roots(page):
+        yield root.get_by_role("button", name=button_name, exact=True)
+        if css_fallback:
+            yield root.locator(css_fallback)
+            yield root.locator(f'[aria-label="{button_name}"]')
+            yield root.locator(f'[title="{button_name}"]')
+
+    if css_fallback:
+        yield page.locator(f"[id*='sp_message_container'] {css_fallback}")
+        yield page.locator(f'[id*="sp_message_container"] [aria-label="{button_name}"]')
+        yield page.locator(f'[id*="sp_message_container"] [title="{button_name}"]')
 
 
 # IS COOKIE CONSENT VISIBLE
@@ -145,89 +291,118 @@ def _is_cookie_consent_visible(page: Page) -> bool:
     """
 
     consent_container = page.locator("[id*='sp_message_container']")
-    if consent_container.count() > 0 and consent_container.first.is_visible():
+    if _locator_is_visible(consent_container):
         return True
 
-    consent_iframe = page.frame_locator("iframe[id*='sp_message_iframe']")
-    notice = consent_iframe.locator("#notice")
-    if notice.count() > 0 and notice.first.is_visible():
-        return True
-
-    for button_name, _ in _CONSENT_DISMISS_BUTTONS:
-        button = consent_iframe.get_by_role("button", name=button_name, exact=True)
-        if button.count() > 0 and button.first.is_visible():
+    for notice in _consent_notice_locators(page):
+        if _locator_is_visible(notice) or _locator_is_present(notice):
             return True
+
+    for selector in _CONSENT_MINIMAL_CHOICE_SELECTORS + ("button.sp_choice_type_11",):
+        for root in _iter_consent_search_roots(page):
+            button = root.locator(selector)
+            if _locator_is_visible(button) or _locator_is_present(button):
+                return True
+
+    for button_name, css_fallback in _CONSENT_DISMISS_BUTTONS:
+        for button in _consent_dismiss_button_locators(page, button_name, css_fallback):
+            if _locator_is_visible(button) or _locator_is_present(button):
+                return True
 
     return False
 
 
 # WAIT FOR COOKIE CONSENT BANNER
-def _wait_for_cookie_consent_banner(page: Page, *, timeout_ms: int = 10000) -> bool:
+def _wait_for_cookie_consent_banner(page: Page, *, timeout_ms: int = 1000) -> bool:
     """
-    Wait until the Sourcepoint consent modal appears, trying the outer container
-    first and then the iframe notice or dismiss buttons.
+    Wait briefly until the Sourcepoint consent modal appears, trying the outer
+    container first and then the notice or dismiss buttons on the page and in
+    consent frames.
     """
+
+    if _is_cookie_consent_visible(page):
+        return True
 
     try:
         page.locator("[id*='sp_message_container']").first.wait_for(
-            state="visible", timeout=timeout_ms
+            state="attached", timeout=timeout_ms
         )
         return True
     except Exception:
         pass
 
-    consent_iframe = page.frame_locator("iframe[id*='sp_message_iframe']")
-    try:
-        consent_iframe.locator("#notice").first.wait_for(
-            state="visible", timeout=timeout_ms
-        )
-        return True
-    except Exception:
-        pass
-
-    for button_name, css_fallback in _CONSENT_DISMISS_BUTTONS:
-        button = consent_iframe.get_by_role("button", name=button_name, exact=True)
+    for notice in _consent_notice_locators(page):
         try:
-            button.first.wait_for(state="visible", timeout=2000)
+            notice.first.wait_for(state="attached", timeout=timeout_ms)
             return True
         except Exception:
-            if css_fallback:
-                try:
-                    consent_iframe.locator(css_fallback).first.wait_for(
-                        state="visible", timeout=2000
-                    )
-                    return True
-                except Exception:
-                    pass
+            pass
+
+    for selector in _CONSENT_MINIMAL_CHOICE_SELECTORS + ("button.sp_choice_type_11",):
+        for root in _iter_consent_search_roots(page):
+            try:
+                root.locator(selector).first.wait_for(state="attached", timeout=timeout_ms)
+                return True
+            except Exception:
+                pass
 
     return False
+
+
+# CLICK COOKIE CONSENT VIA JS
+def _click_cookie_consent_via_js(page: Page) -> str | None:
+    """
+    Click the least-permissive available dismiss button via JavaScript inside
+    any frame that hosts the Sourcepoint consent UI.
+    """
+
+    for frame in page.frames:
+        try:
+            selector = frame.evaluate(_CONSENT_JS_CLICK)
+            if selector:
+                return selector
+        except Exception:
+            pass
+
+    return None
 
 
 # CLICK COOKIE CONSENT DISMISS BUTTON
 def _click_cookie_consent_dismiss_button(page: Page) -> bool:
     """
-    Click the least-permissive available dismiss button inside the consent iframe.
+    Click the least-permissive available dismiss button on the main page or
+    inside any consent iframe.
     """
 
-    consent_iframe = page.frame_locator("iframe[id*='sp_message_iframe']")
+    for root in _iter_consent_search_roots(page):
+        for selector in _CONSENT_MINIMAL_CHOICE_SELECTORS:
+            button = root.locator(selector)
+            if not _locator_is_present(button):
+                continue
+
+            try:
+                button.first.click(timeout=2000)
+                print(f"Clicked cookie consent via {selector}")
+                return True
+            except Exception:
+                pass
 
     for button_name, css_fallback in _CONSENT_DISMISS_BUTTONS:
-        button = consent_iframe.get_by_role("button", name=button_name, exact=True)
-        try:
-            button.first.wait_for(state="visible", timeout=5000)
-            button.first.click()
-            print(f"Clicked '{button_name}' on cookie consent")
-            return True
-        except Exception:
-            if css_fallback:
-                fallback = consent_iframe.locator(css_fallback)
-                try:
-                    fallback.first.wait_for(state="visible", timeout=2000)
-                    fallback.first.click()
-                    print(f"Clicked '{button_name}' on cookie consent")
-                    return True
-                except Exception:
-                    pass
+        for button in _consent_dismiss_button_locators(page, button_name, css_fallback):
+            if not _locator_is_present(button):
+                continue
+
+            try:
+                button.first.click(timeout=2000)
+                print(f"Clicked '{button_name}' on cookie consent")
+                return True
+            except Exception:
+                pass
+
+    selector = _click_cookie_consent_via_js(page)
+    if selector:
+        print(f"Clicked cookie consent via JavaScript ({selector})")
+        return True
 
     return False
 
@@ -235,33 +410,124 @@ def _click_cookie_consent_dismiss_button(page: Page) -> bool:
 # DISMISS COOKIE CONSENT
 def dismiss_cookie_consent(page: Page, *, wait_for_banner: bool = False) -> None:
     """
-    Dismiss the AutoTrader cookie consent modal when it is visible inside its
-    iframe. Pass wait_for_banner=True once immediately after a navigation so
-    the late-loading banner can be handled; otherwise only act when the modal is
-    already on screen so repeated calls do not probe for a new banner to appear.
+    Dismiss the AutoTrader cookie consent modal when it is visible on the main
+    page or inside its Sourcepoint iframe. Pass wait_for_banner=True once
+    immediately after a navigation so the late-loading banner can be handled;
+    otherwise only act when the modal is already on screen so repeated calls do
+    not probe for a new banner to appear.
     """
 
-    if not _is_cookie_consent_visible(page):
-        if not wait_for_banner:
-            return
+    appear_deadline = time.time() + (
+        _CONSENT_APPEAR_TIMEOUT_S if wait_for_banner else 0.0
+    )
+    dismiss_deadline = time.time() + (
+        _CONSENT_DISMISS_TIMEOUT_S if wait_for_banner else 5.0
+    )
 
-        # the banner often appears several seconds after domcontentloaded
-        if not _wait_for_cookie_consent_banner(page):
-            return
+    while time.time() < dismiss_deadline:
+        if wait_for_banner or _is_cookie_consent_visible(page):
+            if _click_cookie_consent_dismiss_button(page):
+                clear_deadline = time.time() + _CONSENT_CLEAR_TIMEOUT_S
+                while time.time() < clear_deadline:
+                    if not _is_cookie_consent_visible(page):
+                        return
+                    time.sleep(0.25)
+                return
 
-    if not _is_cookie_consent_visible(page):
+            time.sleep(0.25)
+            continue
+
+        if wait_for_banner and time.time() < appear_deadline:
+            _wait_for_cookie_consent_banner(page)
+            time.sleep(0.25)
+            continue
+
         return
 
-    if not _click_cookie_consent_dismiss_button(page):
+
+# PAUSE DELAY SECONDS
+def _pause_delay_seconds(min_seconds: float, max_seconds: float) -> float:
+    """Return a human-like delay using the same gamma distribution as pause()."""
+
+    if max_seconds <= min_seconds:
+        return max(min_seconds, 0.0)
+
+    scale = (max_seconds - min_seconds) / 1.8
+    shape = ((min_seconds * 0.9) / scale) + 1.0
+    return min_seconds * 0.1 + random.gammavariate(shape, scale)
+
+
+# CONSENT POLL INTERVAL S
+_CONSENT_POLL_INTERVAL_S = 0.5
+
+
+# POLL COOKIE CONSENT
+def _poll_cookie_consent(page: Page) -> None:
+    """
+    Check once for a Sourcepoint consent modal and dismiss it when present.
+    Also tries a direct button click when visibility heuristics miss an iframe.
+    """
+
+    if _is_cookie_consent_visible(page):
+        dismiss_cookie_consent(page)
         return
 
-    # wait for the modal to clear so it does not intercept later clicks
-    try:
-        page.locator("[id*='sp_message_container']").first.wait_for(
-            state="hidden", timeout=10000
-        )
-    except Exception:
-        pass
+    if _click_cookie_consent_dismiss_button(page):
+        clear_deadline = time.time() + _CONSENT_CLEAR_TIMEOUT_S
+        while time.time() < clear_deadline:
+            if not _is_cookie_consent_visible(page):
+                return
+            time.sleep(0.25)
+
+
+# PAUSE FOR PAGE
+def pause_for_page(page: Page, min_seconds: float = 1.0, max_seconds: float = 3.0) -> None:
+    """
+    Wait like pause(), but poll for a late cookie consent modal during longer
+    delays so it can be dismissed before it blocks interactions.
+    """
+
+    delay = _pause_delay_seconds(min_seconds, max_seconds)
+    deadline = time.time() + delay
+
+    while time.time() < deadline:
+        _poll_cookie_consent(page)
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        time.sleep(min(_CONSENT_POLL_INTERVAL_S, remaining))
+
+
+# WAIT FOR LOAD STATE WITH COOKIE CONSENT
+def _wait_for_load_state_with_cookie_consent(
+    page: Page,
+    state: str,
+    *,
+    timeout_ms: int = 30000,
+) -> None:
+    """
+    Wait for a page load state in short slices, polling for cookie consent
+    between attempts so a late modal does not block the rest of the wait.
+    """
+
+    deadline = time.time() + timeout_ms / 1000
+    last_error: Exception | None = None
+
+    while time.time() < deadline:
+        _poll_cookie_consent(page)
+        try:
+            remaining_ms = max(100, int((deadline - time.time()) * 1000))
+            page.wait_for_load_state(state, timeout=min(1000, remaining_ms))
+            return
+        except Exception as exc:
+            last_error = exc
+
+        time.sleep(_CONSENT_POLL_INTERVAL_S)
+
+    if last_error is not None:
+        raise last_error
+
+    raise TimeoutError(f"Timed out waiting for load state {state!r}")
 
 
 # SELECT CLASSIC CARS FILTER
@@ -284,21 +550,21 @@ def _select_classic_cars_filter(page: Page) -> None:
     looking_facet.first.wait_for(state="visible")
     looking_facet.first.click()
     print("Expanded 'I'm looking for'")
-    pause()
+    pause_for_page(page)
 
     # the classic option is input#classic inside label[for="classic"]
     classic_checkbox = page.locator("#classic")
     classic_checkbox.wait_for(state="attached")
     if classic_checkbox.is_checked():
         print("Classic cars already selected")
-        pause()
+        pause_for_page(page)
         return
 
     classic_label = page.locator('label[for="classic"]')
     if classic_label.count() > 0:
         classic_label.first.click()
         print("Selected 'Classic cars'")
-        pause()
+        pause_for_page(page)
         return
 
     # fall back to accessible-name locators when the id attribute changes
@@ -308,7 +574,7 @@ def _select_classic_cars_filter(page: Page) -> None:
     classic_option.first.wait_for(state="visible")
     classic_option.first.click()
     print("Selected 'Classic cars'")
-    pause()
+    pause_for_page(page)
 
 
 # ENGLISH POSTCODES
@@ -325,71 +591,71 @@ _ENGLISH_POSTCODES = (
     "OX1 1DP",
     "BN1 1GE",
     "EX1 1QA",
-    "PL1 1AA",
+    "PL1 1RP",
     "YO1 7HH",
     "HU1 1UU",
     "LE1 1AA",
-    "CV1 1AA",
-    "ST1 1AA",
+    "CV1 1EX",
+    "ST1 1HR",
     "DE1 1AA",
-    "GL1 1AA",
+    "GL1 1AD",
     "BA1 1AA",
-    "SN1 1AA",
-    "RG1 1AA",
+    "SN1 1BA",
+    "RG1 1EU",
     "MK9 1AA",
     "PO1 1AA",
-    "SO14 1AA",
+    "SO14 1AQ",
     "NR1 1AA",
     "IP1 1AA",
     "CO1 1AA",
-    "CM1 1AA",
+    "CM1 1HT",
     "SS1 1AA",
-    "TN1 1AA",
+    "TN1 1NT",
     "GU1 1AA",
     "RH1 1AA",
-    "KT1 1AA",
+    "KT1 1HL",
     "CR0 1AA",
     "TW1 1AA",
     "HA1 1AA",
-    "UB1 1AA",
+    "UB1 1QB",
     "SL1 1AA",
-    "HP1 1AA",
+    "HP1 1DN",
     "LU1 1AA",
-    "PE1 1AA",
-    "NN1 1AA",
-    "DN1 1AA",
+    "PE1 1DD",
+    "NN1 1ED",
+    "DN1 2AA",
     "HU10 6AA",
     "WF1 1AA",
     "HD1 1AA",
     "HX1 1AA",
-    "BD1 1AA",
+    "BD1 1HX",
     "HG1 1AA",
     "DL1 1AA",
     "TS1 1AA",
-    "SR1 1AA",
-    "DH1 1AA",
+    "SR1 1AE",
+    "DH1 1AB",
     "CA1 1AA",
     "LA1 1AA",
-    "FY1 1AA",
-    "PR1 1AA",
-    "BB1 1AA",
+    "FY1 1AN",
+    "PR1 0AA",
+    "BB1 1QB",
     "OL1 1AA",
-    "SK1 1AA",
-    "WA1 1AA",
-    "CW1 1AA",
+    "SK1 1YD",
+    "WA1 1NN",
+    "CW1 2DB",
     "ST5 1AA",
     "TF1 1AA",
-    "SY1 1AA",
+    "SY1 1EN",
     "WR1 1AA",
-    "DY1 1AA",
+    "DY1 1HF",
     "WS1 1AA",
     "WV1 1AA",
     "B90 1AA",
-    "CV6 1AA",
-    "LE11 1AA",
+    "CV6 5AA",
+    "LE11 1AB",
     "NG7 1AA",
-    "S10 1AA",
-    "CH1 1AA",
+    "S10 1AE",
+    "CH1 1AB",
     "L2 2AA",
     "M2 2AA",
     "EC1A 1BB",
@@ -430,7 +696,7 @@ def _fill_landing_postcode(page: Page, postcode: str) -> None:
         """,
         timeout=15000,
     )
-    pause(1.0, 2.0)
+    pause_for_page(page,1.0, 2.0)
 
     postcode_input = page.locator("#postcode")
     max_attempts = 5
@@ -438,7 +704,7 @@ def _fill_landing_postcode(page: Page, postcode: str) -> None:
     for _ in range(max_attempts):
         # retry fill until the controlled input reports the expected value
         postcode_input.fill(postcode)
-        pause(0.5, 1.0)
+        pause_for_page(page,0.5, 1.0)
         if postcode_input.input_value() == postcode:
             print(f"Entered postcode: {postcode}")
             return
@@ -458,13 +724,14 @@ def apply_search_filters(page: Page, *, select_classic_cars: bool = False) -> st
     results-page URL.
     """
 
-    # dismiss only if the banner is already visible; do not wait for a new one
-    dismiss_cookie_consent(page)
-    pause()
+    # consent can appear after the initial landing-page dismissal in setup()
+    dismiss_cookie_consent(page, wait_for_banner=True)
+    pause_for_page(page)
 
     # fill the landing-page postcode before expanding filters
     _fill_landing_postcode(page, random_english_postcode())
-    pause()
+    dismiss_cookie_consent(page)
+    pause_for_page(page)
 
     # the used-vans landing page exposes "More options" as a plain button with
     # no data-testid, so fall back to matching it by its accessible name
@@ -474,7 +741,7 @@ def apply_search_filters(page: Page, *, select_classic_cars: bool = False) -> st
     more_options.first.wait_for(state="visible")
     more_options.first.click()
     print("Clicked 'More options'")
-    pause()
+    pause_for_page(page)
 
     if select_classic_cars:
         _select_classic_cars_filter(page)
@@ -484,47 +751,47 @@ def apply_search_filters(page: Page, *, select_classic_cars: bool = False) -> st
     seller_facet.wait_for(state="visible")
     seller_facet.click()
     print("Expanded 'Seller type'")
-    pause()
+    pause_for_page(page)
 
     trade_checkbox = page.locator("#seller_type-trade_sellers-checkbox")
     if trade_checkbox.is_checked():
         page.get_by_test_id("seller_type-trade_sellers-container").click()
         print("Unchecked trade sellers")
-        pause()
+        pause_for_page(page)
 
     private_checkbox = page.locator("#seller_type-private_sellers-checkbox")
     if not private_checkbox.is_checked():
         page.get_by_test_id("seller_type-private_sellers-container").click()
         print("Selected private sellers")
-        pause()
+        pause_for_page(page)
 
     # distance from you: national (empty option value)
     distance_facet = page.get_by_test_id("distance-facet-group")
     distance_facet.click()
     print("Expanded 'Distance from you'")
-    pause()
+    pause_for_page(page)
 
     page.locator("select#distance").select_option(value="")
     print("Set distance to National")
-    pause()
+    pause_for_page(page)
 
     # sort: most recent
     sort_facet = page.get_by_test_id("sort-facet-group")
     sort_facet.click()
     print("Expanded 'Sort'")
-    pause()
+    pause_for_page(page)
 
     most_recent = page.get_by_test_id("most-recent-radio-testid")
     most_recent.wait_for(state="visible")
     most_recent.click()
     print("Selected 'Most recent' sort option")
-    pause()
+    pause_for_page(page)
 
     search_button = page.get_by_test_id("search-apply-button")
     search_button.wait_for(state="visible")
     search_button.click()
     print("Clicked 'Search' to apply filters")
-    pause()
+    pause_for_page(page)
 
     wait_for_selector_with_backoff(
         page,
@@ -534,7 +801,7 @@ def apply_search_filters(page: Page, *, select_classic_cars: bool = False) -> st
     )
     search_url = page.url
     print(f"Navigated to search results: {search_url}")
-    pause()
+    pause_for_page(page)
 
     return search_url
 
@@ -549,10 +816,10 @@ def configure_search(page: Page, config: AutotraderScrapeConfig) -> str:
 
     goto_with_captcha_handling(page, config.landing_url)
     print(f"Navigated to {config.landing_url}")
-    pause()
+    pause_for_page(page)
 
     dismiss_cookie_consent(page, wait_for_banner=True)
-    pause()
+    pause_for_page(page)
 
     return apply_search_filters(
         page, select_classic_cars=config.select_classic_cars
@@ -584,7 +851,7 @@ def get_specs_and_features(page: Page) -> str | None:
 
     try:
         view_all_button.click()
-        pause(1.0, 2.0)
+        pause_for_page(page,1.0, 2.0)
     except Exception:
         return None
 
@@ -603,7 +870,7 @@ def get_specs_and_features(page: Page) -> str | None:
             collapsed_buttons = popup.locator('button[aria-expanded="false"]')
             if collapsed_buttons.count() > 0:
                 collapsed_buttons.first.click()
-                pause(1.0, 3.0)
+                pause_for_page(page,1.0, 3.0)
         except Exception:
             pass
 
@@ -679,7 +946,7 @@ def get_specs_and_features(page: Page) -> str | None:
             markdown_parts.append("")
 
     # pause before closing the popup
-    pause(2.0, 10.0)
+    pause_for_page(page,2.0, 10.0)
 
     # close the popup using the Back button
     try:
@@ -689,7 +956,7 @@ def get_specs_and_features(page: Page) -> str | None:
         )
         if back_button.count() > 0:
             back_button.click()
-            pause(0.5, 1.0)
+            pause_for_page(page,0.5, 1.0)
     except Exception:
         pass
 
@@ -804,7 +1071,7 @@ def save_gallery_images(
         return None, 0
 
     gallery_button.click()
-    pause(1.0, 2.0)
+    pause_for_page(page,1.0, 2.0)
 
     # collect unique image urls
     image_urls = []
@@ -815,10 +1082,10 @@ def save_gallery_images(
     # never block (or fail) the whole listing waiting for it — the scroll loop
     # below loads and collects images on its own regardless
     try:
-        page.wait_for_load_state("networkidle", timeout=30000)
+        _wait_for_load_state_with_cookie_consent(page, "networkidle", timeout_ms=30000)
     except Exception:
         print("  Gallery did not reach network idle; proceeding to load images")
-    pause(1.0, 2.0)
+    pause_for_page(page,1.0, 2.0)
 
     # find the scrollable container in the gallery (look for common scrollable elements)
     scrollable_container = page.evaluate(
@@ -870,7 +1137,7 @@ def save_gallery_images(
             }
         """
         )
-        pause(0.5, 1.0)
+        pause_for_page(page,0.5, 1.0)
 
         # wait for potential new images to load
         page.wait_for_timeout(500)
@@ -906,7 +1173,7 @@ def save_gallery_images(
         scroll_attempts += 1
 
     # pause to ensure all images are fully loaded
-    pause(1.0, 2.0)
+    pause_for_page(page,1.0, 2.0)
 
     # locate all img elements in the gallery
     img_elements = page.locator("img").all()
@@ -953,7 +1220,7 @@ def save_gallery_images(
                 # click next to advance carousel
                 try:
                     carousel_next_button.click()
-                    pause(0.3, 0.6)
+                    pause_for_page(page,0.3, 0.6)
                     carousel_clicks += 1
                 except Exception:
                     break
@@ -968,13 +1235,13 @@ def save_gallery_images(
     )
 
     # pause before closing gallery
-    pause(1.0, 2.0)
+    pause_for_page(page,1.0, 2.0)
 
     # click the close button to return to listing (works for both carousel and scroll modes)
     close_button = page.get_by_test_id("gallery-close")
     if close_button.count() > 0:
         close_button.click()
-        pause(0.5, 1.0)
+        pause_for_page(page,0.5, 1.0)
 
     return temp_dir, len(image_urls)
 
@@ -1057,20 +1324,20 @@ def read_full_prospect_listing(
     if expand_btn.count() > 0:
         try:
             expand_btn.click()
-            pause(1.0, 3.0)
+            pause_for_page(page,1.0, 3.0)
             # get expanded description
             expanded_desc = page.locator('section[id="description"] p').first
             if expanded_desc.count() > 0:
                 full_description = expanded_desc.inner_text()
             # click back to return to main listing page
-            pause(2.0, 5.0)
+            pause_for_page(page,2.0, 5.0)
             back_button = page.locator(
                 'section[data-testid="description-modal-back-button"] '
                 'button[aria-label="Close"]'
             )
             if back_button.count() > 0:
                 back_button.click()
-                pause(1.0, 2.0)
+                pause_for_page(page,1.0, 2.0)
         except Exception:
             pass  # keep the short description if expand fails
 
@@ -1281,7 +1548,9 @@ def _wait_for_search_results_ready(page: Page) -> None:
     the listing cards.
     """
 
+    dismiss_cookie_consent(page)
     page.wait_for_load_state("domcontentloaded", timeout=30000)
+    dismiss_cookie_consent(page)
     page.locator(_SEARCH_RESULTS_LISTING_SELECTOR).first.wait_for(
         state="visible", timeout=30000
     )
@@ -1336,8 +1605,18 @@ def scrape_listings(
         # so wait for the late cookie banner; later pages only need a cheap
         # dismissal if one is somehow still on screen
         dismiss_cookie_consent(page, wait_for_banner=first_page_load)
+        was_first_page_load = first_page_load
         first_page_load = False
-        pause()
+
+        if was_first_page_load:
+            try:
+                _wait_for_search_results_ready(page)
+            except Exception:
+                dismiss_cookie_consent(page, wait_for_banner=True)
+            else:
+                dismiss_cookie_consent(page)
+
+        pause_for_page(page)
 
         # an empty page means we have walked past the final results page, so
         # the entire result set has been processed
@@ -1440,7 +1719,7 @@ def scrape_listings(
                 page.wait_for_load_state("domcontentloaded")
                 if is_captcha_present(page):
                     wait_for_captcha_solve(page)
-                pause()
+                pause_for_page(page)
 
                 if is_http_not_found(response) or is_listing_no_longer_available(
                     page
@@ -1510,7 +1789,7 @@ def scrape_listings(
                     listing_type=listing_type,
                 )
 
-                pause(2.0, 10.0)
+                pause_for_page(page,2.0, 10.0)
             except CaptchaSolveError:
                 # an unsolved challenge will block the rest of the sweep on
                 # this exit ip too, so bubble up for a proxy rotation
@@ -1523,7 +1802,7 @@ def scrape_listings(
         if resume is not None:
             resume.page_number = page_number
             resume.processed_ids = processed_ids
-        pause(min_seconds=1.0, max_seconds=2.0)
+        pause_for_page(page,min_seconds=1.0, max_seconds=2.0)
 
     print(f"\nFinished after walking {page_number} results page(s)")
     print(f"Processed {len(processed_ids)} listings")
@@ -1562,9 +1841,9 @@ def run_autotrader(config: AutotraderScrapeConfig) -> None:
     def setup(page: Page, resume: ScrapeResumeState) -> None:
         goto_with_captcha_handling(page, config.landing_url)
         print(f"Navigated to {config.landing_url}")
-        pause()
+        pause_for_page(page)
         dismiss_cookie_consent(page, wait_for_banner=True)
-        pause()
+        pause_for_page(page)
         resume.search_url = apply_search_filters(
             page,
             select_classic_cars=config.select_classic_cars,

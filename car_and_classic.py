@@ -697,6 +697,9 @@ def scrape_listings(
             listing_candidates, start=1
         ):
             if card_id in processed_ids:
+                print(
+                    f"  [{index}] {title} — already processed this run, skipping"
+                )
                 continue
 
             # record position before each listing so proxy rotation can resume here

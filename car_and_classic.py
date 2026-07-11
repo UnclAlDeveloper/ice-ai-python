@@ -216,14 +216,47 @@ ICON_TO_FIELD = {
 }
 
 
-# ACCEPT COOKIES
-def accept_cookies(page: Page, timeout: float = 15000):
+# CONSENT APPEAR TIMEOUT S
+_CONSENT_APPEAR_TIMEOUT_S = 8.0
+
+# CONSENT CLEAR TIMEOUT S
+_CONSENT_CLEAR_TIMEOUT_S = 5.0
+
+# CONSENT POLL INTERVAL S
+_CONSENT_POLL_INTERVAL_S = 0.5
+
+
+# IS COOKIE CONSENT VISIBLE
+def _is_cookie_consent_visible(page: Page) -> bool:
     """
-    Dismiss the OneTrust cookie consent banner by clicking 'Accept All'. The
-    banner loads asynchronously, so wait for the button to appear rather than
-    probing once; if it never shows there is nothing to dismiss. After clicking,
-    wait for the banner and its dark backdrop to clear, then defensively remove
-    any lingering OneTrust overlay that would otherwise intercept later clicks.
+    Return True when the OneTrust cookie banner is on screen and blocking
+    interaction with the page underneath.
+    """
+
+    banner = page.locator("#onetrust-banner-sdk")
+    if banner.count() > 0:
+        try:
+            if banner.first.is_visible():
+                return True
+        except Exception:
+            pass
+
+    accept_button = page.locator("#onetrust-accept-btn-handler")
+    if accept_button.count() > 0:
+        try:
+            if accept_button.first.is_visible():
+                return True
+        except Exception:
+            pass
+
+    return False
+
+
+# CLICK ACCEPT COOKIES
+def _click_accept_cookies(page: Page, timeout: float = 5000) -> bool:
+    """
+    Click 'Accept All' on the OneTrust banner and remove any lingering overlay.
+    Returns True when consent was dismissed.
     """
 
     accept_button = page.locator("#onetrust-accept-btn-handler")
@@ -232,7 +265,7 @@ def accept_cookies(page: Page, timeout: float = 15000):
     try:
         accept_button.wait_for(state="visible", timeout=timeout)
     except Exception:
-        return
+        return False
 
     accept_button.click()
 
@@ -254,6 +287,98 @@ def accept_cookies(page: Page, timeout: float = 15000):
         }"""
     )
 
+    return True
+
+
+# ACCEPT COOKIES
+def accept_cookies(
+    page: Page,
+    *,
+    wait_for_banner: bool = False,
+    timeout: float = 15000,
+) -> None:
+    """
+    Dismiss the OneTrust cookie consent banner by clicking 'Accept All'. Pass
+    wait_for_banner=True immediately after a navigation so a late-loading banner
+    can be handled; otherwise only act when the banner is already on screen so
+    repeated calls do not probe for a new banner to appear.
+    """
+
+    appear_deadline = time.time() + (
+        min(timeout / 1000, _CONSENT_APPEAR_TIMEOUT_S) if wait_for_banner else 0.0
+    )
+    dismiss_deadline = time.time() + (
+        timeout / 1000 if wait_for_banner else 5.0
+    )
+    click_timeout = min(timeout, 5000.0)
+
+    while time.time() < dismiss_deadline:
+        if wait_for_banner or _is_cookie_consent_visible(page):
+            if _click_accept_cookies(page, timeout=click_timeout):
+                clear_deadline = time.time() + _CONSENT_CLEAR_TIMEOUT_S
+                while time.time() < clear_deadline:
+                    if not _is_cookie_consent_visible(page):
+                        return
+                    time.sleep(0.25)
+                return
+
+            time.sleep(0.25)
+            continue
+
+        if wait_for_banner and time.time() < appear_deadline:
+            try:
+                page.locator("#onetrust-accept-btn-handler").wait_for(
+                    state="attached", timeout=1000
+                )
+            except Exception:
+                pass
+            time.sleep(0.25)
+            continue
+
+        return
+
+
+# POLL COOKIE CONSENT
+def _poll_cookie_consent(page: Page) -> None:
+    """
+    Check once for a OneTrust consent banner and dismiss it when present.
+    """
+
+    if _is_cookie_consent_visible(page):
+        accept_cookies(page)
+
+
+# PAUSE DELAY SECONDS
+def _pause_delay_seconds(min_seconds: float, max_seconds: float) -> float:
+    """Return a human-like delay using the same gamma distribution as pause()."""
+
+    if max_seconds <= min_seconds:
+        return max(min_seconds, 0.0)
+
+    scale = (max_seconds - min_seconds) / 1.8
+    shape = ((min_seconds * 0.9) / scale) + 1.0
+    return min_seconds * 0.1 + random.gammavariate(shape, scale)
+
+
+# PAUSE FOR PAGE
+def pause_for_page(
+    page: Page, min_seconds: float = 1.0, max_seconds: float = 3.0
+) -> None:
+    """
+    Wait like pause(), but poll for a late OneTrust cookie banner during longer
+    delays so it can be dismissed before it blocks interactions.
+    """
+
+    delay = _pause_delay_seconds(min_seconds, max_seconds)
+    deadline = time.time() + delay
+
+    while time.time() < deadline:
+        _poll_cookie_consent(page)
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        time.sleep(min(_CONSENT_POLL_INTERVAL_S, remaining))
+
 
 # DISMISS BLOCKING OVERLAYS
 def _dismiss_blocking_overlays(page: Page, *, cookie_timeout: float = 3000) -> None:
@@ -262,7 +387,7 @@ def _dismiss_blocking_overlays(page: Page, *, cookie_timeout: float = 3000) -> N
     events on the search results page before opening sort or filter controls.
     """
 
-    accept_cookies(page, timeout=cookie_timeout)
+    accept_cookies(page, wait_for_banner=False, timeout=cookie_timeout)
     dismiss_inertia_error_dialog(page)
 
 
@@ -297,7 +422,7 @@ def _apply_newest_listed_sort(page: Page) -> None:
 
     for attempt in range(2):
         _dismiss_blocking_overlays(page)
-        pause()
+        pause_for_page(page)
 
         if _is_sorted_by_newest(page):
             return
@@ -310,7 +435,7 @@ def _apply_newest_listed_sort(page: Page) -> None:
             description="sort overlay",
         )
 
-        pause()
+        pause_for_page(page)
         page.locator('button:has(span:text-is("Newest listed"))').click()
         wait_for_selector_with_backoff(
             page,
@@ -407,7 +532,8 @@ def extract_gallery_images(page: Page) -> list[str]:
 
     image_urls = []
 
-    # clear any inertia error overlay that would intercept the gallery click
+    # clear any overlays that would intercept the gallery click
+    _poll_cookie_consent(page)
     dismiss_inertia_error_dialog(page)
 
     gallery_section = page.locator('section:has(h2:text("Gallery"))')
@@ -659,7 +785,8 @@ def scrape_listings(
     while True:
         page_url = with_page_param(search_url, page_number)
         goto_with_captcha_handling(page, page_url)
-        pause()
+        accept_cookies(page, wait_for_banner=True, timeout=8000)
+        pause_for_page(page)
 
         if not search_results_present(page, _SEARCH_RESULTS_CARD_SELECTOR):
             print(
@@ -760,8 +887,9 @@ def scrape_listings(
                 # intercepts pointer events; goto_with_captcha_handling also
                 # pauses for any captcha shown in place of the detail page
                 response = goto_with_captcha_handling(page, listing_url)
+                accept_cookies(page, wait_for_banner=True, timeout=8000)
                 wait_for_listing_detail_page(page)
-                pause()
+                pause_for_page(page)
 
                 if is_http_not_found(response) or is_listing_no_longer_available(
                     page
@@ -802,6 +930,7 @@ def scrape_listings(
                 )
                 prospect_listing.status_checked_at = datetime.now()
                 new_count += 1
+                print(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
                 print(f"  [{index}] {title}")
                 print(f"      make_and_model: {prospect_listing.make_and_model}")
                 print(f"      year: {prospect_listing.year}")
@@ -930,7 +1059,7 @@ def scrape_listings(
         if resume is not None:
             resume.page_number = page_number
             resume.processed_ids = processed_ids
-        pause(min_seconds=1.0, max_seconds=2.0)
+        pause_for_page(page, min_seconds=1.0, max_seconds=2.0)
 
     print(f"\nFinished — {page_number} page(s) scraped, {new_count} new listing(s).")
 
@@ -950,8 +1079,8 @@ def _open_session(playwright) -> tuple:
     # land on the search page, solving any captcha that interrupts the load
     goto_with_captcha_handling(page, "https://www.carandclassic.com/search")
 
-    pause()
-    accept_cookies(page)
+    pause_for_page(page)
+    accept_cookies(page, wait_for_banner=True)
 
     return browser, page
 
@@ -966,10 +1095,10 @@ def _apply_search_filters(page: Page) -> str:
     """
 
     _dismiss_blocking_overlays(page, cookie_timeout=15000)
-    pause()
+    pause_for_page(page)
 
     # open the all filters overlay
-    pause()
+    pause_for_page(page)
     page.locator('button:has(span:text-is("All filters"))').first.click()
     wait_for_selector_with_backoff(
         page,
@@ -979,31 +1108,31 @@ def _apply_search_filters(page: Page) -> str:
     )
 
     # select category, country, listing type and seller type
-    pause()
+    pause_for_page(page)
     page.locator(
         'section:has(h2:text-is("Category")) button:has(span:text-is("Cars"))'
     ).click()
 
-    pause()
+    pause_for_page(page)
     page.locator(
         'section:has(h2:text-is("Country")) '
         'button:has(span:text-is("United Kingdom"))'
     ).click()
 
-    pause()
+    pause_for_page(page)
     page.locator(
         'section:has(h2:text-is("Listing type")) '
         'button:has(span:text-is("Advert"))'
     ).click()
 
-    pause()
+    pause_for_page(page)
     page.locator(
         'section:has(h2:text-is("Seller type")) '
         'button:has(span:text-is("Private"))'
     ).click()
 
     # apply the selected filters and wait for the results grid
-    pause()
+    pause_for_page(page)
     page.locator('button:has-text("Show"):has-text("results")').click()
     wait_for_selector_with_backoff(
         page,

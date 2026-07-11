@@ -1,0 +1,13 @@
+nohup: ignoring input
+Traceback (most recent call last):
+  File "/Ice-AI/python/car_and_classic.py", line 1175, in <module>
+    car_and_classic()
+  File "/Ice-AI/python/car_and_classic.py", line 1166, in car_and_classic
+    run_with_proxy_rotation(
+  File "/Ice-AI/python/scraper_driver.py", line 457, in run_with_proxy_rotation
+    scrape(page, deadline, scrape_resume)
+  File "/Ice-AI/python/car_and_classic.py", line 1164, in scrape
+    scrape_listings(page, resume.search_url, deadline, resume)
+  File "/Ice-AI/python/car_and_classic.py", line 842, in scrape_listings
+    raise ProxySessionExpired(
+scraper_driver.ProxySessionExpired: proxy rotation interval elapsed during listing scrape

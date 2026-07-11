@@ -1704,6 +1704,7 @@ def scrape_listings(
 
             # a new listing: announce it so the on-screen single detail view
             # matches the log and is not mistaken for a stuck results page
+            print(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
             print(
                 f"\nProcessing new listing (source_id: {source_id}): "
                 f"{short_description[:60]}\n  {listing_url}"

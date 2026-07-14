@@ -1,1 +1,0 @@
-{"nodes": [{"id": "van_prompt_md", "label": "Van Prompt", "file_type": "document", "source_file": "van_prompt.md"}], "edges": [{"source": "van_prompt_md", "target": "car_repair_valuation_flow", "relation": "conceptually_related_to", "confidence": "EXTRACTED", "confidence_score": 1.0, "source_file": "van_prompt.md"}], "hyperedges": []}

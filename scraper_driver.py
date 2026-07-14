@@ -28,6 +28,7 @@ from stealth_browser import (
     goto_with_captcha_handling,
     is_navigation_timeout,
     is_proxy_network_error,
+    is_target_closed_error,
     sync_stealth_playwright,
 )
 
@@ -508,6 +509,7 @@ def run_with_proxy_rotation(
                         not (
                             is_proxy_network_error(e)
                             or is_navigation_timeout(e)
+                            or is_target_closed_error(e)
                             or isinstance(e, CaptchaSolveError)
                         )
                         or rotations >= config.max_proxy_rotations

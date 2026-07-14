@@ -28,6 +28,7 @@ __all__ = [
     "is_captcha_present",
     "is_navigation_timeout",
     "is_proxy_network_error",
+    "is_target_closed_error",
     "launch_stealth_browser",
     "launch_stealth_chromium",
     "new_stealth_page",
@@ -55,6 +56,18 @@ STEALTH_USER_AGENT = os.getenv(
 STEALTH_SEC_CH_UA = (
     f'"Chromium";v="{STEALTH_CHROME_MAJOR}", '
     f'"Google Chrome";v="{STEALTH_CHROME_MAJOR}", "Not?A_Brand";v="24"'
+)
+
+# keep navigation on a short timeout so a stalled proxy exit IP surfaces quickly
+# as a timeout that triggers a rotation instead of blocking for minutes
+STEALTH_NAVIGATION_TIMEOUT_MS = int(
+    os.getenv("STEALTH_NAVIGATION_TIMEOUT_MS", "30000")
+)
+
+# element actions run between deliberate human-like pauses, so give them a
+# generous budget rather than Playwright's 30s default that trips mid-listing
+STEALTH_ACTION_TIMEOUT_MS = int(
+    os.getenv("STEALTH_ACTION_TIMEOUT_MS", str(5 * 60 * 1000))
 )
 
 _decodo_port_cycle: Iterator[int] | None = None
@@ -361,7 +374,16 @@ def launch_stealth_chromium(
     # solving can reuse the same sticky exit ip that the browser is using
     _active_proxy_settings = proxy
 
-    return playwright.chromium.launch(headless=headless, proxy=proxy)
+    # container-hardening flags: /dev/shm defaults to 64MB inside docker, which
+    # is too small for chromium's renderer on heavy pages and crashes the target
+    # (surfacing as a hung sync call after "Target closed"); routing shared
+    # memory to /tmp with --disable-dev-shm-usage avoids the crash, and
+    # --no-sandbox is required to launch under most containerised/root setups
+    launch_args = ["--no-sandbox", "--disable-dev-shm-usage"]
+
+    return playwright.chromium.launch(
+        headless=headless, proxy=proxy, args=launch_args
+    )
 
 
 # GET ACTIVE PROXY SETTINGS
@@ -442,6 +464,20 @@ def new_stealth_page(browser: Browser) -> Page:
     """
 
     page = browser.new_page(user_agent=STEALTH_USER_AGENT)
+
+    # bound navigations and element actions so a stalled proxy exit ip or a slow
+    # render surfaces as a timeout the rotation loop can act on, rather than a
+    # sync call blocking indefinitely against an unresponsive target
+    page.set_default_navigation_timeout(STEALTH_NAVIGATION_TIMEOUT_MS)
+    page.set_default_timeout(STEALTH_ACTION_TIMEOUT_MS)
+
+    # surface a renderer crash (e.g. out-of-memory in a small /dev/shm container)
+    # in the logs so a dead session is diagnosable rather than silently hung
+    page.on(
+        "crash",
+        lambda _: print("  Browser page crashed (renderer terminated)"),
+    )
+
     _apply_windows_identity(page)
     return page
 
@@ -824,6 +860,11 @@ def is_captcha_present(page: Page) -> bool:
     embedded hCaptcha/reCAPTCHA widget.
     """
 
+    # a closed/crashed target cannot host a captcha, and probing it would block
+    # the sync call indefinitely, so bail out before touching any locator
+    if page.is_closed():
+        return False
+
     try:
         # url-based detection covers cloudflare/datadome/perimeterx redirects
         current_url = (page.url or "").lower()
@@ -1186,6 +1227,30 @@ def is_navigation_timeout(exc: BaseException) -> bool:
     return "Timeout" in message and "exceeded" in message
 
 
+TARGET_CLOSED_ERROR_FRAGMENTS = (
+    "Target page, context or browser has been closed",
+    "Target closed",
+    "TargetClosedError",
+    "Page crashed",
+    "has crashed",
+)
+
+
+# IS TARGET CLOSED ERROR
+def is_target_closed_error(exc: BaseException) -> bool:
+    """
+    Return True when an exception means the page/target was closed or the
+    renderer crashed (e.g. Chromium ran out of shared memory in a container).
+    The whole session is unusable afterwards, so the caller should relaunch a
+    fresh browser rather than keep retrying against the dead target.
+    """
+
+    message = str(exc)
+    return any(
+        fragment in message for fragment in TARGET_CLOSED_ERROR_FRAGMENTS
+    )
+
+
 # GOTO WITH CAPTCHA HANDLING
 def goto_with_captcha_handling(
     page: Page, url: str, max_retries: int = 3
@@ -1205,6 +1270,15 @@ def goto_with_captcha_handling(
             # wait only for domcontentloaded: a full "load" can hang or abort on
             # challenge interstitials and heavy client-rendered pages
             response = page.goto(url, wait_until="domcontentloaded")
+
+            # a renderer that crashed during navigation leaves a dead target;
+            # raise so the caller relaunches a fresh session instead of probing
+            # it for a captcha and hanging on the unresponsive connection
+            if page.is_closed():
+                raise RuntimeError(
+                    f"Target page closed while navigating to {url} "
+                    "(renderer likely crashed)"
+                )
 
             # if a captcha appeared after a successful load, solve then retry
             if is_captcha_present(page):

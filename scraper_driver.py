@@ -14,6 +14,7 @@ from common import (
     create_engine_with_retry,
     is_http_not_found,
     is_not_found_error,
+    is_playwright_timeout,
     is_transient_db_error,
     pause,
     with_db_retry,
@@ -24,7 +25,9 @@ from models.enums import ListingSource, ListingType, ProspectListingStatus
 from stealth_browser import (
     CaptchaSolveError,
     Page,
+    PageUnresponsiveError,
     check_proxy_health,
+    close_browser_quietly,
     goto_with_captcha_handling,
     is_navigation_timeout,
     is_proxy_network_error,
@@ -211,7 +214,7 @@ def load_listing_with_backoff(
 
             # only transport-level failures are worth retrying; any other error
             # is a real page/parse problem the caller should handle directly
-            if not is_site_unreachable_error(e):
+            if not is_site_unreachable_error(e) and not is_playwright_timeout(e):
                 raise
 
             last_error = e
@@ -219,8 +222,13 @@ def load_listing_with_backoff(
                 # exponential back-off gives a flapping proxy or connection time
                 # to recover before the next attempt
                 delay = backoff_seconds * (2 ** (attempt - 1))
+                failure = (
+                    "Page probe timed out"
+                    if is_playwright_timeout(e)
+                    else "Site unreachable"
+                )
                 print(
-                    f"  Site unreachable (attempt {attempt}/"
+                    f"  {failure} (attempt {attempt}/"
                     f"{max_retries}): {e}; retrying in "
                     f"{delay:.0f}s..."
                 )
@@ -391,13 +399,18 @@ def update_new_listings_availability(
 
                     # drop the now-orphaned photos from s3 and the images table
                     delete_listing_images(listing, session)
-                elif is_site_unreachable_error(e):
+                elif is_site_unreachable_error(e) or is_playwright_timeout(e):
                     # the page could not be fetched even after back-off retries;
                     # availability is unknown, so never mark NotAvailable. bubble
                     # up so the outer loop rotates the proxy or aborts the run.
                     session.rollback()
+                    reason = (
+                        "probe timed out"
+                        if is_playwright_timeout(e)
+                        else "site unreachable"
+                    )
                     print(
-                        f"  Site still unreachable after "
+                        f"  {reason.title()} after "
                         f"{config.availability_max_load_retries} attempts; aborting "
                         f"availability check: {e}"
                     )
@@ -470,10 +483,7 @@ def run_with_proxy_rotation(
                     )
 
                     if browser is not None:
-                        try:
-                            browser.close()
-                        except Exception:
-                            pass
+                        close_browser_quietly(browser, force_kill_first=True)
                         browser = None
                 except Exception as e:
                     if is_transient_db_error(e):
@@ -494,10 +504,7 @@ def run_with_proxy_rotation(
                         )
 
                         if browser is not None:
-                            try:
-                                browser.close()
-                            except Exception:
-                                pass
+                            close_browser_quietly(browser)
                             browser = None
 
                         time.sleep(delay)
@@ -510,7 +517,9 @@ def run_with_proxy_rotation(
                             is_proxy_network_error(e)
                             or is_navigation_timeout(e)
                             or is_target_closed_error(e)
+                            or is_playwright_timeout(e)
                             or isinstance(e, CaptchaSolveError)
+                            or isinstance(e, PageUnresponsiveError)
                         )
                         or rotations >= config.max_proxy_rotations
                     ):
@@ -539,14 +548,10 @@ def run_with_proxy_rotation(
                     )
 
                     if browser is not None:
-                        try:
-                            browser.close()
-                        except Exception:
-                            pass
+                        close_browser_quietly(browser, force_kill_first=True)
                         browser = None
 
             if sys.stdin.isatty():
                 page.wait_for_event("close", timeout=0)
         finally:
-            if browser is not None:
-                browser.close()
+            close_browser_quietly(browser)

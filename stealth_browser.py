@@ -1,10 +1,12 @@
 import itertools
 import os
 import re
+import signal
+import threading
 import time
 import uuid
 from contextlib import contextmanager
-from typing import Iterator, Optional
+from typing import Callable, Iterator, Optional, TypeVar
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import requests
@@ -12,12 +14,16 @@ from playwright.sync_api import Browser, Page, Playwright
 from playwright.sync_api import sync_playwright as _sync_playwright
 from playwright_stealth import Stealth
 
+T = TypeVar("T")
+
 __all__ = [
     "Browser",
     "CaptchaSolveError",
     "Page",
+    "PageUnresponsiveError",
     "Playwright",
     "check_proxy_health",
+    "close_browser_quietly",
     "detect_captcha_task",
     "detect_cloudflare_interstitial",
     "detect_datadome_captcha_url",
@@ -32,7 +38,11 @@ __all__ = [
     "launch_stealth_browser",
     "launch_stealth_chromium",
     "new_stealth_page",
+    "page_action_timeout",
+    "page_html",
     "parse_decodo_port_range",
+    "quick_locator_count",
+    "run_quick_page_action",
     "solve_captcha_with_capsolver",
     "solve_cloudflare_interstitial",
     "solve_datadome_captcha",
@@ -64,10 +74,21 @@ STEALTH_NAVIGATION_TIMEOUT_MS = int(
     os.getenv("STEALTH_NAVIGATION_TIMEOUT_MS", "30000")
 )
 
-# element actions run between deliberate human-like pauses, so give them a
-# generous budget rather than Playwright's 30s default that trips mid-listing
+# element actions on a loaded listing page; slow proxy exits are handled by
+# wait_for_selector_with_backoff's explicit per-call timeouts instead
 STEALTH_ACTION_TIMEOUT_MS = int(
-    os.getenv("STEALTH_ACTION_TIMEOUT_MS", str(5 * 60 * 1000))
+    os.getenv("STEALTH_ACTION_TIMEOUT_MS", str(90 * 1000))
+)
+
+# captcha probes must stay short: a hung renderer would otherwise block on
+# page.evaluate() / locator.count() forever (those APIs ignore action timeouts)
+CAPTCHA_PROBE_TIMEOUT_MS = int(
+    os.getenv("CAPTCHA_PROBE_TIMEOUT_MS", "5000")
+)
+
+# quick presence checks (locator.count, short reads) on a possibly wedged page
+QUICK_ACTION_TIMEOUT_MS = int(
+    os.getenv("QUICK_ACTION_TIMEOUT_MS", "15000")
 )
 
 _decodo_port_cycle: Iterator[int] | None = None
@@ -115,6 +136,15 @@ class CaptchaSolveError(RuntimeError):
     """
 
 
+# PAGE UNRESPONSIVE ERROR
+class PageUnresponsiveError(RuntimeError):
+    """
+    Raised when the browser page stops responding to Playwright commands during
+    navigation or captcha probing. The current Chromium renderer or proxy exit
+    IP is unusable; callers should relaunch the browser on a fresh proxy rather
+    than retrying against the wedged target.
+    """
+
 PROXY_NETWORK_ERROR_FRAGMENTS = (
     "ERR_TIMED_OUT",
     "ERR_CONNECTION_TIMED_OUT",
@@ -128,6 +158,16 @@ PROXY_NETWORK_ERROR_FRAGMENTS = (
     "ERR_HTTP_RESPONSE_CODE_FAILURE",
     "ERR_PROXY_AUTH_REQUESTED",
     "ERR_PROXY_AUTH_UNSUPPORTED",
+    # broken TLS through a bad/expired Decodo exit (or a mangled CONNECT tunnel)
+    # — the page never loaded, so rotate rather than treating it as a site fault
+    "ERR_SSL_PROTOCOL_ERROR",
+    "ERR_SSL_VERSION_OR_CIPHER_MISMATCH",
+    "ERR_SSL_BAD_RECORD_MAC_ALERT",
+    "ERR_SSL_OBSOLETE_VERSION",
+    "ERR_PROXY_CERTIFICATE_INVALID",
+    "ERR_CERT_AUTHORITY_INVALID",
+    "ERR_CERT_COMMON_NAME_INVALID",
+    "ERR_CERT_INVALID",
 )
 
 
@@ -482,6 +522,269 @@ def new_stealth_page(browser: Browser) -> Page:
     return page
 
 
+# PAGE ACTION TIMEOUT
+@contextmanager
+def page_action_timeout(page: Page, timeout_ms: int):
+    """
+    Temporarily lower the page's default action timeout so quick probes (captcha
+    detection, title reads) fail fast on an unresponsive renderer instead of
+    inheriting the multi-minute listing-scrape budget. Nested calls restore the
+    previous timeout rather than always jumping back to STEALTH_ACTION_TIMEOUT_MS,
+    so an outer quick budget is not discarded by an inner probe.
+    """
+
+    # track nested budgets on the page so finally restores the caller timeout
+    stack = getattr(page, "_ice_timeout_stack", None)
+    if stack is None:
+        stack = [STEALTH_ACTION_TIMEOUT_MS]
+        setattr(page, "_ice_timeout_stack", stack)
+
+    stack.append(timeout_ms)
+    page.set_default_timeout(timeout_ms)
+    try:
+        yield
+    finally:
+        stack.pop()
+        page.set_default_timeout(stack[-1])
+
+
+# IS PLAYWRIGHT TIMEOUT
+def _is_playwright_timeout(exc: Exception) -> bool:
+    """
+    Return True when an exception is a Playwright timeout ('Timeout NNNms
+    exceeded'), which usually means the renderer or proxy is stalled rather than
+    the page genuinely lacking a captcha.
+    """
+
+    message = str(exc)
+    return "Timeout" in message and "exceeded" in message
+
+
+# DESCENDANT PIDS
+def _descendant_pids(root_pid: int) -> list[int]:
+    """
+    Return every process id that is a descendant of root_pid by walking /proc.
+    Used to find Chromium children of this scraper so a hung Playwright close
+    can be unblocked without calling the sync API from another thread.
+    """
+
+    children_by_ppid: dict[int, list[int]] = {}
+    try:
+        for name in os.listdir("/proc"):
+            if not name.isdigit():
+                continue
+            pid = int(name)
+            try:
+                with open(f"/proc/{pid}/stat", "r", encoding="utf-8") as handle:
+                    data = handle.read()
+                # /proc/pid/stat: pid (comm) state ppid ... — comm may contain
+                # spaces/parens, so split on the final ')' before the fields
+                rparen = data.rfind(")")
+                fields = data[rparen + 2 :].split()
+                ppid = int(fields[1])
+            except (OSError, ValueError, IndexError):
+                continue
+            children_by_ppid.setdefault(ppid, []).append(pid)
+    except OSError:
+        return []
+
+    result: list[int] = []
+    stack = list(children_by_ppid.get(root_pid, []))
+    while stack:
+        pid = stack.pop()
+        result.append(pid)
+        stack.extend(children_by_ppid.get(pid, []))
+    return result
+
+
+# IS CHROMIUM PID
+def _is_chromium_pid(pid: int) -> bool:
+    """
+    Return True when /proc/pid/cmdline looks like a Chromium/Chrome binary.
+    """
+
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as handle:
+            cmdline = handle.read().decode("utf-8", "replace").lower()
+    except OSError:
+        return False
+
+    return "chrom" in cmdline or "headless_shell" in cmdline
+
+
+# FORCE KILL CHROMIUM DESCENDANTS
+def _force_kill_chromium_descendants() -> None:
+    """
+    SIGKILL Chromium descendants of this process. Safe to call from a watchdog
+    thread because it only uses os.kill — never Playwright's sync API, which is
+    greenlet-bound to the thread that started sync_playwright.
+    """
+
+    for pid in _descendant_pids(os.getpid()):
+        if not _is_chromium_pid(pid):
+            continue
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+
+# FORCE CLOSE PAGE
+def _force_close_page(page: Page, description: str, timeout_ms: int) -> None:
+    """
+    Unblock a hung sync Playwright call by killing the Chromium process from a
+    watchdog thread. Calling page.close()/browser.close() here would cross
+    greenlet threads and raise 'cannot switch to a different thread'.
+    """
+
+    # page is unused; kept so call sites stay readable about which action failed
+    _ = page
+    print(
+        f"  Hard-timeout: {description} after {timeout_ms}ms; killing chromium"
+    )
+    _force_kill_chromium_descendants()
+
+
+# CLOSE BROWSER QUIETLY
+def close_browser_quietly(
+    browser: Browser | None,
+    *,
+    timeout_s: float = 5.0,
+    force_kill_first: bool = False,
+) -> None:
+    """
+    Close a Playwright browser without raising. Close always runs on the calling
+    (Playwright) thread so greenlets stay valid. When force_kill_first is set
+    (e.g. scheduled proxy rotation), SIGKILL Chromium before close so in-flight
+    navigations abort promptly instead of leaving a wedged CDP session. If close
+    itself hangs after a wedged CDP session, a watchdog SIGKILLs Chromium so the
+    sync call can error out and the rotation loop can relaunch.
+    """
+
+    if browser is None:
+        return
+
+    if force_kill_first:
+        _force_kill_chromium_descendants()
+
+    done = threading.Event()
+
+    def _watchdog() -> None:
+        if done.wait(timeout_s):
+            return
+        print(
+            f"  browser.close() hung for {timeout_s:.0f}s; killing chromium"
+        )
+        _force_kill_chromium_descendants()
+
+    watcher = threading.Thread(
+        target=_watchdog, daemon=True, name="browser-close"
+    )
+    watcher.start()
+    try:
+        browser.close()
+    except Exception:
+        pass
+    finally:
+        done.set()
+
+
+# PAGE HTML
+def page_html(page: Page) -> str:
+    """
+    Return the page HTML via inner_html('html'), which respects the page action
+    timeout. Playwright's page.content() sends no timeout to the driver and can
+    block forever on a wedged renderer even inside page_action_timeout.
+    """
+
+    return page.inner_html("html")
+
+
+# RESET PAGE AFTER PROBE TIMEOUT
+def _reset_page_after_probe_timeout(page: Page) -> None:
+    """
+    Navigate to about:blank after a probe timeout so the next goto attempt does
+    not inherit a wedged renderer state from the previous navigation.
+    """
+
+    if page.is_closed():
+        return
+
+    try:
+        with page_action_timeout(page, CAPTCHA_PROBE_TIMEOUT_MS):
+            page.goto("about:blank", wait_until="domcontentloaded")
+    except Exception:
+        # the reset is best-effort; a still-dead target will fail the next goto
+        pass
+
+
+# RUN QUICK PAGE ACTION
+def run_quick_page_action(
+    page: Page,
+    action: Callable[[], T],
+    *,
+    description: str = "page action",
+    timeout_ms: int | None = None,
+) -> T:
+    """
+    Run a short Playwright operation under a tight timeout so probes fail fast
+    on an unresponsive renderer. set_default_timeout alone is not enough:
+    page.content(), locator.count() and page.evaluate() ignore it, so a
+    watchdog closes the page when the deadline elapses to unblock the sync call.
+    """
+
+    deadline_ms = timeout_ms if timeout_ms is not None else QUICK_ACTION_TIMEOUT_MS
+    finished = threading.Event()
+    hard_timed_out = False
+
+    def _watchdog() -> None:
+        nonlocal hard_timed_out
+        if finished.wait(deadline_ms / 1000.0):
+            return
+        # action may have finished in the race window after wait timed out
+        if finished.is_set():
+            return
+        hard_timed_out = True
+        _force_close_page(page, description, deadline_ms)
+
+    watcher = threading.Thread(
+        target=_watchdog,
+        daemon=True,
+        name=f"quick-action:{description}",
+    )
+    watcher.start()
+    try:
+        with page_action_timeout(page, deadline_ms):
+            return action()
+    except PageUnresponsiveError:
+        raise
+    except Exception as e:
+        if (
+            hard_timed_out
+            or _is_playwright_timeout(e)
+            or is_target_closed_error(e)
+        ):
+            raise PageUnresponsiveError(
+                f"{description} timed out after {deadline_ms}ms"
+            ) from e
+        raise
+    finally:
+        finished.set()
+
+
+# QUICK LOCATOR COUNT
+def quick_locator_count(locator, *, description: str = "locator count") -> int:
+    """
+    Return locator.count() under a short hard timeout so a wedged renderer
+    cannot block the scrape indefinitely. locator.count() ignores Playwright's
+    default action timeout, so run_quick_page_action's watchdog is required.
+    """
+
+    return run_quick_page_action(
+        locator.page, locator.count, description=description
+    )
+
+
 # CAPSOLVER PROXY FIELDS
 def _capsolver_proxy_fields() -> dict | None:
     """
@@ -542,7 +845,7 @@ def launch_stealth_browser(
         try:
             yield browser, page
         finally:
-            browser.close()
+            close_browser_quietly(browser)
 
 
 # GET CAPSOLVER API KEY
@@ -866,38 +1169,65 @@ def is_captcha_present(page: Page) -> bool:
         return False
 
     try:
-        # url-based detection covers cloudflare/datadome/perimeterx redirects
-        current_url = (page.url or "").lower()
-        if any(fragment in current_url for fragment in CAPTCHA_URL_FRAGMENTS):
-            return True
-
-        # title-based detection catches the typical interstitial titles
-        title = (page.title() or "").lower()
-        if any(fragment in title for fragment in CAPTCHA_TITLE_FRAGMENTS):
-            return True
-
-        # iframe-based detection catches embedded challenge widgets
-        challenge_iframe = page.locator(
-            'iframe[src*="challenges.cloudflare.com"], '
-            'iframe[src*="recaptcha"], '
-            'iframe[src*="hcaptcha"], '
-            'iframe[src*="datadome"], '
-            'iframe[src*="perimeterx"], '
-            'iframe[src*="captcha-delivery"]'
+        # wait_for_function respects the action timeout; page.evaluate does not,
+        # so a hung renderer would otherwise block forever on this probe
+        return run_quick_page_action(
+            page,
+            lambda: _probe_captcha_present(page),
+            description="captcha probe",
+            timeout_ms=CAPTCHA_PROBE_TIMEOUT_MS,
         )
-        if challenge_iframe.count() > 0:
-            return True
-
-        # visible-text detection as a final fallback for provider-agnostic prompts
-        for fragment in CAPTCHA_TEXT_FRAGMENTS:
-            if page.get_by_text(fragment, exact=False).count() > 0:
-                return True
+    except PageUnresponsiveError:
+        raise
     except Exception:
-        # if any probe fails (e.g. detached frame) assume no captcha so the
-        # caller can decide how to handle the underlying error
+        # any other probe failure (e.g. detached frame) is treated as no captcha
         return False
 
-    return False
+
+# PROBE CAPTCHA PRESENT
+def _probe_captcha_present(page: Page) -> bool:
+    """
+    Return whether a captcha challenge is visible, using wait_for_function so the
+    result object is always truthy and Playwright's timeout can fire.
+    """
+
+    handle = page.wait_for_function(
+        """({ urlFrags, titleFrags, textFrags }) => {
+            const url = location.href.toLowerCase();
+            if (urlFrags.some((f) => url.includes(f))) {
+                return { present: true };
+            }
+
+            const title = (document.title || "").toLowerCase();
+            if (titleFrags.some((f) => title.includes(f))) {
+                return { present: true };
+            }
+
+            const iframeSelector = [
+                'iframe[src*="challenges.cloudflare.com"]',
+                'iframe[src*="recaptcha"]',
+                'iframe[src*="hcaptcha"]',
+                'iframe[src*="datadome"]',
+                'iframe[src*="perimeterx"]',
+                'iframe[src*="captcha-delivery"]',
+            ].join(", ");
+            if (document.querySelector(iframeSelector)) {
+                return { present: true };
+            }
+
+            const bodyText = document.body ? document.body.innerText : "";
+            return {
+                present: textFrags.some((f) => bodyText.includes(f)),
+            };
+        }""",
+        arg={
+            "urlFrags": list(CAPTCHA_URL_FRAGMENTS),
+            "titleFrags": list(CAPTCHA_TITLE_FRAGMENTS),
+            "textFrags": list(CAPTCHA_TEXT_FRAGMENTS),
+        },
+        timeout=CAPTCHA_PROBE_TIMEOUT_MS,
+    )
+    return bool(handle.evaluate("r => r.present"))
 
 
 # PAGE USER AGENT
@@ -959,22 +1289,48 @@ def detect_cloudflare_interstitial(page: Page) -> bool:
     """
 
     try:
-        title = (page.title() or "").lower()
-        if any(
-            fragment in title
-            for fragment in ("just a moment", "attention required", "checking your browser")
-        ):
-            return True
-
-        # the interstitial hosts the challenge in a cloudflare-served iframe/div
-        markers = page.locator(
-            "#challenge-running, #cf-chl-widget, "
-            'iframe[src*="challenges.cloudflare.com"], '
-            'div[id^="cf-chl"]'
+        return run_quick_page_action(
+            page,
+            lambda: _probe_cloudflare_interstitial(page),
+            description="cloudflare interstitial probe",
+            timeout_ms=CAPTCHA_PROBE_TIMEOUT_MS,
         )
-        return markers.count() > 0
+    except PageUnresponsiveError:
+        raise
     except Exception:
         return False
+
+
+# PROBE CLOUDFLARE INTERSTITIAL
+def _probe_cloudflare_interstitial(page: Page) -> bool:
+    """
+    Return whether a Cloudflare managed challenge is showing, via a timed
+    wait_for_function probe rather than page.evaluate which has no timeout.
+    """
+
+    handle = page.wait_for_function(
+        """() => {
+            const title = (document.title || "").toLowerCase();
+            const titleFrags = [
+                "just a moment",
+                "attention required",
+                "checking your browser",
+            ];
+            if (titleFrags.some((f) => title.includes(f))) {
+                return { present: true };
+            }
+
+            const selector = [
+                "#challenge-running",
+                "#cf-chl-widget",
+                'iframe[src*="challenges.cloudflare.com"]',
+                'div[id^="cf-chl"]',
+            ].join(", ");
+            return { present: !!document.querySelector(selector) };
+        }""",
+        timeout=CAPTCHA_PROBE_TIMEOUT_MS,
+    )
+    return bool(handle.evaluate("r => r.present"))
 
 
 # CLEAN CAPSOLVER WEBSITE URL
@@ -1001,12 +1357,37 @@ def detect_datadome_captcha_url(page: Page) -> str | None:
     """
 
     try:
-        iframe = page.locator('iframe[src*="captcha-delivery.com"]')
-        if iframe.count() == 0:
-            return None
-        return iframe.first.get_attribute("src")
+        return run_quick_page_action(
+            page,
+            lambda: _probe_datadome_captcha_url(page),
+            description="datadome captcha url probe",
+            timeout_ms=CAPTCHA_PROBE_TIMEOUT_MS,
+        )
+    except PageUnresponsiveError:
+        raise
     except Exception:
         return None
+
+
+# PROBE DATADOME CAPTCHA URL
+def _probe_datadome_captcha_url(page: Page) -> str | None:
+    """
+    Read the DataDome captcha iframe src under a timed wait_for_function so a
+    wedged renderer cannot hang the probe indefinitely.
+    """
+
+    handle = page.wait_for_function(
+        """() => {
+            const iframe = document.querySelector(
+                'iframe[src*="captcha-delivery.com"]'
+            );
+            return {
+                src: iframe ? iframe.getAttribute("src") : null,
+            };
+        }""",
+        timeout=CAPTCHA_PROBE_TIMEOUT_MS,
+    )
+    return handle.evaluate("r => r.src")
 
 
 # SOLVE CLOUDFLARE INTERSTITIAL
@@ -1028,9 +1409,15 @@ def solve_cloudflare_interstitial(page: Page) -> None:
     print("  Detected Cloudflare interstitial; solving via AntiCloudflareTask...")
 
     # capsolver needs the challenge-page html and the real target url, not the
-    # ephemeral __cf_chl_rt_tk redirect address cloudflare may have navigated to
+    # ephemeral __cf_chl_rt_tk redirect address cloudflare may have navigated to;
+    # use page_html so a wedged renderer cannot hang forever on page.content()
     website_url = _clean_capsolver_website_url(page.url)
-    challenge_html = page.content()
+    challenge_html = run_quick_page_action(
+        page,
+        lambda: page_html(page),
+        description="cloudflare challenge html",
+        timeout_ms=QUICK_ACTION_TIMEOUT_MS,
+    )
 
     # forward the live user agent so the clearance is bound to this browser
     page_user_agent = _page_user_agent(page)
@@ -1266,6 +1653,7 @@ def goto_with_captcha_handling(
 
     while attempt < max_retries:
         attempt += 1
+        print(f"  Navigating to {url} (attempt {attempt}/{max_retries})...")
         try:
             # wait only for domcontentloaded: a full "load" can hang or abort on
             # challenge interstitials and heavy client-rendered pages
@@ -1290,6 +1678,32 @@ def goto_with_captcha_handling(
             raise
         except Exception as e:
             last_error = e
+
+            # a hung renderer often surfaces as a probe timeout after goto; reset
+            # the page and retry, or abandon the session once retries are exhausted
+            if _is_playwright_timeout(e):
+                if attempt < max_retries:
+                    print(
+                        f"  Page probe timed out navigating to {url} "
+                        f"(attempt {attempt}/{max_retries}); resetting page "
+                        f"and retrying..."
+                    )
+                    _reset_page_after_probe_timeout(page)
+                    continue
+
+                raise PageUnresponsiveError(
+                    f"Page probe timed out navigating to {url} after "
+                    f"{max_retries} attempts"
+                ) from e
+
+            # transport-level proxy/TLS failures never produce a captcha page;
+            # probing the dead target can trip Playwright's sync greenlet, so
+            # raise immediately and let the caller rotate to a fresh exit IP
+            if is_proxy_network_error(e):
+                print(
+                    f"  Proxy/network error navigating to {url}: {e}"
+                )
+                raise
 
             # a mid-flight challenge redirect typically surfaces as ERR_ABORTED
             # and the interstitial needs a moment to render, so settle before

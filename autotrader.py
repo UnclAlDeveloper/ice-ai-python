@@ -17,6 +17,7 @@ load_environment()
 from stealth_browser import (
     CaptchaSolveError,
     Page,
+    PageUnresponsiveError,
     goto_with_captcha_handling,
     is_captcha_present,
     launch_stealth_chromium,
@@ -842,7 +843,8 @@ def extract_source_id(url: str | None) -> str | None:
 def get_specs_and_features(page: Page) -> str | None:
     """
     Click the 'View all spec and features' button, expand all accordion sections,
-    and extract all specs and features into markdown"""
+    and extract all specs and features into markdown
+    """
 
     # try to find and click the "View all spec and features" button
     view_all_button = page.get_by_test_id("view-all-spec-and-features-signpost")
@@ -856,8 +858,12 @@ def get_specs_and_features(page: Page) -> str | None:
         return None
 
     # wait for the popup to appear
-    popup = page.locator("div.ppa-enabled")
-    if popup.count() == 0:
+    popup = page.locator(
+        'section[role="document"][data-testid="spec-feats-modal-back-button"]'
+    )
+    try:
+        popup.wait_for(state="visible", timeout=5000)
+    except Exception:
         return None
 
     # expand all collapsed accordion sections
@@ -1066,6 +1072,10 @@ def save_gallery_images(
     gallery_button = page.locator(
         'section[name="gallery"] button:has(span:text("Gallery"))'
     )
+    if gallery_button.count() == 0:
+        gallery_button = page.locator(
+            'section[data-testid="gallery"] button:has(span:text("Gallery"))'
+        )
     if gallery_button.count() == 0:
         print("Gallery button not found, skipping image extraction")
         return None, 0
@@ -1794,6 +1804,14 @@ def scrape_listings(
             except CaptchaSolveError:
                 # an unsolved challenge will block the rest of the sweep on
                 # this exit ip too, so bubble up for a proxy rotation
+                raise
+            except PageUnresponsiveError:
+                # the chromium renderer or proxy exit ip is wedged; relaunch
+                # on a fresh decodo port rather than skipping listings silently
+                raise
+            except ProxySessionExpired:
+                # availability checks share the scrape deadline; when it elapses
+                # mid-sweep rotate immediately instead of skipping the listing
                 raise
             except Exception as e:
                 print(f"  Error processing listing, skipping: {e}")

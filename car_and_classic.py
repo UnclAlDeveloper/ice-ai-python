@@ -17,9 +17,13 @@ load_environment()
 from stealth_browser import (
     CaptchaSolveError,
     Page,
+    PageUnresponsiveError,
     goto_with_captcha_handling,
     launch_stealth_chromium,
     new_stealth_page,
+    page_html,
+    quick_locator_count,
+    run_quick_page_action,
 )
 from sqlalchemy.orm import sessionmaker
 
@@ -86,7 +90,7 @@ def _get_advert_type(page: Page) -> str | None:
     """
 
     details = page.locator('section:has(h2:text("Advert Details"))')
-    if details.count() == 0:
+    if quick_locator_count(details, description="advert details section") == 0:
         return None
 
     match = re.search(
@@ -104,11 +108,11 @@ def _has_description_sold_phrase(page: Page) -> bool:
     """
 
     desc_article = page.locator('article:has(h2:text("Description"))')
-    if desc_article.count() == 0:
+    if quick_locator_count(desc_article, description="description section") == 0:
         return False
 
     first_para = desc_article.locator("p").first
-    if first_para.count() == 0:
+    if quick_locator_count(first_para, description="description paragraph") == 0:
         return False
 
     return bool(DESCRIPTION_SOLD_PHRASE.search(first_para.inner_text()))
@@ -161,6 +165,21 @@ def is_listing_no_longer_available(page: Page) -> bool:
     appear before deciding, ensuring a slow render is never misread as available.
     """
 
+    return run_quick_page_action(
+        page,
+        lambda: _check_listing_no_longer_available(page),
+        description="listing availability check",
+        timeout_ms=30_000,
+    )
+
+
+# CHECK LISTING NO LONGER AVAILABLE
+def _check_listing_no_longer_available(page: Page) -> bool:
+    """
+    Evaluate whether the current listing detail page is unavailable, using short
+    timeouts on each locator probe so a wedged renderer cannot block for minutes.
+    """
+
     # wait for whichever outcome renders first so a removed advert ends the wait
     # immediately rather than paying the full timeout, while a live listing is
     # confirmed by its asking-price header or at least its h1 title
@@ -172,19 +191,23 @@ def is_listing_no_longer_available(page: Page) -> bool:
         pass
 
     for text in UNAVAILABLE_ADVERT_TEXTS:
-        if page.get_by_text(text, exact=False).count() > 0:
+        if quick_locator_count(
+            page.get_by_text(text, exact=False),
+            description="unavailable advert banner",
+        ) > 0:
             return True
 
-    # fall back to scanning the rendered html in case the banner markup changes
+    # fall back to scanning the rendered html in case the banner markup changes;
+    # page_html respects the action timeout unlike page.content()
     try:
-        content = page.content()
+        content = page_html(page)
         if any(text in content for text in UNAVAILABLE_ADVERT_TEXTS):
             return True
     except Exception:
         pass
 
     h1 = page.locator("section h1").first
-    if h1.count() > 0:
+    if quick_locator_count(h1, description="listing h1") > 0:
         h1_text = h1.text_content() or ""
         if is_title_sold_or_under_offer(h1_text):
             return True
@@ -194,12 +217,33 @@ def is_listing_no_longer_available(page: Page) -> bool:
 
     # a For Sale classified with no asking price is no longer purchasable
     if (
-        price_header.count() == 0
+        quick_locator_count(price_header, description="asking price header") == 0
         and _get_advert_type(page) == "For Sale"
     ):
         return True
 
     return False
+
+
+# UNAVAILABLE BANNER IN PAGE HTML
+def _unavailable_banner_in_page_html(page: Page) -> bool:
+    """
+    Return True when unavailable-advert banner text is present in the page html.
+    Used after a Playwright timeout to avoid re-running full availability probes
+    against a possibly wedged renderer.
+    """
+
+    try:
+        content = run_quick_page_action(
+            page,
+            lambda: page_html(page),
+            description="page html read",
+            timeout_ms=10_000,
+        )
+    except PageUnresponsiveError:
+        return False
+
+    return any(text in content for text in UNAVAILABLE_ADVERT_TEXTS)
 
 
 _SEARCH_RESULTS_CARD_SELECTOR = '[data-testid="card-listing"]'
@@ -234,7 +278,7 @@ def _is_cookie_consent_visible(page: Page) -> bool:
     """
 
     banner = page.locator("#onetrust-banner-sdk")
-    if banner.count() > 0:
+    if quick_locator_count(banner, description="cookie banner") > 0:
         try:
             if banner.first.is_visible():
                 return True
@@ -242,7 +286,7 @@ def _is_cookie_consent_visible(page: Page) -> bool:
             pass
 
     accept_button = page.locator("#onetrust-accept-btn-handler")
-    if accept_button.count() > 0:
+    if quick_locator_count(accept_button, description="cookie accept button") > 0:
         try:
             if accept_button.first.is_visible():
                 return True
@@ -409,7 +453,11 @@ def _is_sorted_by_newest(page: Page) -> bool:
     if params.get("sort") == "latest":
         return True
 
-    return page.locator(_NEWEST_LISTED_SORT_APPLIED_SELECTOR).count() > 0
+    return run_quick_page_action(
+        page,
+        lambda: page.locator(_NEWEST_LISTED_SORT_APPLIED_SELECTOR).count() > 0,
+        description="newest-listed sort check",
+    )
 
 
 # APPLY NEWEST LISTED SORT
@@ -511,7 +559,7 @@ def dismiss_inertia_error_dialog(page: Page) -> bool:
     """
 
     dialog = page.locator("dialog#inertia-error-dialog")
-    if dialog.count() == 0:
+    if quick_locator_count(dialog, description="inertia error dialog") == 0:
         return False
 
     # the dialog exposes no visible close control, so detach it from the dom
@@ -537,15 +585,21 @@ def extract_gallery_images(page: Page) -> list[str]:
     dismiss_inertia_error_dialog(page)
 
     gallery_section = page.locator('section:has(h2:text("Gallery"))')
-    if gallery_section.count() == 0:
+    if quick_locator_count(gallery_section, description="gallery section") == 0:
         return image_urls
 
     gallery_buttons = gallery_section.locator("button")
-    if gallery_buttons.count() == 0:
+    if quick_locator_count(gallery_buttons, description="gallery buttons") == 0:
         return image_urls
 
     last_button = gallery_buttons.last
-    has_camera_icon = last_button.locator('svg[data-icon="camera"]').count() > 0
+    has_camera_icon = (
+        quick_locator_count(
+            last_button.locator('svg[data-icon="camera"]'),
+            description="gallery camera icon",
+        )
+        > 0
+    )
 
     if has_camera_icon:
         # click the last button to open the full gallery popup
@@ -554,7 +608,10 @@ def extract_gallery_images(page: Page) -> list[str]:
 
         # collect all image src urls from the popup panel
         popup_images = page.locator("#panel_sheet_images img")
-        for i in range(popup_images.count()):
+        popup_image_count = quick_locator_count(
+            popup_images, description="gallery popup images"
+        )
+        for i in range(popup_image_count):
             src = popup_images.nth(i).get_attribute("src")
             if src and src.startswith("http") and src not in image_urls:
                 image_urls.append(src)
@@ -567,7 +624,10 @@ def extract_gallery_images(page: Page) -> list[str]:
     else:
         # all images are visible on the detail page already
         section_images = gallery_section.locator("img")
-        for i in range(section_images.count()):
+        section_image_count = quick_locator_count(
+            section_images, description="gallery section images"
+        )
+        for i in range(section_image_count):
             src = section_images.nth(i).get_attribute("src")
             if src and src.startswith("http") and src not in image_urls:
                 image_urls.append(src)
@@ -582,6 +642,23 @@ def extract_listing_details(
     """
     Extract prospect listing fields from an individual listing detail page
     and return a populated ProspectListings instance along with gallery image URLs.
+    """
+
+    return run_quick_page_action(
+        page,
+        lambda: _extract_listing_details_impl(page, hash_code, source_id),
+        description="listing field extraction",
+        timeout_ms=90_000,
+    )
+
+
+# EXTRACT LISTING DETAILS IMPL
+def _extract_listing_details_impl(
+    page: Page, hash_code: str, source_id: str | None
+) -> tuple[ProspectListings, list[str]]:
+    """
+    Populate a ProspectListings row and gallery image urls from the current
+    listing detail page.
     """
 
     url = page.url
@@ -603,11 +680,12 @@ def extract_listing_details(
 
     # extract fields from the spec list items using their svg data-icon attribute
     items = page.locator("section ul li")
-    for i in range(items.count()):
+    item_count = quick_locator_count(items, description="listing spec items")
+    for i in range(item_count):
         li = items.nth(i)
         icon = li.locator("svg[data-icon]")
 
-        if icon.count() > 0:
+        if quick_locator_count(icon, description="spec list icon") > 0:
             icon_name = icon.first.get_attribute("data-icon")
             value = li.text_content().strip()
             field = ICON_TO_FIELD.get(icon_name)
@@ -631,7 +709,7 @@ def extract_listing_details(
         else:
             # the location li uses a flag <img> instead of an svg
             img = li.locator("img")
-            if img.count() > 0:
+            if quick_locator_count(img, description="location flag image") > 0:
                 location = li.text_content().strip()
                 location = re.sub(r",?\s*United Kingdom$", "", location)
 
@@ -639,7 +717,7 @@ def extract_listing_details(
     asking_price = None
     currency_symbol = None
     price_header = page.locator('header:has(span:text("Asking price")) h2')
-    if price_header.count() > 0:
+    if quick_locator_count(price_header, description="asking price header") > 0:
         price_text = price_header.first.text_content().strip()
         if price_text:
             currency_symbol = price_text[0]
@@ -653,7 +731,7 @@ def extract_listing_details(
     short_description = None
     full_description = None
     desc_article = page.locator('article:has(h2:text("Description"))')
-    if desc_article.count() > 0:
+    if quick_locator_count(desc_article, description="description article") > 0:
         full_text = desc_article.locator("p").first.inner_text().strip()
         full_description = full_text
         short_description = full_text.split("\n")[0].strip()
@@ -661,11 +739,14 @@ def extract_listing_details(
     # extract vehicle background history check summary
     basic_history_check = None
     bg_section = page.locator('section:has(h2:text("Vehicle background"))')
-    if bg_section.count() > 0:
+    if quick_locator_count(bg_section, description="vehicle background section") > 0:
         answers = bg_section.locator("div > p:last-child")
         no_count = 0
         yes_count = 0
-        for i in range(answers.count()):
+        answer_count = quick_locator_count(
+            answers, description="vehicle background answers"
+        )
+        for i in range(answer_count):
             answer = answers.nth(i).text_content().strip()
             if answer == "No":
                 no_count += 1
@@ -725,7 +806,10 @@ def _snapshot_listing_candidates(
         articles = page.locator(_SEARCH_RESULTS_CARD_SELECTOR)
 
     listing_candidates: list[tuple[str, str, str | None, str]] = []
-    for i in range(articles.count()):
+    article_count = quick_locator_count(
+        articles, description="search result cards"
+    )
+    for i in range(article_count):
         card = articles.nth(i)
         title = card.locator("h2").text_content().strip()
         href = card.locator("a").first.get_attribute("href")
@@ -799,7 +883,12 @@ def scrape_listings(
             new_vehicles_grid = page.locator(
                 "div.lg\\:grid-cols-3.grid.grid-cols-1"
             )
-            use_new_section = new_vehicles_grid.count() > 0
+            use_new_section = (
+                quick_locator_count(
+                    new_vehicles_grid, description="new vehicles grid"
+                )
+                > 0
+            )
             if use_new_section:
                 print("New vehicles section detected — processing only new listings")
 
@@ -906,7 +995,7 @@ def scrape_listings(
                     h1 = page.locator("section h1").first
                     make_and_model = (
                         h1.text_content().strip()
-                        if h1.count() > 0
+                        if quick_locator_count(h1, description="listing h1") > 0
                         else title
                     )
                     with SessionLocal() as session:
@@ -1003,53 +1092,53 @@ def scrape_listings(
                     existing_source_ids.add(source_id)
                 processed_ids.add(card_id)
 
-                # after each newly saved listing, run a tiny randomized availability sweep
-                update_new_listings_availability(
-                    page,
-                    listing_source=ListingSource.CAR_AND_CLASSIC,
-                    is_unavailable_fn=is_listing_no_longer_available,
-                    limit=random.randint(0, 2),
-                    config=CONFIG,
-                    deadline=deadline,
-                )
             except CaptchaSolveError:
                 # an unsolved challenge will block the rest of the sweep on
                 # this exit ip too, so bubble up for a proxy rotation
                 raise
+            except PageUnresponsiveError:
+                # the chromium renderer or proxy exit ip is wedged; relaunch
+                # on a fresh decodo port rather than skipping listings silently
+                raise
             except Exception as e:
-                # a removed advert has no section h1; if a wait timed out but
-                # the unavailable banner is present, save a stub rather than
-                # burning the full backoff budget and skipping without a record
-                if is_playwright_timeout(e) and is_listing_no_longer_available(
-                    page
-                ):
-                    print(
-                        f"  [{index}] {title} — NotAvailable (unavailable), "
-                        f"skipping"
-                    )
-                    h1 = page.locator("section h1").first
-                    make_and_model = (
-                        h1.text_content().strip()
-                        if h1.count() > 0
-                        else title
-                    )
-                    with SessionLocal() as session:
-                        persist_unavailable_listing_stub(
-                            session,
-                            listing_source=ListingSource.CAR_AND_CLASSIC,
-                            listing_type=ListingType.CLASSIC,
-                            hash_code=hash_code,
-                            source_id=source_id,
-                            url=listing_url,
-                            make_and_model=make_and_model,
-                            short_description=title,
+                if is_playwright_timeout(e):
+                    if _unavailable_banner_in_page_html(page):
+                        print(
+                            f"  [{index}] {title} — NotAvailable (unavailable), "
+                            f"skipping"
                         )
-                    if source_id is not None:
-                        existing_source_ids.add(source_id)
-                    processed_ids.add(card_id)
-                    continue
+                        with SessionLocal() as session:
+                            persist_unavailable_listing_stub(
+                                session,
+                                listing_source=ListingSource.CAR_AND_CLASSIC,
+                                listing_type=ListingType.CLASSIC,
+                                hash_code=hash_code,
+                                source_id=source_id,
+                                url=listing_url,
+                                make_and_model=title,
+                                short_description=title,
+                            )
+                        if source_id is not None:
+                            existing_source_ids.add(source_id)
+                        processed_ids.add(card_id)
+                        continue
+
+                    raise PageUnresponsiveError(
+                        f"listing page timed out for {listing_url}"
+                    ) from e
 
                 print(f"  [{index}] {title} — error, skipping: {e}")
+
+        # batch availability checks once per results page so the browser is not
+        # navigated away from the scrape context after every new listing
+        update_new_listings_availability(
+            page,
+            listing_source=ListingSource.CAR_AND_CLASSIC,
+            is_unavailable_fn=is_listing_no_longer_available,
+            limit=random.randint(1, 4),
+            config=CONFIG,
+            deadline=deadline,
+        )
 
         # new-vehicles section has no pagination, so stop after one pass
         if use_new_section:

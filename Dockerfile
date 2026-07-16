@@ -9,7 +9,7 @@ RUN apt-get update \
  && echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
       > /etc/apt/sources.list.d/pgdg.list \
  && apt-get update \
- && apt-get install -y --no-install-recommends postgresql-client-18 \
+ && apt-get install -y --no-install-recommends postgresql-client-18 procps tmux \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -19,6 +19,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN playwright install --with-deps chromium
 
 COPY . .
+COPY .bashrc /root/.bashrc
+COPY .bash_profile /root/.bash_profile
+COPY .profile /root/.profile
+RUN ln -sf /bin/bash /bin/sh \
+ && usermod -s /bin/bash root
 RUN chmod +x entrypoint.sh
 
 EXPOSE 8005

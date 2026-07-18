@@ -19,6 +19,7 @@ from stealth_browser import (
     Page,
     PageUnresponsiveError,
     goto_with_captcha_handling,
+    is_proxy_network_error,
     launch_stealth_chromium,
     new_stealth_page,
     page_html,
@@ -62,10 +63,82 @@ UNAVAILABLE_ADVERT_TEXTS = (
 
 CONFIG = ProxyRotationConfig.from_env_prefix("CAR_AND_CLASSIC")
 
+# cars in the UK from private sellers, newest first; applied via query params
+# because the All filters overlay needs client-side JS that Cloudflare often
+# blocks on proxied asset requests (button visible, click does nothing)
+_FILTERED_SEARCH_URL = (
+    "https://www.carandclassic.com/search"
+    "?vehicle_type=cars"
+    "&country=GB"
+    "&seller_type=private"
+    "&sort=latest"
+    "&source=modal-sort"
+)
+
 # title or h1 patterns that indicate a listing is sold or under offer
 TITLE_SOLD_OR_UNDER_OFFER = re.compile(
     r"(?i)\bunder\s+offer\b|\b(?:already\s+)?sold\b"
 )
+
+# section headings that can appear as section h1 on the detail page and must
+# never be treated as the vehicle make/model
+_NON_TITLE_HEADINGS = frozenset(
+    {
+        "highlights",
+        "gallery",
+        "description",
+        "vehicle background",
+        "asking price",
+        "overview",
+        "specification",
+        "specifications",
+        "seller",
+        "location",
+    }
+)
+
+# car & classic allows at most 100 photos per advert; anything beyond that is
+# almost certainly gallery-extraction noise (thumbnails, related cars, etc.)
+_MAX_GALLERY_IMAGES = 100
+
+
+# IS NON TITLE HEADING
+def _is_non_title_heading(text: str | None) -> bool:
+    """
+    Return True when text looks like a page section heading rather than a
+    vehicle make and model string.
+    """
+
+    if not text:
+        return True
+    return text.strip().lower() in _NON_TITLE_HEADINGS
+
+
+# NORMALIZE IMAGE URL
+def _normalize_image_url(url: str) -> str:
+    """
+    Strip query and fragment so the same photo at different CDN sizes is only
+    kept once when collecting gallery image urls.
+    """
+
+    parsed = urlparse(url)
+    return urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", "", ""))
+
+
+# APPEND UNIQUE IMAGE URL
+def _append_unique_image_url(image_urls: list[str], seen: set[str], src: str | None) -> None:
+    """
+    Add an http(s) image src to image_urls when its normalised form has not
+    already been collected.
+    """
+
+    if not src or not src.startswith("http"):
+        return
+    key = _normalize_image_url(src)
+    if key in seen:
+        return
+    seen.add(key)
+    image_urls.append(src)
 
 # conservative sold phrases in the first description paragraph only
 DESCRIPTION_SOLD_PHRASE = re.compile(
@@ -575,10 +648,12 @@ def extract_gallery_images(page: Page) -> list[str]:
     Collect image URLs from the Gallery section. If the last button contains a
     camera icon, click it to open the full gallery popup and collect URLs from
     there. Otherwise all images are already visible on the detail page, so
-    collect URLs directly from the gallery section.
+    collect URLs directly from the gallery section. URLs are de-duplicated by
+    path (ignoring CDN size query params) and capped at the site photo limit.
     """
 
-    image_urls = []
+    image_urls: list[str] = []
+    seen: set[str] = set()
 
     # clear any overlays that would intercept the gallery click
     _poll_cookie_consent(page)
@@ -606,15 +681,15 @@ def extract_gallery_images(page: Page) -> list[str]:
         last_button.click()
         pause(0.5, 1)
 
-        # collect all image src urls from the popup panel
-        popup_images = page.locator("#panel_sheet_images img")
+        # collect all image src urls from the popup panel only
+        popup = page.locator("#panel_sheet_images")
+        popup_images = popup.locator("img")
         popup_image_count = quick_locator_count(
             popup_images, description="gallery popup images"
         )
         for i in range(popup_image_count):
             src = popup_images.nth(i).get_attribute("src")
-            if src and src.startswith("http") and src not in image_urls:
-                image_urls.append(src)
+            _append_unique_image_url(image_urls, seen, src)
 
         # close the gallery popup
         close_button = page.locator('button:has(svg[data-icon="close"])').first
@@ -629,24 +704,37 @@ def extract_gallery_images(page: Page) -> list[str]:
         )
         for i in range(section_image_count):
             src = section_images.nth(i).get_attribute("src")
-            if src and src.startswith("http") and src not in image_urls:
-                image_urls.append(src)
+            _append_unique_image_url(image_urls, seen, src)
+
+    if len(image_urls) > _MAX_GALLERY_IMAGES:
+        print(
+            f"  Gallery returned {len(image_urls)} images "
+            f"(site max is {_MAX_GALLERY_IMAGES}); truncating"
+        )
+        image_urls = image_urls[:_MAX_GALLERY_IMAGES]
 
     return image_urls
 
 
 # EXTRACT LISTING DETAILS
 def extract_listing_details(
-    page: Page, hash_code: str, source_id: str | None
+    page: Page,
+    hash_code: str,
+    source_id: str | None,
+    fallback_title: str | None = None,
 ) -> tuple[ProspectListings, list[str]]:
     """
     Extract prospect listing fields from an individual listing detail page
     and return a populated ProspectListings instance along with gallery image URLs.
+    fallback_title is the search-card title, used when the detail-page h1 is a
+    section heading such as Highlights rather than the vehicle name.
     """
 
     return run_quick_page_action(
         page,
-        lambda: _extract_listing_details_impl(page, hash_code, source_id),
+        lambda: _extract_listing_details_impl(
+            page, hash_code, source_id, fallback_title
+        ),
         description="listing field extraction",
         timeout_ms=90_000,
     )
@@ -654,7 +742,10 @@ def extract_listing_details(
 
 # EXTRACT LISTING DETAILS IMPL
 def _extract_listing_details_impl(
-    page: Page, hash_code: str, source_id: str | None
+    page: Page,
+    hash_code: str,
+    source_id: str | None,
+    fallback_title: str | None = None,
 ) -> tuple[ProspectListings, list[str]]:
     """
     Populate a ProspectListings row and gallery image urls from the current
@@ -664,9 +755,18 @@ def _extract_listing_details_impl(
     url = page.url
     current_datetime = datetime.now()
 
-    # extract make_and_model from the h1
+    # prefer a real vehicle title over section headings like "Highlights" that
+    # can appear as the first section h1 when the page layout shifts
     h1_text = page.locator("section h1").first.text_content().strip()
-    make_and_model = h1_text
+    if _is_non_title_heading(h1_text):
+        make_and_model = (fallback_title or "").strip() or h1_text
+        if fallback_title:
+            print(
+                f"  Detail h1 was '{h1_text}'; using card title "
+                f"'{make_and_model}' instead"
+            )
+    else:
+        make_and_model = h1_text
 
     mileage = None
     mileage_unit = None
@@ -768,7 +868,7 @@ def _extract_listing_details_impl(
         status=ProspectListingStatus.NEW,
         url=url,
         make_and_model=make_and_model,
-        short_description=short_description or h1_text,
+        short_description=short_description or make_and_model,
         full_description=full_description,
         asking_price=asking_price,
         currency_symbol=currency_symbol,
@@ -1015,7 +1115,7 @@ def scrape_listings(
                     continue
 
                 prospect_listing, image_urls = extract_listing_details(
-                    page, hash_code, source_id
+                    page, hash_code, source_id, fallback_title=title
                 )
                 prospect_listing.status_checked_at = datetime.now()
                 new_count += 1
@@ -1073,7 +1173,7 @@ def scrape_listings(
                             shutil.rmtree(temp_image_dir)
                         delete_listing(prospect_listing, session)
                         new_count -= 1
-                        raise RuntimeError(
+                        raise PageUnresponsiveError(
                             f"partial image download for {listing_url} "
                             f"({saved_image_count}/{len(image_urls)} images saved)"
                         )
@@ -1100,7 +1200,15 @@ def scrape_listings(
                 # the chromium renderer or proxy exit ip is wedged; relaunch
                 # on a fresh decodo port rather than skipping listings silently
                 raise
+            except ProxySessionExpired:
+                # availability checks share the scrape deadline; when it elapses
+                # mid-sweep rotate immediately instead of skipping the listing
+                raise
             except Exception as e:
+                if is_proxy_network_error(e):
+                    # tunnel/connection failures mean the sticky session is dead;
+                    # rotate rather than skipping every remaining listing
+                    raise
                 if is_playwright_timeout(e):
                     if _unavailable_banner_in_page_html(page):
                         print(
@@ -1177,52 +1285,19 @@ def _open_session(playwright) -> tuple:
 # APPLY SEARCH FILTERS
 def _apply_search_filters(page: Page) -> str:
     """
-    Open the All filters overlay on the search page, select Cars, United
-    Kingdom, Advert and Private seller type, apply the filters, then sort the
-    results by Newest listed so the grid is ready to scrape. Returns the
-    canonical page-one search url including sort=latest.
+    Load the Cars / United Kingdom / Private seller search results sorted by
+    Newest listed. Filters are set via query parameters on the search URL
+    rather than the All filters overlay, which depends on hydrated client JS
+    that often fails to load behind Cloudflare on proxied sessions. Returns
+    the canonical page-one search url including sort=latest.
     """
 
     _dismiss_blocking_overlays(page, cookie_timeout=15000)
     pause_for_page(page)
 
-    # open the all filters overlay
-    pause_for_page(page)
-    page.locator('button:has(span:text-is("All filters"))').first.click()
-    wait_for_selector_with_backoff(
-        page,
-        'section:has(h2:text-is("Category"))',
-        state="attached",
-        description="all filters overlay",
-    )
-
-    # select category, country, listing type and seller type
-    pause_for_page(page)
-    page.locator(
-        'section:has(h2:text-is("Category")) button:has(span:text-is("Cars"))'
-    ).click()
-
-    pause_for_page(page)
-    page.locator(
-        'section:has(h2:text-is("Country")) '
-        'button:has(span:text-is("United Kingdom"))'
-    ).click()
-
-    pause_for_page(page)
-    page.locator(
-        'section:has(h2:text-is("Listing type")) '
-        'button:has(span:text-is("Advert"))'
-    ).click()
-
-    pause_for_page(page)
-    page.locator(
-        'section:has(h2:text-is("Seller type")) '
-        'button:has(span:text-is("Private"))'
-    ).click()
-
-    # apply the selected filters and wait for the results grid
-    pause_for_page(page)
-    page.locator('button:has-text("Show"):has-text("results")').click()
+    # navigate to the pre-filtered search url (cars, GB, private, newest)
+    goto_with_captcha_handling(page, _FILTERED_SEARCH_URL)
+    accept_cookies(page, wait_for_banner=True, timeout=8000)
     wait_for_selector_with_backoff(
         page,
         '[data-testid="card-listing"]',
@@ -1230,7 +1305,10 @@ def _apply_search_filters(page: Page) -> str:
         description="search results grid",
     )
 
-    _apply_newest_listed_sort(page)
+    # sort=latest is already on the url; only open the sort control if the
+    # page did not pick it up (e.g. a soft redirect dropped the param)
+    if not _is_sorted_by_newest(page):
+        _apply_newest_listed_sort(page)
 
     return _canonical_newest_search_url(page.url)
 

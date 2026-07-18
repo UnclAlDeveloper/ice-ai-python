@@ -1,8 +1,10 @@
 import os
 import tempfile
+import time
 from datetime import datetime
 from typing import TYPE_CHECKING, Optional
 
+from botocore.exceptions import BotoCoreError, ClientError, ConnectionClosedError
 from stealth_browser import Page
 
 from AWSAccess import AWSAccess
@@ -17,6 +19,10 @@ from models.enums import ListingSource, ListingTable
 
 if TYPE_CHECKING:
     from sqlalchemy.orm import Session
+
+# how many times to retry a single s3 put when the socket stalls or the
+# connection drops mid-upload (read timeouts now surface via awsaccess config)
+_S3_SAVE_ATTEMPTS = 3
 
 
 # GET PROSPECT IMAGES AWS ACCESS
@@ -77,6 +83,34 @@ def _download_image_bytes(
     return None
 
 
+# SAVE MEDIA WITH RETRY
+def _save_media_with_retry(
+    aws_access: AWSAccess, image_hash: str, extension: str, image_bytes: bytes
+) -> None:
+    """
+    Upload image bytes to S3, retrying transient timeouts and connection drops
+    so a single wedged put_object cannot stall the whole listing for minutes.
+    """
+
+    last_error: BaseException | None = None
+    for attempt in range(_S3_SAVE_ATTEMPTS):
+        try:
+            aws_access.save_media(image_hash, extension, image_bytes)
+            return
+        except (BotoCoreError, ClientError, ConnectionClosedError, OSError) as e:
+            last_error = e
+            if attempt < _S3_SAVE_ATTEMPTS - 1:
+                delay = 2.0 * (attempt + 1)
+                print(
+                    f"  S3 upload failed ({e}); retrying in {delay:.0f}s "
+                    f"({attempt + 2}/{_S3_SAVE_ATTEMPTS})..."
+                )
+                time.sleep(delay)
+    raise RuntimeError(
+        f"S3 upload failed after {_S3_SAVE_ATTEMPTS} attempts: {last_error}"
+    )
+
+
 # DOWNLOAD AND SAVE LISTING IMAGES
 def download_and_save_listing_images(
     image_urls: list[str],
@@ -99,6 +133,9 @@ def download_and_save_listing_images(
 
     # use aws access for saving and retrieving images from s3
     aws_access = _get_prospect_images_aws_access()
+
+    total = len(image_urls)
+    print(f"  Downloading {total} images...")
 
     saved_count = 0
     for index, img_url in enumerate(image_urls):
@@ -144,8 +181,8 @@ def download_and_save_listing_images(
             with open(temp_file_path, "wb") as f:
                 f.write(image_bytes)
 
-            # save to s3
-            aws_access.save_media(image_hash, extension, image_bytes)
+            # save to s3, with retries so a hung put surfaces and recovers
+            _save_media_with_retry(aws_access, image_hash, extension, image_bytes)
 
             # get the s3 url
             s3_url = aws_access.get_media_url(image_hash, extension)
@@ -161,8 +198,12 @@ def download_and_save_listing_images(
             session.add(image_record)
             saved_count += 1
 
+            # progress so a long gallery does not look like a freeze
+            if saved_count == 1 or saved_count % 10 == 0 or saved_count == total:
+                print(f"  Saved image {saved_count}/{total}")
+
         except Exception as e:
-            print(f"Error extracting image {index}: {e}")
+            print(f"Error extracting image {index + 1}/{total}: {e}")
             continue
 
     # commit all image records

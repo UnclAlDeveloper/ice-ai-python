@@ -20,6 +20,7 @@ from stealth_browser import (
     PageUnresponsiveError,
     goto_with_captcha_handling,
     is_captcha_present,
+    is_proxy_network_error,
     launch_stealth_chromium,
     new_stealth_page,
     wait_for_captcha_solve,
@@ -1523,7 +1524,7 @@ def read_full_prospect_listing(
             if temp_image_dir and os.path.isdir(temp_image_dir):
                 shutil.rmtree(temp_image_dir)
             delete_listing(prospect_listing, session)
-            raise RuntimeError(
+            raise PageUnresponsiveError(
                 f"partial image download for {url} "
                 f"({saved_image_count}/{image_url_count} images saved)"
             )
@@ -1814,6 +1815,8 @@ def scrape_listings(
                 # mid-sweep rotate immediately instead of skipping the listing
                 raise
             except Exception as e:
+                if is_proxy_network_error(e):
+                    raise
                 print(f"  Error processing listing, skipping: {e}")
 
         # advance to the next results page

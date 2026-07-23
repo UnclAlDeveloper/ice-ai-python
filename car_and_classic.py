@@ -61,7 +61,10 @@ UNAVAILABLE_ADVERT_TEXTS = (
     "This advert has now been removed through sale or otherwise",
 )
 
-CONFIG = ProxyRotationConfig.from_env_prefix("CAR_AND_CLASSIC")
+CONFIG = ProxyRotationConfig.from_env_prefix(
+    "CAR_AND_CLASSIC",
+    max_consecutive_captchas_before_rotation=3,
+)
 
 # cars in the UK from private sellers, newest first; applied via query params
 # because the All filters overlay needs client-side JS that Cloudflare often
@@ -1321,7 +1324,9 @@ def car_and_classic():
     timeouts) the browser is relaunched on a fresh proxy port and the sweep
     resumes on the same search-results page (page= query param) where it was
     interrupted; already-saved listings are skipped because scrape_listings
-    reloads the existing source ids from the database on each pass.
+    reloads the existing source ids from the database on each pass. When a
+    captcha is shown on three consecutive navigations the current exit IP is
+    rotated automatically even if CapSolver cleared the earlier challenges.
     """
 
     def setup(page: Page, resume: ScrapeResumeState) -> None:

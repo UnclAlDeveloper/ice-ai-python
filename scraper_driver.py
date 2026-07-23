@@ -28,10 +28,12 @@ from stealth_browser import (
     PageUnresponsiveError,
     check_proxy_health,
     close_browser_quietly,
+    configure_consecutive_captcha_rotation,
     goto_with_captcha_handling,
     is_navigation_timeout,
     is_proxy_network_error,
     is_target_closed_error,
+    reset_consecutive_captcha_count,
     sync_stealth_playwright,
 )
 
@@ -63,15 +65,19 @@ class ProxyRotationConfig:
     proxy_rotation_interval_minutes: float
     max_consecutive_setup_failures: int
     max_consecutive_db_failures: int
+    max_consecutive_captchas_before_rotation: int
     availability_max_load_retries: int
     availability_load_backoff_seconds: float
 
     # PROXY ROTATION CONFIG FROM ENV PREFIX
     @classmethod
-    def from_env_prefix(cls, prefix: str) -> "ProxyRotationConfig":
+    def from_env_prefix(
+        cls, prefix: str, **defaults: int | float
+    ) -> "ProxyRotationConfig":
         """
         Build a ProxyRotationConfig from environment variables whose names start
-        with the given prefix (e.g. AUTOTRADER_MAX_PROXY_ROTATIONS).
+        with the given prefix (e.g. AUTOTRADER_MAX_PROXY_ROTATIONS). Optional
+        keyword defaults apply when the corresponding env var is unset.
         """
 
         return cls(
@@ -84,6 +90,16 @@ class ProxyRotationConfig:
             ),
             max_consecutive_db_failures=int(
                 os.getenv(f"{prefix}_MAX_DB_FAILURES", "10")
+            ),
+            max_consecutive_captchas_before_rotation=int(
+                os.getenv(
+                    f"{prefix}_MAX_CONSECUTIVE_CAPTCHAS",
+                    str(
+                        defaults.get(
+                            "max_consecutive_captchas_before_rotation", 0
+                        )
+                    ),
+                )
             ),
             availability_max_load_retries=int(
                 os.getenv(f"{prefix}_AVAILABILITY_LOAD_RETRIES", "4")
@@ -441,6 +457,10 @@ def run_with_proxy_rotation(
 
     scrape_resume = ScrapeResumeState()
 
+    configure_consecutive_captcha_rotation(
+        config.max_consecutive_captchas_before_rotation
+    )
+
     with sync_stealth_playwright() as p:
         check_proxy_health(p)
 
@@ -454,6 +474,7 @@ def run_with_proxy_rotation(
                 established = False
                 try:
                     browser, page = open_session(p)
+                    reset_consecutive_captcha_count()
 
                     deadline = (
                         time.monotonic()

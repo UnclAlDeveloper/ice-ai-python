@@ -24,6 +24,8 @@ __all__ = [
     "Playwright",
     "check_proxy_health",
     "close_browser_quietly",
+    "configure_consecutive_captcha_rotation",
+    "reset_consecutive_captcha_count",
     "detect_captcha_task",
     "detect_cloudflare_interstitial",
     "detect_datadome_captcha_url",
@@ -134,6 +136,56 @@ class CaptchaSolveError(RuntimeError):
     Callers can treat this as a signal that the current exit IP is blocked and
     rotate the proxy rather than misclassifying the page being visited.
     """
+
+
+_consecutive_captcha_rotation_threshold = 0
+_consecutive_captcha_count = 0
+
+
+# CONFIGURE CONSECUTIVE CAPTCHA ROTATION
+def configure_consecutive_captcha_rotation(threshold: int) -> None:
+    """
+    Enable automatic proxy rotation after threshold consecutive captcha encounters
+    on separate navigations. A value of zero disables the feature. Resets the
+    running encounter count.
+    """
+
+    global _consecutive_captcha_rotation_threshold, _consecutive_captcha_count
+
+    _consecutive_captcha_rotation_threshold = max(0, threshold)
+    _consecutive_captcha_count = 0
+
+
+# RESET CONSECUTIVE CAPTCHA COUNT
+def reset_consecutive_captcha_count() -> None:
+    """
+    Clear the consecutive captcha encounter counter, for example after a proxy
+    rotation opens a fresh browser session.
+    """
+
+    global _consecutive_captcha_count
+
+    _consecutive_captcha_count = 0
+
+
+# RECORD CONSECUTIVE CAPTCHA ENCOUNTER
+def _record_consecutive_captcha_encounter() -> None:
+    """
+    Increment the consecutive captcha counter and raise CaptchaSolveError once
+    the configured threshold is reached so callers rotate to a new exit IP.
+    """
+
+    global _consecutive_captcha_count
+
+    if _consecutive_captcha_rotation_threshold <= 0:
+        return
+
+    _consecutive_captcha_count += 1
+    if _consecutive_captcha_count >= _consecutive_captcha_rotation_threshold:
+        raise CaptchaSolveError(
+            f"CAPTCHA encountered {_consecutive_captcha_count} times in a row; "
+            "rotating proxy to a fresh exit IP."
+        )
 
 
 # PAGE UNRESPONSIVE ERROR
@@ -1522,6 +1574,8 @@ def wait_for_captcha_solve(page: Page, max_attempts: int = 3) -> None:
     if not is_captcha_present(page):
         return
 
+    _record_consecutive_captcha_encounter()
+
     # record the offending url for diagnostics in any failure branch
     current_url = ""
     try:
@@ -1673,6 +1727,7 @@ def goto_with_captcha_handling(
                 wait_for_captcha_solve(page)
                 continue
 
+            reset_consecutive_captcha_count()
             return response
         except CaptchaSolveError:
             raise

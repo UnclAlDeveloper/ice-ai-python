@@ -1,7 +1,35 @@
 import os
+import re
+import tempfile
 from pathlib import Path
 
 from dotenv import load_dotenv
+
+
+# NORMALIZE TEMP ENVIRONMENT
+def _normalize_temp_environment() -> None:
+    """
+    Replace unusable TMPDIR/TEMP/TMP values with a real temp directory for this
+    OS. Windows PyCharm often injects C:\\Users\\...\\AppData\\Local\\Temp into
+    remote Linux runs; Playwright then fails mkdtemp for playwright-artifacts-*.
+    """
+
+    # python's gettempdir already skips non-existent candidates, so it stays valid
+    # even when TEMP points at a Windows path that does not exist on Linux
+    fallback_temp_dir = tempfile.gettempdir()
+    for name in ("TMPDIR", "TEMP", "TMP"):
+        value = os.getenv(name, "").strip()
+        if not value:
+            os.environ[name] = fallback_temp_dir
+            continue
+
+        # drop drive-letter paths inherited from a Windows host into Linux
+        if os.name != "nt" and re.match(r"^[A-Za-z]:[\\/]", value):
+            os.environ[name] = fallback_temp_dir
+            continue
+
+        if not os.path.isdir(value):
+            os.environ[name] = fallback_temp_dir
 
 
 # LOAD ENVIRONMENT
@@ -55,3 +83,6 @@ def load_environment():
             f"Warning: override env file {override_env_file} not found. "
             "Using base/system environment variables only."
         )
+
+    # scrub windows temp paths before playwright or other tools inherit them
+    _normalize_temp_environment()

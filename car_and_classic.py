@@ -1,3 +1,10 @@
+import sys
+import playwright
+import os
+
+print("PYTHONPATH =", os.environ.get("PYTHONPATH"))
+
+import json
 import os
 import random
 import re
@@ -142,6 +149,244 @@ def _append_unique_image_url(image_urls: list[str], seen: set[str], src: str | N
         return
     seen.add(key)
     image_urls.append(src)
+
+
+# MERGE IMAGE URL LISTS
+def _merge_image_url_lists(*sources: list[str]) -> list[str]:
+    """
+    Merge multiple image url lists, de-duplicating by normalised path and
+    keeping the first url variant encountered for each photo.
+    """
+
+    image_urls: list[str] = []
+    seen: set[str] = set()
+    for source in sources:
+        for src in source:
+            _append_unique_image_url(image_urls, seen, src)
+    return image_urls
+
+
+# INERTIA GALLERY IMAGES MARKER
+_INERTIA_GALLERY_IMAGES_MARKER = '"images":[{"xs":'
+
+# INERTIA GALLERY IMAGE SIZES
+_INERTIA_GALLERY_IMAGE_SIZES = ("xxl", "xl", "lg", "md", "sm", "xs")
+
+
+# FIND JSON ARRAY END
+def _find_json_array_end(content: str, start: int) -> int | None:
+    """
+    Return the index one past the closing bracket of a JSON array that starts
+    at start, or None when the array is not well-formed.
+    """
+
+    if start >= len(content) or content[start] != "[":
+        return None
+
+    depth = 0
+    in_string = False
+    escape = False
+    for index in range(start, len(content)):
+        character = content[index]
+        if in_string:
+            if escape:
+                escape = False
+            elif character == "\\":
+                escape = True
+            elif character == '"':
+                in_string = False
+            continue
+        if character == '"':
+            in_string = True
+        elif character == "[":
+            depth += 1
+        elif character == "]":
+            depth -= 1
+            if depth == 0:
+                return index + 1
+    return None
+
+
+# EXTRACT GALLERY IMAGES FROM INERTIA HTML
+def _extract_gallery_images_from_inertia_html(content: str) -> list[str]:
+    """
+    Parse the embedded Inertia gallery payload from listing page HTML. Car &
+    Classic embeds a responsive images array (xs through xxl) with every photo
+    for the listing; this is more complete than the visible gallery thumbnails.
+    """
+
+    marker_index = content.find(_INERTIA_GALLERY_IMAGES_MARKER)
+    if marker_index < 0:
+        return []
+
+    array_start = marker_index + len('"images":')
+    array_end = _find_json_array_end(content, array_start)
+    if array_end is None:
+        return []
+
+    try:
+        images_data = json.loads(content[array_start:array_end])
+    except json.JSONDecodeError:
+        return []
+
+    image_urls: list[str] = []
+    seen: set[str] = set()
+    for entry in images_data:
+        if not isinstance(entry, dict):
+            continue
+
+        # pick the largest available responsive size for each photo
+        src = None
+        for size in _INERTIA_GALLERY_IMAGE_SIZES:
+            size_entry = entry.get(size)
+            if isinstance(size_entry, dict):
+                src = size_entry.get("src")
+                if src:
+                    break
+        if src:
+            _append_unique_image_url(image_urls, seen, src.replace("\\/", "/"))
+
+    return image_urls
+
+
+# EXTRACT GALLERY IMAGES FROM STRUCTURED HTML
+def _extract_gallery_images_from_structured_html(content: str) -> list[str]:
+    """
+    Collect gallery image URLs from JSON-LD and Open Graph meta tags when DOM
+    extraction and the Inertia gallery payload are unavailable.
+    """
+
+    image_urls: list[str] = []
+    seen: set[str] = set()
+
+    for match in re.finditer(
+        r'<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>',
+        content,
+        re.DOTALL | re.IGNORECASE,
+    ):
+        try:
+            data = json.loads(match.group(1))
+        except json.JSONDecodeError:
+            continue
+
+        objects: list[object]
+        if isinstance(data, list):
+            objects = data
+        elif isinstance(data, dict) and isinstance(data.get("@graph"), list):
+            objects = data["@graph"]
+        else:
+            objects = [data]
+
+        for obj in objects:
+            if not isinstance(obj, dict):
+                continue
+            obj_type = obj.get("@type", "")
+            types = obj_type if isinstance(obj_type, list) else [obj_type]
+            if not any(item in ("Car", "Product", "Vehicle") for item in types):
+                continue
+
+            images = obj.get("image", [])
+            if isinstance(images, str):
+                images = [images]
+            for url in images:
+                _append_unique_image_url(image_urls, seen, str(url))
+
+    if image_urls:
+        return image_urls
+
+    for match in re.finditer(
+        r'<meta[^>]+(?:property|name)=["\'](?:og:image(?::url)?|twitter:image:src)["\'][^>]+content=["\']([^"\']+)["\']',
+        content,
+        re.IGNORECASE,
+    ):
+        _append_unique_image_url(image_urls, seen, match.group(1).replace("&amp;", "&"))
+
+    for match in re.finditer(
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:property|name)=["\'](?:og:image(?::url)?|twitter:image:src)["\']',
+        content,
+        re.IGNORECASE,
+    ):
+        _append_unique_image_url(image_urls, seen, match.group(1).replace("&amp;", "&"))
+
+    return image_urls
+
+
+# COLLECT GALLERY SECTION IMAGES
+def _collect_gallery_section_images(
+    gallery_section,
+    image_urls: list[str],
+    seen: set[str],
+) -> None:
+    """
+    Append image src urls from img elements inside the gallery section.
+    """
+
+    section_images = gallery_section.locator("img")
+    section_image_count = quick_locator_count(
+        section_images, description="gallery section images"
+    )
+    for index in range(section_image_count):
+        src = section_images.nth(index).get_attribute("src")
+        _append_unique_image_url(image_urls, seen, src)
+
+
+# EXTRACT GALLERY IMAGES FROM DOM
+def _extract_gallery_images_from_dom(page: Page) -> list[str]:
+    """
+    Collect image URLs from the Gallery section via Playwright locators. Visible
+    thumbnails are always collected; when a camera icon opens a full gallery
+    sheet, additional URLs are merged from the popup when present.
+    """
+
+    image_urls: list[str] = []
+    seen: set[str] = set()
+
+    gallery_section = page.locator('section:has(h2:text("Gallery"))')
+    if quick_locator_count(gallery_section, description="gallery section") == 0:
+        return image_urls
+
+    gallery_buttons = gallery_section.locator("button")
+    if quick_locator_count(gallery_buttons, description="gallery buttons") == 0:
+        _collect_gallery_section_images(gallery_section, image_urls, seen)
+        return image_urls
+
+    last_button = gallery_buttons.last
+    has_camera_icon = (
+        quick_locator_count(
+            last_button.locator('svg[data-icon="camera"]'),
+            description="gallery camera icon",
+        )
+        > 0
+    )
+
+    # always collect the thumbnails already rendered in the gallery grid
+    _collect_gallery_section_images(gallery_section, image_urls, seen)
+
+    if has_camera_icon:
+        # try to open the full gallery sheet for any photos not yet visible
+        last_button.click()
+        pause(0.5, 1)
+
+        for popup_selector in (
+            "#panel_sheet_images img",
+            ".pswp img",
+            "[role='dialog'] img",
+        ):
+            popup_images = page.locator(popup_selector)
+            popup_image_count = quick_locator_count(
+                popup_images,
+                description=f"gallery popup images ({popup_selector})",
+            )
+            for index in range(popup_image_count):
+                src = popup_images.nth(index).get_attribute("src")
+                _append_unique_image_url(image_urls, seen, src)
+
+        close_button = page.locator('button:has(svg[data-icon="close"])').first
+        if close_button.is_visible():
+            close_button.click()
+            pause(0.5, 1)
+
+    return image_urls
 
 # conservative sold phrases in the first description paragraph only
 DESCRIPTION_SOLD_PHRASE = re.compile(
@@ -648,66 +893,40 @@ def dismiss_inertia_error_dialog(page: Page) -> bool:
 # EXTRACT GALLERY IMAGES
 def extract_gallery_images(page: Page) -> list[str]:
     """
-    Collect image URLs from the Gallery section. If the last button contains a
-    camera icon, click it to open the full gallery popup and collect URLs from
-    there. Otherwise all images are already visible on the detail page, so
-    collect URLs directly from the gallery section. URLs are de-duplicated by
-    path (ignoring CDN size query params) and capped at the site photo limit.
+    Collect image URLs for a listing from every available source and merge
+    them. Car & Classic uses several gallery layouts, so this combines the
+    embedded Inertia payload, DOM gallery thumbnails and popup sheet, and
+    JSON-LD / Open Graph fallbacks. URLs are de-duplicated by path (ignoring
+    CDN size query params) and capped at the site photo limit.
     """
-
-    image_urls: list[str] = []
-    seen: set[str] = set()
 
     # clear any overlays that would intercept the gallery click
     _poll_cookie_consent(page)
     dismiss_inertia_error_dialog(page)
 
-    gallery_section = page.locator('section:has(h2:text("Gallery"))')
-    if quick_locator_count(gallery_section, description="gallery section") == 0:
-        return image_urls
+    page_content = ""
+    try:
+        page_content = page_html(page)
+    except Exception:
+        pass
 
-    gallery_buttons = gallery_section.locator("button")
-    if quick_locator_count(gallery_buttons, description="gallery buttons") == 0:
-        return image_urls
-
-    last_button = gallery_buttons.last
-    has_camera_icon = (
-        quick_locator_count(
-            last_button.locator('svg[data-icon="camera"]'),
-            description="gallery camera icon",
-        )
-        > 0
+    inertia_urls = (
+        _extract_gallery_images_from_inertia_html(page_content)
+        if page_content
+        else []
+    )
+    dom_urls = _extract_gallery_images_from_dom(page)
+    structured_urls = (
+        _extract_gallery_images_from_structured_html(page_content)
+        if page_content
+        else []
     )
 
-    if has_camera_icon:
-        # click the last button to open the full gallery popup
-        last_button.click()
-        pause(0.5, 1)
-
-        # collect all image src urls from the popup panel only
-        popup = page.locator("#panel_sheet_images")
-        popup_images = popup.locator("img")
-        popup_image_count = quick_locator_count(
-            popup_images, description="gallery popup images"
-        )
-        for i in range(popup_image_count):
-            src = popup_images.nth(i).get_attribute("src")
-            _append_unique_image_url(image_urls, seen, src)
-
-        # close the gallery popup
-        close_button = page.locator('button:has(svg[data-icon="close"])').first
-        if close_button.is_visible():
-            close_button.click()
-            pause(0.5, 1)
-    else:
-        # all images are visible on the detail page already
-        section_images = gallery_section.locator("img")
-        section_image_count = quick_locator_count(
-            section_images, description="gallery section images"
-        )
-        for i in range(section_image_count):
-            src = section_images.nth(i).get_attribute("src")
-            _append_unique_image_url(image_urls, seen, src)
+    image_urls = _merge_image_url_lists(
+        inertia_urls,
+        dom_urls,
+        structured_urls,
+    )
 
     if len(image_urls) > _MAX_GALLERY_IMAGES:
         print(

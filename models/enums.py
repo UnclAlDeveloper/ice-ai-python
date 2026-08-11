@@ -28,6 +28,7 @@ class ListingSource(StrEnum):
     GUMTREE = "Gumtree"
     MANUAL_ENTRY = "ManualEntry"
     ONLYVANS = "OnlyVans"
+    PISTONHEADS = "Pistonheads"
 
 
 # LISTING TABLE

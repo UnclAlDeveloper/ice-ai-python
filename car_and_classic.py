@@ -57,6 +57,21 @@ from scraper_driver import (
     ProxyRotationConfig,
     ProxySessionExpired,
     ScrapeResumeState,
+    log_already_exists,
+    log_already_processed,
+    log_listing_error,
+    log_loaded_source_ids,
+    log_no_listings_on_page,
+    log_not_available,
+    log_paginating_start,
+    log_partial_save,
+    log_repeat_page,
+    log_resume_scrape,
+    log_results_page,
+    log_saved_listing,
+    log_scrape_finished,
+    log_sold_under_offer_card,
+    log_timestamp,
     persist_unavailable_listing_stub,
     run_with_proxy_rotation,
     search_results_present,
@@ -110,6 +125,9 @@ _NON_TITLE_HEADINGS = frozenset(
 # car & classic allows at most 100 photos per advert; anything beyond that is
 # almost certainly gallery-extraction noise (thumbnails, related cars, etc.)
 _MAX_GALLERY_IMAGES = 100
+
+# cap search pagination at 20 pages (~60 cards per page, ~1200 listings total)
+_MAX_SEARCH_PAGES = 20
 
 
 # IS NON TITLE HEADING
@@ -1155,8 +1173,8 @@ def scrape_listings(
     resume: ScrapeResumeState | None = None,
 ):
     """
-    Walk every page of Car & Classic search results and save new listings.
-    Each results page is loaded via the page= query parameter on the canonical
+    Walk up to _MAX_SEARCH_PAGES of Car & Classic search results and save new
+    listings. Each results page is loaded via the page= query parameter on the canonical
     search url (including sort=latest), listing cards are snapshotted, then each
     candidate is visited directly without returning to the grid between items.
     When deadline (a time.monotonic value) is given, raises ProxySessionExpired
@@ -1167,7 +1185,7 @@ def scrape_listings(
     """
 
     existing_source_ids = get_existing_source_ids(ListingSource.CAR_AND_CLASSIC)
-    print(f"Loaded {len(existing_source_ids)} existing source ids from database")
+    log_loaded_source_ids(len(existing_source_ids))
 
     database_url = os.getenv("AUTO_ADS_DATABASE_URL")
     engine = create_engine_with_retry(database_url)
@@ -1181,12 +1199,9 @@ def scrape_listings(
 
     if resume is not None and resume.search_url is not None:
         search_url = with_page_param(resume.search_url, 1)
-        print(
-            f"Resuming listings scrape at page {page_number} "
-            f"({len(processed_ids)} listings already processed)"
-        )
+        log_resume_scrape(page_number, len(processed_ids))
 
-    print("Paginating to load all Car & Classic listings...\n")
+    log_paginating_start("Car & Classic")
 
     while True:
         page_url = with_page_param(search_url, page_number)
@@ -1195,10 +1210,7 @@ def scrape_listings(
         pause_for_page(page)
 
         if not search_results_present(page, _SEARCH_RESULTS_CARD_SELECTOR):
-            print(
-                f"No listings on results page {page_number}; reached the end "
-                f"of the result set"
-            )
+            log_no_listings_on_page(page_number)
             break
 
         if use_new_section is None:
@@ -1220,24 +1232,17 @@ def scrape_listings(
         page_listing_ids = {card_id for card_id, _, _, _ in listing_candidates}
 
         if page_listing_ids and page_listing_ids == previous_page_listing_ids:
-            print(
-                f"Results page {page_number} repeats the previous page; "
-                f"reached the end of the result set"
-            )
+            log_repeat_page(page_number)
             break
         previous_page_listing_ids = page_listing_ids
 
-        print(
-            f"\n--- Page {page_number} ({len(listing_candidates)} listings) ---"
-        )
+        log_results_page(page_number, len(listing_candidates))
 
         for index, (card_id, listing_url, source_id, title) in enumerate(
             listing_candidates, start=1
         ):
             if card_id in processed_ids:
-                print(
-                    f"  [{index}] {title} — already processed this run, skipping"
-                )
+                log_already_processed(index, title)
                 continue
 
             # record position before each listing so proxy rotation can resume here
@@ -1255,7 +1260,7 @@ def scrape_listings(
                 )
 
             if source_id is not None and source_id in existing_source_ids:
-                print(f"  [{index}] {title} — already exists, skipping")
+                log_already_exists(index, title)
                 processed_ids.add(card_id)
                 continue
 
@@ -1269,10 +1274,7 @@ def scrape_listings(
             # skip sold/under-offer listings from the card title without a
             # detail-page visit when the marker is already visible
             if is_title_sold_or_under_offer(title):
-                print(
-                    f"  [{index}] {title} — sold/under offer (card title), "
-                    f"skipping"
-                )
+                log_sold_under_offer_card(index, title)
                 with SessionLocal() as session:
                     persist_unavailable_listing_stub(
                         session,
@@ -1292,6 +1294,8 @@ def scrape_listings(
             # process each listing inside a guard so one bad listing cannot
             # abort the whole sweep; every candidate url comes from the snapshot
             # so a failure just moves on to the next without re-reading the page
+            log_timestamp()
+
             try:
                 # navigate to the listing via its href instead of clicking the
                 # card, because the anchor is overlaid by a sibling that
@@ -1310,10 +1314,7 @@ def scrape_listings(
                         if is_http_not_found(response)
                         else "unavailable"
                     )
-                    print(
-                        f"  [{index}] {title} — NotAvailable ({reason}), "
-                        f"skipping"
-                    )
+                    log_not_available(index, title, reason)
                     h1 = page.locator("section h1").first
                     make_and_model = (
                         h1.text_content().strip()
@@ -1341,12 +1342,6 @@ def scrape_listings(
                 )
                 prospect_listing.status_checked_at = datetime.now()
                 new_count += 1
-                print(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-                print(f"  [{index}] {title}")
-                print(f"      make_and_model: {prospect_listing.make_and_model}")
-                print(f"      year: {prospect_listing.year}")
-                print(f"      location: {prospect_listing.location}")
-                print(f"      images: {len(image_urls)}")
 
                 # save to database and download images
                 with SessionLocal() as session:
@@ -1361,6 +1356,17 @@ def scrape_listings(
 
                     with_db_retry(
                         persist_listing, description="persist prospect listing"
+                    )
+
+                    # log details once fields and gallery urls are known, before
+                    # the slow download / ai work
+                    log_saved_listing(
+                        index,
+                        title,
+                        make_and_model=prospect_listing.make_and_model,
+                        year=prospect_listing.year,
+                        location=prospect_listing.location,
+                        image_count=len(image_urls),
                     )
 
                     temp_image_dir = download_and_save_listing_images(
@@ -1386,10 +1392,11 @@ def scrape_listings(
                     # the whole listing (row, images and s3 objects) so it is not
                     # kept incomplete and gets re-fetched cleanly on a later pass
                     if image_urls and saved_image_count < len(image_urls):
-                        print(
-                            f"      Partial save "
-                            f"({saved_image_count}/{len(image_urls)} images) — "
-                            f"deleting listing {prospect_listing.id}"
+                        log_partial_save(
+                            index,
+                            saved_image_count,
+                            len(image_urls),
+                            prospect_listing.id,
                         )
                         if temp_image_dir and os.path.isdir(temp_image_dir):
                             shutil.rmtree(temp_image_dir)
@@ -1410,9 +1417,27 @@ def scrape_listings(
                     if temp_image_dir and os.path.isdir(temp_image_dir):
                         shutil.rmtree(temp_image_dir)
 
+                    # reload column values before the session closes: the
+                    # ai-analysis commit expires attributes, and an expired
+                    # instance cannot be read after detach (DetachedInstanceError)
+                    session.refresh(prospect_listing)
+
+                log_timestamp()
+
                 if source_id is not None:
                     existing_source_ids.add(source_id)
                 processed_ids.add(card_id)
+
+                # after each newly saved listing, run a randomized availability sweep
+                update_new_listings_availability(
+                    page,
+                    listing_source=ListingSource.CAR_AND_CLASSIC,
+                    is_unavailable_fn=is_listing_no_longer_available,
+                    limit=random.randint(1, 4),
+                    config=CONFIG,
+                    deadline=deadline,
+                    listing_type=ListingType.CLASSIC,
+                )
 
             except CaptchaSolveError:
                 # an unsolved challenge will block the rest of the sweep on
@@ -1433,10 +1458,7 @@ def scrape_listings(
                     raise
                 if is_playwright_timeout(e):
                     if _unavailable_banner_in_page_html(page):
-                        print(
-                            f"  [{index}] {title} — NotAvailable (unavailable), "
-                            f"skipping"
-                        )
+                        log_not_available(index, title, "unavailable")
                         with SessionLocal() as session:
                             persist_unavailable_listing_stub(
                                 session,
@@ -1457,21 +1479,17 @@ def scrape_listings(
                         f"listing page timed out for {listing_url}"
                     ) from e
 
-                print(f"  [{index}] {title} — error, skipping: {e}")
-
-        # batch availability checks once per results page so the browser is not
-        # navigated away from the scrape context after every new listing
-        update_new_listings_availability(
-            page,
-            listing_source=ListingSource.CAR_AND_CLASSIC,
-            is_unavailable_fn=is_listing_no_longer_available,
-            limit=random.randint(1, 4),
-            config=CONFIG,
-            deadline=deadline,
-        )
+                log_listing_error(index, title, e)
 
         # new-vehicles section has no pagination, so stop after one pass
         if use_new_section:
+            break
+
+        if page_number >= _MAX_SEARCH_PAGES:
+            print(
+                f"Reached max search pages ({_MAX_SEARCH_PAGES}); "
+                "stopping pagination"
+            )
             break
 
         page_number += 1
@@ -1480,7 +1498,7 @@ def scrape_listings(
             resume.processed_ids = processed_ids
         pause_for_page(page, min_seconds=1.0, max_seconds=2.0)
 
-    print(f"\nFinished — {page_number} page(s) scraped, {new_count} new listing(s).")
+    log_scrape_finished(page_number, new_count, len(processed_ids))
 
 
 # OPEN SESSION

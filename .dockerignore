@@ -4,6 +4,7 @@
 __pycache__/
 *.pyc
 *.pyo
+*.log
 nohup.out
 data/
 *.ipynb

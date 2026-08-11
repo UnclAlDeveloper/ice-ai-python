@@ -124,6 +124,183 @@ class ScrapeResumeState:
     processed_ids: set[str] = field(default_factory=set)
 
 
+# LOG TIMESTAMP
+def log_timestamp() -> None:
+    """Print the current local date and time on its own line."""
+
+    print(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+
+# LOG LOADED SOURCE IDS
+def log_loaded_source_ids(count: int) -> None:
+    """Print how many listing source ids were loaded from the database."""
+
+    print(f"Loaded {count} existing source ids from database")
+
+
+# LOG RESUME SCRAPE
+def log_resume_scrape(page_number: int, processed_count: int) -> None:
+    """Print where a listings scrape will resume after proxy rotation."""
+
+    print(
+        f"Resuming listings scrape at page {page_number} "
+        f"({processed_count} listings already processed)"
+    )
+
+
+# LOG PAGINATING START
+def log_paginating_start(source_label: str) -> None:
+    """Print the start of a paginated listings sweep."""
+
+    print(f"Paginating to load all {source_label} listings...\n")
+
+
+# LOG NO LISTINGS ON PAGE
+def log_no_listings_on_page(page_number: int) -> None:
+    """Print that a results page is empty and pagination should stop."""
+
+    print(
+        f"No listings on results page {page_number}; reached the end "
+        f"of the result set"
+    )
+
+
+# LOG REPEAT PAGE
+def log_repeat_page(page_number: int) -> None:
+    """Print that a results page duplicates the previous page."""
+
+    print(
+        f"Results page {page_number} repeats the previous page; "
+        f"reached the end of the result set"
+    )
+
+
+# LOG RESULTS PAGE
+def log_results_page(page_number: int, listing_count: int) -> None:
+    """Print a results-page header with its listing count."""
+
+    print(f"\n--- Page {page_number} ({listing_count} listings) ---")
+
+
+# LOG ALREADY PROCESSED
+def log_already_processed(index: int, title: str) -> None:
+    """Print that a listing card was already handled in this run."""
+
+    print(f"  [{index}] {title} — already processed this run, skipping")
+
+
+# LOG ALREADY EXISTS
+def log_already_exists(index: int, title: str) -> None:
+    """Print that a listing is already stored in the database."""
+
+    print(f"  [{index}] {title} — already exists, skipping")
+
+
+# LOG PROCESSING NEW LISTING
+def log_processing_new_listing(
+    index: int,
+    title: str,
+    listing_url: str,
+    source_id: str | None = None,
+) -> None:
+    """
+    Announce a new listing before navigating to its detail page so the log
+    matches the browser and is not mistaken for a stuck results page.
+    """
+
+    log_timestamp()
+    if source_id is not None:
+        print(
+            f"  [{index}] Processing new listing (source_id: {source_id}): "
+            f"{title}"
+        )
+    else:
+        print(f"  [{index}] Processing new listing: {title}")
+    print(f"      {listing_url}")
+
+
+# LOG NOT AVAILABLE
+def log_not_available(index: int, title: str, reason: str) -> None:
+    """Print that a listing is no longer available and will be skipped."""
+
+    print(f"  [{index}] {title} — NotAvailable ({reason}), skipping")
+
+
+# LOG SOLD UNDER OFFER CARD
+def log_sold_under_offer_card(index: int, title: str) -> None:
+    """Print that a search-card title indicates sold or under offer."""
+
+    print(f"  [{index}] {title} — sold/under offer (card title), skipping")
+
+
+# LOG SAVED LISTING
+def log_saved_listing(
+    index: int,
+    title: str,
+    *,
+    make_and_model: str | None = None,
+    year: int | None = None,
+    location: str | None = None,
+    image_count: int | None = None,
+) -> None:
+    """
+    Print a multi-line summary of extracted listing details. Call this after
+    fields (and gallery url count) are known, and before image download / AI
+    analysis, so long-running work is attributed to a visible listing.
+    """
+
+    print(f"  [{index}] {title}")
+    if make_and_model is not None:
+        print(f"      make_and_model: {make_and_model}")
+    if year is not None:
+        print(f"      year: {year}")
+    if location is not None:
+        print(f"      location: {location}")
+    if image_count is not None:
+        print(f"      images: {image_count}")
+
+
+# LOG PARTIAL SAVE
+def log_partial_save(
+    index: int, saved_count: int, total_count: int, listing_id: int
+) -> None:
+    """Print that a listing save was incomplete and is being rolled back."""
+
+    print(
+        f"  [{index}] Partial save "
+        f"({saved_count}/{total_count} images) — "
+        f"deleting listing {listing_id}"
+    )
+
+
+# LOG LISTING ERROR
+def log_listing_error(index: int, title: str, error: Exception | str) -> None:
+    """Print that a single listing failed and will be skipped."""
+
+    print(f"  [{index}] {title} — error, skipping: {error}")
+
+
+# LOG SKIPPING
+def log_skipping(index: int, title: str, reason: str) -> None:
+    """Print a generic skip reason for a listing card."""
+
+    print(f"  [{index}] {title} — {reason}")
+
+
+# LOG SCRAPE FINISHED
+def log_scrape_finished(
+    page_count: int, new_count: int, processed_count: int | None = None
+) -> None:
+    """Print the end-of-run summary for a listings scrape."""
+
+    print(
+        f"\nFinished — {page_count} page(s) scraped, "
+        f"{new_count} new listing(s)."
+    )
+    if processed_count is not None:
+        print(f"Processed {processed_count} listings")
+
+
 # WITH PAGE PARAM
 def with_page_param(url: str, page_number: int) -> str:
     """

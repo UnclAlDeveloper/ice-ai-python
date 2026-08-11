@@ -34,6 +34,9 @@ GEMINI_MAX_IMAGES_PER_REQUEST = 3600
 # GEMINI INLINE REQUEST SIZE LIMIT BYTES
 GEMINI_INLINE_REQUEST_SIZE_LIMIT_BYTES = 20 * 1024 * 1024
 
+# GEMINI MAX INLINE FILE BYTES
+GEMINI_MAX_INLINE_FILE_BYTES = 7 * 1024 * 1024
+
 
 # CONVERT FOUND LISTING TO MARKDOWN
 def convert_prospect_listing_to_markdown(prospect_listing: ProspectListings) -> str:
@@ -171,10 +174,12 @@ def generate_ai_analysis(
         ),
     )
 
-    # build the contents list with the text prompt
+    # build the contents list with the text prompt; track payload size so the
+    # inline request stays under Gemini's 20 MB limit
     contents = [full_prompt]
     image_count = 0
-    inline_image_bytes = 0
+    skipped_oversize_files = 0
+    inline_payload_bytes = len(full_prompt.encode("utf-8"))
 
     # add images from temp directory if provided
     if temp_image_dir and os.path.isdir(temp_image_dir):
@@ -209,25 +214,44 @@ def generate_ai_analysis(
                 )
                 break
 
+            # check size before reading so oversized files never enter the payload
+            file_size = os.path.getsize(file_path)
+            if file_size > GEMINI_MAX_INLINE_FILE_BYTES:
+                skipped_oversize_files += 1
+                print(
+                    f"  Skipping {filename} ({file_size / (1024 * 1024):.1f} MB); "
+                    f"exceeds Gemini's {GEMINI_MAX_INLINE_FILE_BYTES // (1024 * 1024)} MB "
+                    f"per-file inline limit"
+                )
+                continue
+
+            if inline_payload_bytes + file_size > GEMINI_INLINE_REQUEST_SIZE_LIMIT_BYTES:
+                print(
+                    f"  Stopping image upload at {image_count} images "
+                    f"({inline_payload_bytes / (1024 * 1024):.1f} MB); "
+                    f"adding {filename} ({file_size / (1024 * 1024):.1f} MB) would "
+                    f"exceed Gemini's {GEMINI_INLINE_REQUEST_SIZE_LIMIT_BYTES // (1024 * 1024)} MB "
+                    f"per-request limit"
+                )
+                break
+
             # read the image bytes and create a Part
             with open(file_path, "rb") as f:
                 image_bytes = f.read()
 
-            inline_image_bytes += len(image_bytes)
+            inline_payload_bytes += len(image_bytes)
             image_part = types.Part.from_bytes(data=image_bytes, mime_type=mime_type)
             contents.append(image_part)
             image_count += 1
 
+    if skipped_oversize_files:
+        print(f"  Skipped {skipped_oversize_files} image(s) over the per-file size limit")
+
     print(
         f"  Requesting Gemini analysis ({model_name}, {image_count} images, "
-        f"{inline_image_bytes / (1024 * 1024):.1f} MB inline payload, "
+        f"{inline_payload_bytes / (1024 * 1024):.1f} MB inline payload, "
         f"timeout {GEMINI_REQUEST_TIMEOUT_MS // 60_000} min)..."
     )
-    if inline_image_bytes > GEMINI_INLINE_REQUEST_SIZE_LIMIT_BYTES:
-        print(
-            "  Warning: inline image payload exceeds Gemini's 20 MB per-request "
-            "limit; the API call may fail or hang"
-        )
 
     # generate the content
     response = client.models.generate_content(model=model_name, contents=contents)

@@ -16,7 +16,9 @@ WORKDIR /app
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-RUN playwright install --with-deps chromium
+# install real google chrome for stealth launches (channel=chrome) plus the
+# bundled chromium build as a fallback when the chrome channel is unavailable
+RUN playwright install --with-deps chrome chromium
 
 COPY . .
 COPY .bashrc /root/.bashrc

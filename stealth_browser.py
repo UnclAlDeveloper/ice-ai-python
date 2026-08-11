@@ -1,7 +1,9 @@
 import itertools
 import os
 import re
+import shutil
 import signal
+import subprocess
 import threading
 import time
 import uuid
@@ -55,20 +57,109 @@ __all__ = [
 # CapSolver's AntiCloudflareTask only accepts a Windows Chrome user agent, and
 # Cloudflare cross-checks the user agent against the Sec-CH-UA client hints, so
 # the whole session must present one coherent Windows Chrome identity even
-# though it runs on Linux. The major version tracks the bundled Chromium build;
-# override via env when Playwright ships a newer Chromium.
-STEALTH_CHROME_MAJOR = os.getenv("STEALTH_CHROME_MAJOR", "148")
+# though it runs on Linux. Prefer a real Google Chrome channel over Playwright's
+# "Chrome for Testing" build, which paints that name into the window title and
+# is an easy automation tell.
+STEALTH_BROWSER_CHANNEL = os.getenv("STEALTH_BROWSER_CHANNEL", "chrome").strip()
 
-STEALTH_USER_AGENT = os.getenv(
-    "STEALTH_USER_AGENT",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    f"(KHTML, like Gecko) Chrome/{STEALTH_CHROME_MAJOR}.0.0.0 Safari/537.36",
+# Windows-like WebGL strings so headed WSL / swiftshader sessions do not advertise
+# a software renderer while the UA claims a normal desktop Chrome.
+STEALTH_WEBGL_VENDOR = os.getenv(
+    "STEALTH_WEBGL_VENDOR", "Google Inc. (Intel)"
+)
+STEALTH_WEBGL_RENDERER = os.getenv(
+    "STEALTH_WEBGL_RENDERER",
+    "ANGLE (Intel, Intel(R) UHD Graphics 620 (0x00005917) "
+    "Direct3D11 vs_5_0 ps_5_0, D3D11)",
 )
 
-STEALTH_SEC_CH_UA = (
-    f'"Chromium";v="{STEALTH_CHROME_MAJOR}", '
-    f'"Google Chrome";v="{STEALTH_CHROME_MAJOR}", "Not?A_Brand";v="24"'
+
+# DETECT CHROME FULL VERSION
+def _detect_chrome_full_version() -> str | None:
+    """
+    Read the installed Google Chrome full version (e.g. 151.0.7922.108) so client
+    hints can advertise a real build instead of a fake major.0.0.0 fullVersion.
+    """
+
+    for binary in ("google-chrome", "google-chrome-stable", "chromium-browser"):
+        path = shutil.which(binary)
+        if path is None:
+            continue
+        try:
+            output = subprocess.check_output(
+                [path, "--version"], text=True, timeout=5
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        match = re.search(r"(\d+\.\d+\.\d+\.\d+)", output)
+        if match:
+            return match.group(1)
+    return None
+
+
+# SEC CH UA FOR MAJOR
+def _sec_ch_ua_for_major(major: str) -> str:
+    """
+    Build a modern greased Sec-CH-UA header for the given Chrome major version.
+    """
+
+    return (
+        f'"Not=A?Brand";v="99", "Google Chrome";v="{major}", '
+        f'"Chromium";v="{major}"'
+    )
+
+
+# WINDOWS USER AGENT FOR MAJOR
+def _windows_user_agent_for_major(major: str) -> str:
+    """
+    Build the reduced Windows Chrome user agent Chrome itself advertises for the
+    given major version (full build stays in client hints, not the UA string).
+    """
+
+    return (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        f"(KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36"
+    )
+
+
+# env overrides win auto-detection so CapSolver-bound identities stay pin-able
+_ENV_CHROME_FULL_VERSION = os.getenv("STEALTH_CHROME_FULL_VERSION")
+_ENV_CHROME_MAJOR = os.getenv("STEALTH_CHROME_MAJOR")
+_ENV_USER_AGENT = os.getenv("STEALTH_USER_AGENT")
+
+STEALTH_CHROME_FULL_VERSION = (
+    _ENV_CHROME_FULL_VERSION
+    or _detect_chrome_full_version()
+    or "151.0.7922.108"
 )
+STEALTH_CHROME_MAJOR = _ENV_CHROME_MAJOR or STEALTH_CHROME_FULL_VERSION.split(".")[0]
+STEALTH_USER_AGENT = _ENV_USER_AGENT or _windows_user_agent_for_major(
+    STEALTH_CHROME_MAJOR
+)
+STEALTH_SEC_CH_UA = _sec_ch_ua_for_major(STEALTH_CHROME_MAJOR)
+
+
+# SYNC STEALTH IDENTITY
+def _sync_stealth_identity(full_version: str) -> None:
+    """
+    Point the module-level Windows Chrome identity at the browser build actually
+    launched so UA, Sec-CH-UA and high-entropy client hints stay coherent.
+    """
+
+    global STEALTH_CHROME_FULL_VERSION, STEALTH_CHROME_MAJOR
+    global STEALTH_USER_AGENT, STEALTH_SEC_CH_UA
+
+    if not full_version:
+        return
+
+    STEALTH_CHROME_FULL_VERSION = _ENV_CHROME_FULL_VERSION or full_version
+    STEALTH_CHROME_MAJOR = (
+        _ENV_CHROME_MAJOR or STEALTH_CHROME_FULL_VERSION.split(".")[0]
+    )
+    STEALTH_USER_AGENT = _ENV_USER_AGENT or _windows_user_agent_for_major(
+        STEALTH_CHROME_MAJOR
+    )
+    STEALTH_SEC_CH_UA = _sec_ch_ua_for_major(STEALTH_CHROME_MAJOR)
 
 # keep navigation on a short timeout so a stalled proxy exit IP surfaces quickly
 # as a timeout that triggers a rotation instead of blocking for minutes
@@ -430,10 +521,19 @@ def sync_stealth_playwright() -> Iterator[Playwright]:
     advertise over HTTP.
     """
 
+    # refresh identity from the installed chrome before constructing stealth so
+    # init scripts and sec-ch-ua headers match the channel we are about to launch
+    detected = _detect_chrome_full_version()
+    if detected:
+        _sync_stealth_identity(detected)
+
     stealth = Stealth(
         navigator_user_agent_override=STEALTH_USER_AGENT,
         navigator_platform_override="Win32",
         sec_ch_ua_override=STEALTH_SEC_CH_UA,
+        chrome_runtime=True,
+        webgl_vendor_override=STEALTH_WEBGL_VENDOR,
+        webgl_renderer_override=STEALTH_WEBGL_RENDERER,
     )
     with stealth.use_sync(_sync_playwright()) as playwright:
         yield playwright
@@ -472,10 +572,71 @@ def launch_stealth_chromium(
     # memory to /tmp with --disable-dev-shm-usage avoids the crash, and
     # --no-sandbox is required to launch under most containerised/root setups
     launch_args = ["--no-sandbox", "--disable-dev-shm-usage"]
+    browser_env = os.environ.copy()
 
-    return playwright.chromium.launch(
-        headless=headless, proxy=proxy, args=launch_args
-    )
+    # playwright's headless=True still passes legacy --headless to channel=chrome,
+    # which is easier for cloudflare to detect and more prone to wedging on
+    # challenge pages (captcha probes then hard-timeout and kill chromium). use
+    # chrome's new headless mode instead: full browser binary, no window
+    playwright_headless = headless
+    if headless:
+        playwright_headless = False
+        launch_args.extend(
+            [
+                "--headless=new",
+                "--window-size=1280,800",
+                "--disable-gpu",
+                "--disable-gpu-compositing",
+            ]
+        )
+    else:
+        # headed chromium under wslg commonly ends up as a taskbar-only /
+        # unrestorable (or fully transparent) rail window: it opens far off the
+        # visible desktop, prefers wayland, and breaks when the d3d12/glamor path
+        # fails. pin geometry, force x11, and disable gpu compositing so the
+        # window actually paints on the windows desktop
+        launch_args.extend(
+            [
+                "--window-position=50,50",
+                "--window-size=1280,800",
+                "--ozone-platform=x11",
+                "--disable-gpu",
+                "--disable-gpu-compositing",
+            ]
+        )
+        browser_env["XDG_SESSION_TYPE"] = "x11"
+        browser_env.pop("WAYLAND_DISPLAY", None)
+        browser_env.pop("ELECTRON_OZONE_PLATFORM_HINT", None)
+
+    # prefer real google chrome over chrome-for-testing so the window title and
+    # product name stop advertising automation; fall back to the bundled build
+    # when the channel is unset or unavailable on this machine
+    launch_kwargs: dict = {
+        "headless": playwright_headless,
+        "proxy": proxy,
+        "args": launch_args,
+        "env": browser_env,
+        "ignore_default_args": ["--enable-automation"],
+    }
+    if STEALTH_BROWSER_CHANNEL:
+        launch_kwargs["channel"] = STEALTH_BROWSER_CHANNEL
+
+    try:
+        browser = playwright.chromium.launch(**launch_kwargs)
+    except Exception as exc:
+        if not STEALTH_BROWSER_CHANNEL:
+            raise
+        print(
+            f"  Warning: failed to launch channel={STEALTH_BROWSER_CHANNEL!r} "
+            f"({exc}); falling back to bundled Chromium"
+        )
+        launch_kwargs.pop("channel", None)
+        browser = playwright.chromium.launch(**launch_kwargs)
+
+    # align ua / client-hint constants with the binary we actually started
+    _sync_stealth_identity(getattr(browser, "version", "") or "")
+    setattr(browser, "_ice_headed_display", not headless)
+    return browser
 
 
 # GET ACTIVE PROXY SETTINGS
@@ -489,28 +650,31 @@ def get_active_proxy_settings() -> dict | None:
 
 
 # WINDOWS USER AGENT METADATA
-def _windows_user_agent_metadata(major: str = STEALTH_CHROME_MAJOR) -> dict:
+def _windows_user_agent_metadata(
+    major: str | None = None, full_version: str | None = None
+) -> dict:
     """
     Build the userAgentMetadata payload that backs the Sec-CH-UA-* client hints
-    for a Windows Chrome build of the given major version, so the high-entropy
-    client hints Cloudflare can request stay consistent with the Windows user
-    agent rather than leaking the underlying Linux host.
+    for a Windows Chrome build, so the high-entropy client hints Cloudflare can
+    request stay consistent with the Windows user agent rather than leaking the
+    underlying Linux host or a fake major.0.0.0 full version.
     """
 
-    full_version = f"{major}.0.0.0"
+    resolved_full = full_version or STEALTH_CHROME_FULL_VERSION
+    resolved_major = major or resolved_full.split(".")[0]
     brands = [
-        {"brand": "Chromium", "version": major},
-        {"brand": "Google Chrome", "version": major},
-        {"brand": "Not?A_Brand", "version": "24"},
+        {"brand": "Not=A?Brand", "version": "99"},
+        {"brand": "Google Chrome", "version": resolved_major},
+        {"brand": "Chromium", "version": resolved_major},
     ]
     full_version_list = [
-        {"brand": "Chromium", "version": full_version},
-        {"brand": "Google Chrome", "version": full_version},
-        {"brand": "Not?A_Brand", "version": "24.0.0.0"},
+        {"brand": "Not=A?Brand", "version": "99.0.0.0"},
+        {"brand": "Google Chrome", "version": resolved_full},
+        {"brand": "Chromium", "version": resolved_full},
     ]
     return {
         "brands": brands,
-        "fullVersion": full_version,
+        "fullVersion": resolved_full,
         "fullVersionList": full_version_list,
         "platform": "Windows",
         "platformVersion": "15.0.0",
@@ -522,8 +686,39 @@ def _windows_user_agent_metadata(major: str = STEALTH_CHROME_MAJOR) -> dict:
     }
 
 
+# ENSURE HEADED WINDOW VISIBLE
+def _ensure_headed_window_visible(page: Page) -> None:
+    """
+    Force a headed Chromium window onto the visible desktop via CDP. Under WSLg
+    the window manager often leaves the first surface off-screen or minimized in
+    a state the Windows taskbar cannot restore, so an explicit bounds + bring
+    to front after page creation is required.
+    """
+
+    try:
+        cdp_session = page.context.new_cdp_session(page)
+        target = cdp_session.send("Browser.getWindowForTarget")
+        window_id = target["windowId"]
+        cdp_session.send(
+            "Browser.setWindowBounds",
+            {
+                "windowId": window_id,
+                "bounds": {
+                    "windowState": "normal",
+                    "left": 50,
+                    "top": 50,
+                    "width": 1280,
+                    "height": 800,
+                },
+            },
+        )
+        cdp_session.send("Page.bringToFront")
+    except Exception:
+        return
+
+
 # APPLY WINDOWS IDENTITY
-def _apply_windows_identity(page: Page, user_agent: str = STEALTH_USER_AGENT) -> None:
+def _apply_windows_identity(page: Page, user_agent: str | None = None) -> None:
     """
     Override the page's user agent and client-hint metadata over CDP so the real
     HTTP User-Agent header, navigator.userAgent, navigator.platform and the
@@ -531,18 +726,27 @@ def _apply_windows_identity(page: Page, user_agent: str = STEALTH_USER_AGENT) ->
     applied before the first navigation so Cloudflare never sees the Linux host.
     """
 
-    # derive the chrome major from the user agent so the client-hint versions
-    # always match whatever user agent the page is advertising
-    match = re.search(r"Chrome/(\d+)", user_agent)
-    major = match.group(1) if match else STEALTH_CHROME_MAJOR
+    resolved_user_agent = user_agent or STEALTH_USER_AGENT
+
+    # prefer the live browser build when available so fullVersionList matches the
+    # binary rather than advertising a synthetic major.0.0.0 build
+    browser = page.context.browser
+    full_version = STEALTH_CHROME_FULL_VERSION
+    if browser is not None and getattr(browser, "version", None):
+        full_version = browser.version
+
+    match = re.search(r"Chrome/(\d+)", resolved_user_agent)
+    major = match.group(1) if match else full_version.split(".")[0]
 
     cdp_session = page.context.new_cdp_session(page)
     cdp_session.send(
         "Emulation.setUserAgentOverride",
         {
-            "userAgent": user_agent,
+            "userAgent": resolved_user_agent,
             "platform": "Windows",
-            "userAgentMetadata": _windows_user_agent_metadata(major),
+            "userAgentMetadata": _windows_user_agent_metadata(
+                major=major, full_version=full_version
+            ),
         },
     )
 
@@ -571,6 +775,13 @@ def new_stealth_page(browser: Browser) -> Page:
     )
 
     _apply_windows_identity(page)
+
+    # headed wslg sessions need an explicit on-screen restore after the first
+    # page exists; launch flags alone are not enough once chromium 148+ /
+    # weston have already placed the rail window off-desktop
+    if getattr(browser, "_ice_headed_display", False):
+        _ensure_headed_window_visible(page)
+
     return page
 
 

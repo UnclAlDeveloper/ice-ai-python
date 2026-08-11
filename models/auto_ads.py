@@ -52,7 +52,7 @@ class ProspectListings(Base):
     make_and_model = mapped_column(String, nullable=False)
     short_description = mapped_column(String, nullable=False)
     url = mapped_column(String, nullable=False)
-    listing_source = mapped_column(ENUM('Autotrader', 'Car&Classic', 'eBay', 'Facebook', 'Gumtree', 'ManualEntry', 'OnlyVans', name='listing_source', schema='aa'), nullable=False)
+    listing_source = mapped_column(ENUM('Autotrader', 'Car&Classic', 'eBay', 'Facebook', 'Gumtree', 'ManualEntry', 'OnlyVans', 'Pistonheads', name='listing_source', schema='aa'), nullable=False)
     status = mapped_column(ENUM('New', 'NotAvailable', 'Viewed', 'NotInterested', 'Interested', 'Bought', 'Sold', name='prospect_listing_status', schema='aa'), nullable=False)
     listing_type = mapped_column(ENUM('Car', 'Van', 'Classic', 'Item', 'Boat', 'Yacht', name='listing_type', schema='aa'), nullable=False)
     created_at = mapped_column(DateTime(True))
@@ -118,7 +118,7 @@ class ResaleListings(Base):
     )
 
     id = mapped_column(Integer)
-    listing_source = mapped_column(ENUM('Autotrader', 'Car&Classic', 'eBay', 'Facebook', 'Gumtree', 'ManualEntry', 'OnlyVans', name='listing_source', schema='aa'), nullable=False)
+    listing_source = mapped_column(ENUM('Autotrader', 'Car&Classic', 'eBay', 'Facebook', 'Gumtree', 'ManualEntry', 'OnlyVans', 'Pistonheads', name='listing_source', schema='aa'), nullable=False)
     status = mapped_column(ENUM('Bought', 'Sold', name='resale_listing_status', schema='aa'), nullable=False)
     make_and_model = mapped_column(String, nullable=False)
     short_description = mapped_column(String, nullable=False)

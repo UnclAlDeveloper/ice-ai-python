@@ -46,6 +46,20 @@ from scraper_driver import (
     ProxyRotationConfig,
     ProxySessionExpired,
     ScrapeResumeState,
+    log_already_exists,
+    log_already_processed,
+    log_listing_error,
+    log_loaded_source_ids,
+    log_no_listings_on_page,
+    log_not_available,
+    log_paginating_start,
+    log_repeat_page,
+    log_resume_scrape,
+    log_results_page,
+    log_saved_listing,
+    log_scrape_finished,
+    log_skipping,
+    log_timestamp,
     persist_unavailable_listing_stub,
     run_with_proxy_rotation,
     search_results_present,
@@ -1060,13 +1074,20 @@ def get_overview_value(page: Page, icon_name: str) -> str | None:
 
 # SAVE GALLERY IMAGES
 def save_gallery_images(
-    page: Page, prospect_listing: ProspectListings, session
+    page: Page,
+    prospect_listing: ProspectListings,
+    session,
+    *,
+    log_index: int | None = None,
+    log_title: str | None = None,
 ) -> tuple[str | None, int]:
     """
     Open the full gallery view, load all images (via carousel or scrolling),
     fetch them via HTTP, save to S3 and temporary directory, and create Images database records.
     Returns the path to the temporary directory containing the images and the
     number of image URLs collected, or (None, 0) if no images were saved.
+    When log_index and log_title are given, prints listing details after gallery
+    urls are collected and before downloads begin.
     """
 
     # click the gallery button to open full gallery view
@@ -1078,6 +1099,15 @@ def save_gallery_images(
             'section[data-testid="gallery"] button:has(span:text("Gallery"))'
         )
     if gallery_button.count() == 0:
+        if log_index is not None and log_title is not None:
+            log_saved_listing(
+                log_index,
+                log_title,
+                make_and_model=prospect_listing.make_and_model,
+                year=prospect_listing.year,
+                location=prospect_listing.location,
+                image_count=0,
+            )
         print("Gallery button not found, skipping image extraction")
         return None, 0
 
@@ -1236,6 +1266,17 @@ def save_gallery_images(
                 except Exception:
                     break
 
+    # log details once urls are known, before the slow download / ai work
+    if log_index is not None and log_title is not None:
+        log_saved_listing(
+            log_index,
+            log_title,
+            make_and_model=prospect_listing.make_and_model,
+            year=prospect_listing.year,
+            location=prospect_listing.location,
+            image_count=len(image_urls),
+        )
+
     # download images, save to temp dir and s3, create database records
     temp_dir = download_and_save_listing_images(
         image_urls,
@@ -1263,10 +1304,14 @@ def read_full_prospect_listing(
     expected_short_description: str,
     listing_type: ListingType,
     ai_prompt_filename: str,
-) -> ProspectListings | None:
+    *,
+    log_index: int | None = None,
+    log_title: str | None = None,
+) -> tuple[ProspectListings | None, int]:
     """
-    Extract full listing details from the detail page and return a ProspectListings
-    instance with the configured listing type and AI prompt.
+    Extract full listing details from the detail page and return a
+    ProspectListings instance with the configured listing type and AI prompt,
+    plus the number of gallery image urls collected.
     """
 
     # get the current url
@@ -1299,11 +1344,17 @@ def read_full_prospect_listing(
 
     # check that the record has a price and is not an AUCTION
     if not price_text:
-        print(f"No price found for listing: {make_and_model} - {short_description}")
-        return None
-    if not price_text or price_text == "AUCTION":
-        print(f"Indicates AUCTION listing: {make_and_model} - {short_description}")
-        return None
+        if log_index is not None and log_title is not None:
+            log_skipping(log_index, log_title, "no price found, skipping")
+        else:
+            print(f"No price found for listing: {make_and_model} - {short_description}")
+        return None, 0
+    if price_text == "AUCTION":
+        if log_index is not None and log_title is not None:
+            log_skipping(log_index, log_title, "auction listing, skipping")
+        else:
+            print(f"Indicates AUCTION listing: {make_and_model} - {short_description}")
+        return None, 0
 
     # parse price components
     currency_symbol = price_text[0] if price_text else None
@@ -1501,7 +1552,11 @@ def read_full_prospect_listing(
 
         # save gallery images after listing is committed
         temp_image_dir, image_url_count = save_gallery_images(
-            page, prospect_listing, session
+            page,
+            prospect_listing,
+            session,
+            log_index=log_index,
+            log_title=log_title,
         )
 
         # count the images that actually persisted so a partial save can be detected
@@ -1538,12 +1593,14 @@ def read_full_prospect_listing(
         if temp_image_dir and os.path.isdir(temp_image_dir):
             shutil.rmtree(temp_image_dir)
 
-        # detach the object from the session so it can be used outside the session context
+        # reload column values before detach: the ai-analysis commit expires
+        # attributes, and an expired+expunged instance cannot be read by the
+        # caller (DetachedInstanceError / sqlalchemy code bhk3)
+        session.refresh(prospect_listing)
         session.expunge(prospect_listing)
 
-    print(f"Extracted listing: {make_and_model} - {short_description[:50]}...")
-
-    return prospect_listing
+    log_timestamp()
+    return prospect_listing, image_url_count
 
 
 # SEARCH RESULTS LISTING SELECTOR
@@ -1589,22 +1646,19 @@ def scrape_listings(
     """
 
     existing_source_ids = get_existing_source_ids(ListingSource.AUTOTRADER)
-    print(f"Loaded {len(existing_source_ids)} existing source ids from database")
+    log_loaded_source_ids(len(existing_source_ids))
 
     processed_ids = resume.processed_ids if resume is not None else set()
     page_number = resume.page_number if resume is not None else 1
-    prospect_listings = []
+    new_count = 0
     previous_page_listing_ids: set[str] = set()
     first_page_load = True
 
     if resume is not None and resume.search_url is not None:
         search_url = resume.search_url
-        print(
-            f"Resuming listings scrape from results page {page_number} "
-            f"({len(processed_ids)} listings already processed)"
-        )
+        log_resume_scrape(page_number, len(processed_ids))
 
-    print(f"Paginating to load all {listing_type.value.lower()} listings...\n")
+    log_paginating_start(listing_type.value.lower())
 
     while True:
         # walk the underlying page parameter; the desktop ui hides pagination
@@ -1632,15 +1686,12 @@ def scrape_listings(
         # an empty page means we have walked past the final results page, so
         # the entire result set has been processed
         if not search_results_present(page, _SEARCH_RESULTS_LISTING_SELECTOR):
-            print(
-                f"No listings on results page {page_number}; reached the end "
-                f"of the result set"
-            )
+            log_no_listings_on_page(page_number)
             break
 
         # snapshot every listing card on this page before navigating to any
         # detail page so the element handles are not invalidated mid-loop
-        listing_candidates: list[tuple[str, str, str | None, str]] = []
+        listing_candidates: list[tuple[str, str, str | None, str, str]] = []
         page_listing_ids: set[str] = set()
         list_items = page.locator(_SEARCH_RESULTS_LISTING_SELECTOR).all()
         for list_item in list_items:
@@ -1657,6 +1708,11 @@ def scrape_listings(
             short_description = (
                 subtitle.inner_text() if subtitle.count() > 0 else ""
             )
+            title = (
+                title_link.inner_text().strip()
+                if title_link.count() > 0
+                else short_description
+            )
 
             href = title_link.get_attribute("href")
             listing_url = (
@@ -1666,28 +1722,28 @@ def scrape_listings(
             )
             source_id = extract_source_id(listing_url)
             listing_candidates.append(
-                (listing_id, listing_url, source_id, short_description)
+                (listing_id, listing_url, source_id, short_description, title)
             )
 
         # autotrader clamps an out-of-range page back to the last valid one, so
         # an identical card set to the previous page means there are no more
         if page_listing_ids and page_listing_ids == previous_page_listing_ids:
-            print(
-                f"Results page {page_number} repeats the previous page; "
-                f"reached the end of the result set"
-            )
+            log_repeat_page(page_number)
             break
         previous_page_listing_ids = page_listing_ids
 
-        print(
-            f"\nResults page {page_number}: {len(listing_candidates)} listings"
-        )
+        log_results_page(page_number, len(listing_candidates))
 
         # process every new listing on this page from the snapshot
-        for listing_id, listing_url, source_id, short_description in (
-            listing_candidates
-        ):
+        for index, (
+            listing_id,
+            listing_url,
+            source_id,
+            short_description,
+            title,
+        ) in enumerate(listing_candidates, start=1):
             if listing_id in processed_ids:
+                log_already_processed(index, title)
                 continue
 
             # record the current page before each listing so a proxy rotation
@@ -1707,19 +1763,11 @@ def scrape_listings(
                 )
 
             if source_id is not None and source_id in existing_source_ids:
-                print(
-                    f"Found existing listing (source_id: {source_id}), skipping..."
-                )
+                log_already_exists(index, title)
                 processed_ids.add(listing_id)
                 continue
 
-            # a new listing: announce it so the on-screen single detail view
-            # matches the log and is not mistaken for a stuck results page
-            print(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-            print(
-                f"\nProcessing new listing (source_id: {source_id}): "
-                f"{short_description[:60]}\n  {listing_url}"
-            )
+            log_timestamp()
 
             # process each listing inside a guard so one bad listing cannot
             # abort the whole sweep; every candidate url comes from the snapshot
@@ -1741,9 +1789,7 @@ def scrape_listings(
                         if is_http_not_found(response)
                         else "unavailable"
                     )
-                    print(
-                        f"  NotAvailable ({reason}), saving stub and skipping"
-                    )
+                    log_not_available(index, title, reason)
                     hash_code = generate_hash_code(
                         f"{short_description}|{source_id}"
                         if source_id
@@ -1774,18 +1820,19 @@ def scrape_listings(
                     processed_ids.add(listing_id)
                     continue
 
-                prospect_listing = read_full_prospect_listing(
+                prospect_listing, _ = read_full_prospect_listing(
                     page,
                     short_description,
                     listing_type,
                     ai_prompt_filename,
+                    log_index=index,
+                    log_title=title,
                 )
                 if prospect_listing is None:
-                    print("skipping...")
                     processed_ids.add(listing_id)
                     continue
 
-                prospect_listings.append(prospect_listing)
+                new_count += 1
                 processed_ids.add(listing_id)
                 if source_id is not None:
                     existing_source_ids.add(source_id)
@@ -1795,7 +1842,7 @@ def scrape_listings(
                     page,
                     listing_source=ListingSource.AUTOTRADER,
                     is_unavailable_fn=is_listing_no_longer_available,
-                    limit=random.randint(5, 20),
+                    limit=random.randint(1, 4),
                     config=CONFIG,
                     deadline=deadline,
                     listing_type=listing_type,
@@ -1817,7 +1864,7 @@ def scrape_listings(
             except Exception as e:
                 if is_proxy_network_error(e):
                     raise
-                print(f"  Error processing listing, skipping: {e}")
+                log_listing_error(index, title, e)
 
         # advance to the next results page
         page_number += 1
@@ -1826,9 +1873,7 @@ def scrape_listings(
             resume.processed_ids = processed_ids
         pause_for_page(page,min_seconds=1.0, max_seconds=2.0)
 
-    print(f"\nFinished after walking {page_number} results page(s)")
-    print(f"Processed {len(processed_ids)} listings")
-    print(f"Found {len(prospect_listings)} new listings")
+    log_scrape_finished(page_number, new_count, len(processed_ids))
 
 
 # OPEN SESSION

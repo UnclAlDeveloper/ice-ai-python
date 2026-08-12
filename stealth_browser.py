@@ -174,9 +174,11 @@ STEALTH_ACTION_TIMEOUT_MS = int(
 )
 
 # captcha probes must stay short: a hung renderer would otherwise block on
-# page.evaluate() / locator.count() forever (those APIs ignore action timeouts)
+# page.evaluate() / locator.count() forever (those APIs ignore action timeouts).
+# cloudflare challenge pages in headless chrome often need longer than 5s before
+# the main world answers again, so default a bit higher and allow override.
 CAPTCHA_PROBE_TIMEOUT_MS = int(
-    os.getenv("CAPTCHA_PROBE_TIMEOUT_MS", "5000")
+    os.getenv("CAPTCHA_PROBE_TIMEOUT_MS", "15000")
 )
 
 # quick presence checks (locator.count, short reads) on a possibly wedged page
@@ -443,38 +445,42 @@ def get_decodo_settings(
     return settings
 
 
-# CHECK PROXY HEALTH
-def check_proxy_health(
+# PROXY RESPONSE ERROR DETAIL
+def _proxy_response_error_detail(response) -> str:
+    """
+    Extract Decodo's x-error-message (or response body) from a failed proxy
+    health-check response so callers see why the gateway rejected the request.
+    """
+
+    headers = getattr(response, "headers", None) or {}
+    detail = headers.get("x-error-message") or ""
+    if not detail:
+        try:
+            detail = (response.text() or "").strip()
+        except Exception:
+            detail = ""
+    return detail
+
+
+# RETRYABLE PROXY HEALTH STATUSES
+_RETRYABLE_PROXY_HEALTH_STATUSES = frozenset({502, 504, 522})
+
+
+# CHECK PROXY HEALTH ON SETTINGS
+def _check_proxy_health_on_settings(
     playwright: Playwright,
+    settings: dict,
     *,
-    settings: dict | None = None,
-    test_url: str | None = None,
-    timeout: float = 20000,
+    url: str,
+    timeout: float,
 ) -> str:
     """
-    Verify the configured Decodo proxy is actually usable by issuing a request
-    through it to a neutral ip-echo endpoint, using Playwright's own request
-    stack with the same proxy settings dict the browser uses so the check is a
-    faithful mirror of browser authentication. Surfaces the real failure (e.g. a
-    407 proxy-auth rejection) up front instead of the opaque navigation errors
-    Chromium raises later. Returns the proxy exit IP on success and raises
-    RuntimeError with actionable guidance on failure.
+    Issue one health-check request through the given Playwright proxy settings
+    and return the exit IP. Raises RuntimeError on auth failure or a non-OK
+    response; connection exceptions are wrapped with the gateway address.
     """
 
-    if settings is None:
-        settings = get_decodo_settings()
-    if not settings:
-        raise RuntimeError(
-            "No Decodo proxy configured (DECODO_SERVER is not set)."
-        )
-
-    url = test_url or os.getenv(
-        "PROXY_HEALTH_CHECK_URL", "https://api.ipify.org?format=json"
-    )
     gateway = settings.get("server", "")
-
-    # route through playwright's request api with the same proxy settings the
-    # browser is launched with, so credentials are handled identically
     request_context = playwright.request.new_context(proxy=settings)
     try:
         try:
@@ -493,9 +499,12 @@ def check_proxy_health(
                 "out of bandwidth or suspended."
             )
         if response.status != 200:
+            detail = _proxy_response_error_detail(response)
+            suffix = f" ({detail})" if detail else ""
             raise RuntimeError(
                 f"Proxy health check to {url} via {gateway} returned HTTP "
-                f"{response.status}; the proxy is not serving requests normally."
+                f"{response.status}{suffix}; the proxy is not serving requests "
+                "normally."
             )
 
         # surface the exit ip so a sticky session can be confirmed
@@ -508,6 +517,91 @@ def check_proxy_health(
         return exit_ip
     finally:
         request_context.dispose()
+
+
+# IS RETRYABLE PROXY HEALTH ERROR
+def _is_retryable_proxy_health_error(message: str) -> bool:
+    """
+    Return True when a health-check failure is caused by a dead sticky port or
+    transient gateway timeout, so another Decodo port should be tried.
+    """
+
+    if message.startswith("Could not connect through the Decodo proxy"):
+        return True
+    return any(
+        f"returned HTTP {status}" in message
+        for status in _RETRYABLE_PROXY_HEALTH_STATUSES
+    )
+
+
+# CHECK PROXY HEALTH
+def check_proxy_health(
+    playwright: Playwright,
+    *,
+    settings: dict | None = None,
+    test_url: str | None = None,
+    timeout: float = 20000,
+) -> str:
+    """
+    Verify the configured Decodo proxy is actually usable by issuing a request
+    through it to a neutral ip-echo endpoint, using Playwright's own request
+    stack with the same proxy settings dict the browser uses so the check is a
+    faithful mirror of browser authentication. Surfaces the real failure (e.g. a
+    407 proxy-auth rejection) up front instead of the opaque navigation errors
+    Chromium raises later. When settings are omitted and DECODO_PORT_RANGE is
+    set, retries across sticky ports so a single dead exit node (HTTP 502/522)
+    does not abort the scrape. Returns the proxy exit IP on success and raises
+    RuntimeError with actionable guidance on failure.
+    """
+
+    url = test_url or os.getenv(
+        "PROXY_HEALTH_CHECK_URL", "https://api.ipify.org?format=json"
+    )
+
+    # an explicit settings dict is a single-shot check (used by diagnostics)
+    if settings is not None:
+        return _check_proxy_health_on_settings(
+            playwright, settings, url=url, timeout=timeout
+        )
+
+    ports = parse_decodo_port_range()
+    attempts = max(len(ports), 1)
+    failures: list[str] = []
+
+    # walk the sticky-port cycle so a dead residential peer on one port does
+    # not block startup when another port in the range still works
+    for attempt in range(1, attempts + 1):
+        candidate = get_decodo_settings()
+        if not candidate:
+            raise RuntimeError(
+                "No Decodo proxy configured (DECODO_SERVER is not set)."
+            )
+
+        gateway = candidate.get("server", "")
+        try:
+            return _check_proxy_health_on_settings(
+                playwright, candidate, url=url, timeout=timeout
+            )
+        except RuntimeError as e:
+            message = str(e)
+            # auth/config failures will not be cured by trying another port
+            if "407 Proxy Authentication" in message or "DECODO_SERVER" in message:
+                raise
+
+            failures.append(message)
+            if not _is_retryable_proxy_health_error(message) or attempt >= attempts:
+                break
+
+            print(
+                f"Proxy health check failed on {gateway} "
+                f"(attempt {attempt}/{attempts}); trying next sticky port..."
+            )
+
+    detail = failures[-1] if failures else "unknown proxy failure"
+    raise RuntimeError(
+        f"Proxy health check failed after {len(failures)} attempt(s) across "
+        f"Decodo sticky ports. Last error: {detail}"
+    )
 
 
 # SYNC STEALTH PLAYWRIGHT
@@ -570,8 +664,14 @@ def launch_stealth_chromium(
     # is too small for chromium's renderer on heavy pages and crashes the target
     # (surfacing as a hung sync call after "Target closed"); routing shared
     # memory to /tmp with --disable-dev-shm-usage avoids the crash, and
-    # --no-sandbox is required to launch under most containerised/root setups
-    launch_args = ["--no-sandbox", "--disable-dev-shm-usage"]
+    # --no-sandbox is required to launch under most containerised/root setups.
+    # renderer-process-limit keeps chrome from spawning unbounded renderers in
+    # the small fargate task that hosts both the api and the scraper.
+    launch_args = [
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+        "--renderer-process-limit=3",
+    ]
     browser_env = os.environ.copy()
 
     # playwright's headless=True still passes legacy --headless to channel=chrome,
@@ -611,6 +711,7 @@ def launch_stealth_chromium(
     # prefer real google chrome over chrome-for-testing so the window title and
     # product name stop advertising automation; fall back to the bundled build
     # when the channel is unset or unavailable on this machine
+    channel = STEALTH_BROWSER_CHANNEL or None
     launch_kwargs: dict = {
         "headless": playwright_headless,
         "proxy": proxy,
@@ -618,24 +719,32 @@ def launch_stealth_chromium(
         "env": browser_env,
         "ignore_default_args": ["--enable-automation"],
     }
-    if STEALTH_BROWSER_CHANNEL:
-        launch_kwargs["channel"] = STEALTH_BROWSER_CHANNEL
+    if channel:
+        launch_kwargs["channel"] = channel
 
     try:
         browser = playwright.chromium.launch(**launch_kwargs)
     except Exception as exc:
-        if not STEALTH_BROWSER_CHANNEL:
+        if not channel:
             raise
         print(
-            f"  Warning: failed to launch channel={STEALTH_BROWSER_CHANNEL!r} "
+            f"  Warning: failed to launch channel={channel!r} "
             f"({exc}); falling back to bundled Chromium"
         )
         launch_kwargs.pop("channel", None)
+        channel = None
         browser = playwright.chromium.launch(**launch_kwargs)
 
     # align ua / client-hint constants with the binary we actually started
     _sync_stealth_identity(getattr(browser, "version", "") or "")
     setattr(browser, "_ice_headed_display", not headless)
+
+    headless_mode = "new" if headless else "headed"
+    print(
+        f"  Launched Chromium version={browser.version} "
+        f"channel={channel or 'bundled'} headless={headless_mode} "
+        f"proxy={'yes' if proxy else 'no'}"
+    )
     return browser
 
 
@@ -1048,6 +1157,26 @@ def quick_locator_count(locator, *, description: str = "locator count") -> int:
     )
 
 
+# LOCATOR IS PRESENT
+def locator_is_present(locator) -> bool:
+    """Return True when a locator resolves to at least one element."""
+
+    try:
+        return locator.count() > 0
+    except Exception:
+        return False
+
+
+# LOCATOR IS VISIBLE
+def locator_is_visible(locator) -> bool:
+    """Return True when a locator resolves to a visible element."""
+
+    try:
+        return locator.count() > 0 and locator.first.is_visible()
+    except Exception:
+        return False
+
+
 # CAPSOLVER PROXY FIELDS
 def _capsolver_proxy_fields() -> dict | None:
     """
@@ -1430,6 +1559,15 @@ def is_captcha_present(page: Page) -> bool:
     # the sync call indefinitely, so bail out before touching any locator
     if page.is_closed():
         return False
+
+    # page.url is local playwright state and does not round-trip to a possibly
+    # wedged renderer, so catch obvious challenge urls before the heavy probe
+    try:
+        url = (page.url or "").lower()
+        if any(fragment in url for fragment in CAPTCHA_URL_FRAGMENTS):
+            return True
+    except Exception:
+        pass
 
     try:
         # wait_for_function respects the action timeout; page.evaluate does not,
@@ -1942,6 +2080,22 @@ def goto_with_captcha_handling(
             return response
         except CaptchaSolveError:
             raise
+        except PageUnresponsiveError as e:
+            last_error = e
+
+            # the captcha-probe watchdog SIGKILLs chromium to unblock a wedged
+            # cdp call, which leaves this page dead; only retry when the target
+            # is still alive (soft timeout without a hard kill)
+            if page.is_closed() or attempt >= max_retries:
+                raise
+
+            print(
+                f"  Page unresponsive after navigating to {url} "
+                f"(attempt {attempt}/{max_retries}); resetting page "
+                f"and retrying..."
+            )
+            _reset_page_after_probe_timeout(page)
+            continue
         except Exception as e:
             last_error = e
 
@@ -1979,7 +2133,20 @@ def goto_with_captcha_handling(
             except Exception:
                 pass
 
-            if is_captcha_present(page):
+            try:
+                captcha_showing = is_captcha_present(page)
+            except PageUnresponsiveError:
+                if attempt < max_retries:
+                    print(
+                        f"  Page unresponsive while probing captcha at {url} "
+                        f"(attempt {attempt}/{max_retries}); resetting page "
+                        f"and retrying..."
+                    )
+                    _reset_page_after_probe_timeout(page)
+                    continue
+                raise
+
+            if captcha_showing:
                 wait_for_captcha_solve(page)
                 continue
 

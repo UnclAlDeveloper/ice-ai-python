@@ -216,6 +216,21 @@ def create_engine_with_retry(database_url: str, **kwargs):
     return create_engine(database_url, **kwargs)
 
 
+# PAUSE DELAY SECONDS
+def pause_delay_seconds(min_seconds: float, max_seconds: float) -> float:
+    """
+    Return a human-like delay without sleeping. The delay uses the same gamma
+    distribution parameterisation as pause().
+    """
+
+    if max_seconds <= min_seconds:
+        return max(min_seconds, 0.0)
+
+    scale = (max_seconds - min_seconds) / 1.8
+    shape = ((min_seconds * 0.9) / scale) + 1.0
+    return min_seconds * 0.1 + random.gammavariate(shape, scale)
+
+
 # PAUSE
 def pause(min_seconds: float = 1.0, max_seconds: float = 3.0):
     """
@@ -225,20 +240,90 @@ def pause(min_seconds: float = 1.0, max_seconds: float = 3.0):
     giving a peak at the lower bound with a long tail toward longer pauses.
     """
 
-    # fall back to a fixed delay when the range is degenerate or invalid
-    if max_seconds <= min_seconds:
-        time.sleep(max(min_seconds, 0.0))
-        return
+    time.sleep(pause_delay_seconds(min_seconds, max_seconds))
 
-    # derive gamma shape and scale from the requested mode and mean:
-    #   mode = (shape - 1) * scale = min_seconds
-    #   mean = shape * scale       = (min_seconds + max_seconds) / 2
-    # subtracting the two equations gives scale, and the shape follows
-    scale = (max_seconds - min_seconds) / 1.8
-    shape = ((min_seconds * 0.9) / scale) + 1.0
 
-    delay = min_seconds * 0.1 + random.gammavariate(shape, scale)
-    time.sleep(delay)
+# PAUSE WITH POLL
+def pause_with_poll(
+    poll: Callable[[], None] | None = None,
+    *,
+    min_seconds: float = 1.0,
+    max_seconds: float = 3.0,
+    poll_interval: float = 0.5,
+) -> None:
+    """
+    Wait using pause_delay_seconds(), optionally calling poll between sleeps so
+    scrapers can dismiss late cookie banners during longer delays.
+    """
+
+    delay = pause_delay_seconds(min_seconds, max_seconds)
+    deadline = time.time() + delay
+
+    while time.time() < deadline:
+        if poll is not None:
+            poll()
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        time.sleep(min(poll_interval, remaining))
+
+
+# WAIT WITH POLL
+def wait_with_poll(
+    action: Callable[[int], None],
+    *,
+    poll: Callable[[], None] | None = None,
+    timeout_ms: int = 30000,
+    poll_interval: float = 0.5,
+    slice_timeout_ms: int = 1000,
+) -> None:
+    """
+    Retry action in short timeout slices until it succeeds or timeout_ms elapses,
+    optionally calling poll between attempts so late cookie banners can be
+    dismissed during the wait. action receives the remaining timeout for the
+    current slice in milliseconds.
+    """
+
+    deadline = time.time() + timeout_ms / 1000
+    last_error: Exception | None = None
+
+    while time.time() < deadline:
+        if poll is not None:
+            poll()
+        try:
+            remaining_ms = max(100, int((deadline - time.time()) * 1000))
+            action(min(slice_timeout_ms, remaining_ms))
+            return
+        except Exception as exc:
+            last_error = exc
+
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        time.sleep(min(poll_interval, remaining))
+
+    if last_error is not None:
+        raise last_error
+
+    raise TimeoutError(f"Timed out after {timeout_ms}ms waiting with poll")
+
+
+# PARSE MILEAGE
+def parse_mileage(raw: str | None) -> tuple[int | None, str | None]:
+    """
+    Split a mileage string such as '81,000 mi' or '138,100 Miles' into the
+    numeric value and unit. Returns (None, None) when the value cannot be
+    parsed.
+    """
+
+    if not raw:
+        return None, None
+
+    match = re.match(r"^([\d,]+)\s*(.+)$", raw.strip())
+    if not match:
+        return None, None
+
+    return int(match.group(1).replace(",", "")), match.group(2).strip()
 
 
 # IS HTTP NOT FOUND

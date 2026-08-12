@@ -1,4 +1,6 @@
 import os
+import random
+import shutil
 import sys
 import time
 from collections.abc import Callable
@@ -8,8 +10,9 @@ from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from sqlalchemy import or_
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import Session, sessionmaker
 
+from ai_analysis import process_ai_analysis_for_listing
 from common import (
     create_engine_with_retry,
     is_http_not_found,
@@ -19,10 +22,15 @@ from common import (
     pause,
     with_db_retry,
 )
-from listing_images import delete_listing_images
-from models.auto_ads import ProspectListings
-from models.enums import ListingSource, ListingType, ProspectListingStatus
+from listing_images import (
+    delete_listing,
+    delete_listing_images,
+    download_and_save_listing_images,
+)
+from models.auto_ads import Images, ProspectListings
+from models.enums import ListingSource, ListingTable, ListingType, ProspectListingStatus
 from stealth_browser import (
+    Browser,
     CaptchaSolveError,
     Page,
     PageUnresponsiveError,
@@ -33,6 +41,8 @@ from stealth_browser import (
     is_navigation_timeout,
     is_proxy_network_error,
     is_target_closed_error,
+    launch_stealth_chromium,
+    new_stealth_page,
     reset_consecutive_captcha_count,
     sync_stealth_playwright,
 )
@@ -310,16 +320,47 @@ def with_page_param(url: str, page_number: int) -> str:
     and proxy-resume navigations.
     """
 
-    parsed = urlparse(url)
-    query = [
-        (key, value)
-        for key, value in parse_qsl(parsed.query, keep_blank_values=True)
-        if key != "page"
-    ]
-    if page_number > 1:
-        query.append(("page", str(page_number)))
+    return replace_query_params(
+        url,
+        drop=("page",),
+        set_params={"page": str(page_number)} if page_number > 1 else None,
+    )
 
-    return urlunparse(parsed._replace(query=urlencode(query)))
+
+# REPLACE QUERY PARAMS
+def replace_query_params(
+    url: str,
+    *,
+    drop: tuple[str, ...] | set[str] = (),
+    set_params: dict[str, str] | None = None,
+    prefer_keys: list[str] | None = None,
+) -> str:
+    """
+    Return url with selected query keys removed and optional replacements set.
+    When prefer_keys is given those keys are emitted first in that order.
+    """
+
+    drop_keys = set(drop)
+    parsed = urlparse(url)
+    existing = {
+        key: value
+        for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+        if key not in drop_keys
+    }
+    if set_params:
+        existing.update(set_params)
+
+    if prefer_keys:
+        final_pairs = [
+            (key, existing[key]) for key in prefer_keys if key in existing
+        ]
+        for key, value in existing.items():
+            if key not in prefer_keys:
+                final_pairs.append((key, value))
+    else:
+        final_pairs = list(existing.items())
+
+    return urlunparse(parsed._replace(query=urlencode(final_pairs)))
 
 
 # SEARCH RESULTS PRESENT
@@ -471,6 +512,275 @@ def persist_unavailable_listing_stub(
         session.commit()
 
     with_db_retry(persist, description="persist unavailable listing stub")
+
+
+# RUN CONSENT DISMISS LOOP
+def run_consent_dismiss_loop(
+    *,
+    is_visible: Callable[[], bool],
+    click_dismiss: Callable[[], bool],
+    wait_attached: Callable[[], None] | None = None,
+    wait_for_banner: bool = False,
+    timeout: float = 15000,
+    appear_timeout_s: float = 8.0,
+    clear_timeout_s: float = 5.0,
+    no_wait_dismiss_timeout_s: float = 5.0,
+    dismiss_timeout_s: float | None = None,
+) -> None:
+    """
+    Shared cookie-consent dismiss loop used by site scrapers. Site-specific
+    visibility checks and click handlers are injected so Sourcepoint, OneTrust,
+    and Quantcast implementations can share the same appear/clear deadlines.
+    """
+
+    appear_deadline = time.time() + (
+        min(timeout / 1000, appear_timeout_s) if wait_for_banner else 0.0
+    )
+    if dismiss_timeout_s is not None:
+        dismiss_window_s = dismiss_timeout_s if wait_for_banner else no_wait_dismiss_timeout_s
+    else:
+        dismiss_window_s = (
+            timeout / 1000 if wait_for_banner else no_wait_dismiss_timeout_s
+        )
+    dismiss_deadline = time.time() + dismiss_window_s
+
+    while time.time() < dismiss_deadline:
+        if wait_for_banner or is_visible():
+            if click_dismiss():
+                clear_deadline = time.time() + clear_timeout_s
+                while time.time() < clear_deadline:
+                    if not is_visible():
+                        return
+                    time.sleep(0.25)
+                return
+
+            time.sleep(0.25)
+            continue
+
+        if wait_for_banner and time.time() < appear_deadline:
+            if wait_attached is not None:
+                wait_attached()
+            time.sleep(0.25)
+            continue
+
+        return
+
+
+# OPEN PROXIED SESSION
+def open_proxied_session(
+    playwright,
+    *,
+    headless: bool,
+    use_proxy: bool = True,
+    landing_url: str | None = None,
+    on_ready: Callable[[Page], None] | None = None,
+    default_timeout_ms: int | None = None,
+    default_navigation_timeout_ms: int | None = None,
+) -> tuple[Browser, Page]:
+    """
+    Launch a fresh Chromium session with optional proxy, timeouts, landing
+    navigation, and a site-specific on_ready hook (e.g. accept cookies).
+    """
+
+    browser = launch_stealth_chromium(
+        playwright, headless=headless, use_proxy=use_proxy
+    )
+    page = new_stealth_page(browser)
+
+    if default_timeout_ms is not None:
+        page.set_default_timeout(default_timeout_ms)
+    if default_navigation_timeout_ms is not None:
+        page.set_default_navigation_timeout(default_navigation_timeout_ms)
+
+    if landing_url is not None:
+        goto_with_captcha_handling(page, landing_url)
+
+    if on_ready is not None:
+        on_ready(page)
+
+    return browser, page
+
+
+# PERSIST LISTING WITH IMAGES AND AI
+def persist_listing_with_images_and_ai(
+    session: Session,
+    prospect_listing: ProspectListings,
+    *,
+    ai_prompt_filename: str,
+    listing_url: str,
+    image_urls: list[str] | None = None,
+    page: Page | None = None,
+    temp_dir_prefix: str = "listing_images_",
+    page_hook: Callable[[Page], None] | None = None,
+    download_images: Callable[
+        [Session, ProspectListings], tuple[str | None, int]
+    ]
+    | None = None,
+    before_ai: Callable[[], None] | None = None,
+    after_ai: Callable[[], None] | None = None,
+    on_after_persist: Callable[[ProspectListings], None] | None = None,
+    log_index: int | None = None,
+    refresh_listing: bool = True,
+    expunge_listing: bool = False,
+) -> ProspectListings:
+    """
+    Commit a prospect listing, download its images, run AI analysis, and clean
+    up the temp image directory. Raises PageUnresponsiveError when images were
+    expected but only a partial set was saved, after discarding the listing.
+    """
+
+    def persist_listing():
+        session.add(prospect_listing)
+        session.flush()
+        session.commit()
+        if refresh_listing and not expunge_listing:
+            session.refresh(prospect_listing)
+
+    with_db_retry(persist_listing, description="persist prospect listing")
+
+    if on_after_persist is not None:
+        on_after_persist(prospect_listing)
+
+    temp_image_dir: str | None = None
+    expected_image_count = 0
+
+    if download_images is not None:
+        temp_image_dir, expected_image_count = download_images(
+            session, prospect_listing
+        )
+    elif image_urls is not None and page is not None:
+        expected_image_count = len(image_urls)
+        temp_image_dir = download_and_save_listing_images(
+            image_urls,
+            page,
+            prospect_listing,
+            session,
+            temp_dir_prefix=temp_dir_prefix,
+            page_hook=page_hook,
+        )
+    else:
+        raise ValueError(
+            "persist_listing_with_images_and_ai requires image_urls+page "
+            "or download_images"
+        )
+
+    saved_image_count = (
+        session.query(Images)
+        .filter(
+            Images.listing_id == prospect_listing.id,
+            Images.listing_table == ListingTable.PROSPECT,
+        )
+        .count()
+    )
+
+    if expected_image_count > 0 and saved_image_count < expected_image_count:
+        if log_index is not None:
+            log_partial_save(
+                log_index,
+                saved_image_count,
+                expected_image_count,
+                prospect_listing.id,
+            )
+        else:
+            print(
+                f"  Partial save ({saved_image_count}/{expected_image_count} images) — "
+                f"deleting listing {prospect_listing.id}"
+            )
+        if temp_image_dir and os.path.isdir(temp_image_dir):
+            shutil.rmtree(temp_image_dir)
+        delete_listing(prospect_listing, session)
+        raise PageUnresponsiveError(
+            f"partial image download for {listing_url} "
+            f"({saved_image_count}/{expected_image_count} images saved)"
+        )
+
+    if before_ai is not None:
+        before_ai()
+
+    prospect_listing = process_ai_analysis_for_listing(
+        ai_prompt_filename,
+        prospect_listing,
+        session,
+        temp_image_dir,
+    )
+
+    if after_ai is not None:
+        after_ai()
+
+    if temp_image_dir and os.path.isdir(temp_image_dir):
+        shutil.rmtree(temp_image_dir)
+
+    if refresh_listing:
+        session.refresh(prospect_listing)
+    if expunge_listing:
+        session.expunge(prospect_listing)
+
+    return prospect_listing
+
+
+# RERAISE OR LOG LISTING ERROR
+def reraise_or_log_listing_error(
+    index: int,
+    title: str,
+    listing_url: str,
+    error: Exception,
+    *,
+    promote_timeouts: bool = True,
+) -> None:
+    """
+    Re-raise rotation-worthy listing errors; otherwise log and allow the scrape
+    loop to continue with the next candidate. When promote_timeouts is True,
+    Playwright timeouts become PageUnresponsiveError so the proxy can rotate.
+    """
+
+    if isinstance(
+        error, (CaptchaSolveError, PageUnresponsiveError, ProxySessionExpired)
+    ):
+        raise error
+    if is_proxy_network_error(error):
+        raise error
+    if promote_timeouts and is_playwright_timeout(error):
+        raise PageUnresponsiveError(
+            f"listing page timed out for {listing_url}"
+        ) from error
+
+    log_listing_error(index, title, error)
+
+
+# MARK LISTING PROCESSED AND CHECK AVAILABILITY
+def mark_listing_processed_and_check_availability(
+    page: Page,
+    *,
+    source_id: str | None,
+    card_id: str,
+    existing_source_ids: set[str],
+    processed_ids: set[str],
+    listing_source: ListingSource,
+    listing_type: ListingType,
+    is_unavailable_fn: Callable[[Page], bool],
+    config: "ProxyRotationConfig",
+    deadline: float | None,
+) -> None:
+    """
+    Record a successfully saved listing as processed and run a randomized
+    availability sweep of other NEW listings from the same source.
+    """
+
+    log_timestamp()
+
+    if source_id is not None:
+        existing_source_ids.add(source_id)
+    processed_ids.add(card_id)
+
+    update_new_listings_availability(
+        page,
+        listing_source=listing_source,
+        is_unavailable_fn=is_unavailable_fn,
+        limit=random.randint(1, 4),
+        config=config,
+        deadline=deadline,
+        listing_type=listing_type,
+    )
 
 
 # UPDATE NEW LISTINGS AVAILABILITY

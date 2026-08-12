@@ -1,8 +1,10 @@
 import os
 import tempfile
 import time
+from collections.abc import Callable, Sequence
 from datetime import datetime
 from typing import TYPE_CHECKING, Optional
+from urllib.parse import urlparse, urlunparse
 
 from botocore.exceptions import BotoCoreError, ClientError, ConnectionClosedError
 from stealth_browser import Page
@@ -23,6 +25,96 @@ if TYPE_CHECKING:
 # how many times to retry a single s3 put when the socket stalls or the
 # connection drops mid-upload (read timeouts now surface via awsaccess config)
 _S3_SAVE_ATTEMPTS = 3
+_DEFAULT_MAX_GALLERY_IMAGES = 100
+
+
+# NORMALIZE IMAGE URL
+def normalize_image_url(
+    url: str,
+    *,
+    path_replacements: Sequence[tuple[str, str]] = (),
+) -> str:
+    """
+    Strip query and fragment so the same photo at different CDN sizes is only
+    kept once. Optional path_replacements rewrite path segments such as
+    LargeSize to Fullsize before comparison.
+    """
+
+    parsed = urlparse(url.split("?", 1)[0])
+    path = parsed.path
+    for old, new in path_replacements:
+        path = path.replace(old, new)
+    return urlunparse((parsed.scheme, parsed.netloc, path, "", "", ""))
+
+
+# APPEND UNIQUE IMAGE URL
+def append_unique_image_url(
+    image_urls: list[str],
+    seen: set[str],
+    src: str | None,
+    *,
+    path_replacements: Sequence[tuple[str, str]] = (),
+    store_normalized: bool = False,
+) -> None:
+    """
+    Add an http(s) image src to image_urls when its normalised form has not
+    already been collected. When store_normalized is True the normalised url is
+    appended instead of the original src.
+    """
+
+    if not src or not src.startswith("http"):
+        return
+
+    key = normalize_image_url(src, path_replacements=path_replacements)
+    if key in seen:
+        return
+
+    seen.add(key)
+    image_urls.append(key if store_normalized else src)
+
+
+# MERGE IMAGE URL LISTS
+def merge_image_url_lists(
+    *sources: list[str],
+    path_replacements: Sequence[tuple[str, str]] = (),
+) -> list[str]:
+    """
+    Merge multiple image url lists, de-duplicating by normalised path and
+    keeping the first url variant encountered for each photo.
+    """
+
+    image_urls: list[str] = []
+    seen: set[str] = set()
+    for source in sources:
+        for src in source:
+            append_unique_image_url(
+                image_urls,
+                seen,
+                src,
+                path_replacements=path_replacements,
+            )
+    return image_urls
+
+
+# CAP GALLERY URLS
+def cap_gallery_urls(
+    image_urls: list[str],
+    *,
+    max_images: int = _DEFAULT_MAX_GALLERY_IMAGES,
+) -> list[str]:
+    """
+    Truncate a gallery url list to max_images, logging when the site returns
+    more photos than the scraper is willing to download.
+    """
+
+    if len(image_urls) <= max_images:
+        return image_urls
+
+    print(
+        f"  Gallery returned {len(image_urls)} images "
+        f"(site max is {max_images}); truncating"
+    )
+    return image_urls[:max_images]
 
 
 # GET PROSPECT IMAGES AWS ACCESS
@@ -42,7 +134,11 @@ def _get_prospect_images_aws_access() -> AWSAccess:
 
 # DOWNLOAD IMAGE BYTES
 def _download_image_bytes(
-    page: Page, img_url: str, *, backoff: tuple[int, ...] = TIMEOUT_BACKOFF_MS
+    page: Page,
+    img_url: str,
+    *,
+    backoff: tuple[int, ...] = TIMEOUT_BACKOFF_MS,
+    page_hook: Callable[[Page], None] | None = None,
 ) -> Optional[tuple[bytes, str]]:
     """
     Fetch an image url through the browser's request context, retrying on
@@ -56,6 +152,9 @@ def _download_image_bytes(
     last_error: object = None
     attempts = len(backoff)
     for index, timeout_ms in enumerate(backoff):
+        if page_hook is not None:
+            page_hook(page)
+
         try:
             response = page.request.get(img_url, timeout=timeout_ms)
             if response.status != 200:
@@ -77,7 +176,11 @@ def _download_image_bytes(
 
         # back off briefly before retrying a transient failure
         if index < attempts - 1:
+            if page_hook is not None:
+                page_hook(page)
             pause(1.0, 3.0)
+            if page_hook is not None:
+                page_hook(page)
 
     print(f"  Failed to download image after {attempts} attempts: {last_error}")
     return None
@@ -118,11 +221,13 @@ def download_and_save_listing_images(
     prospect_listing: ProspectListings,
     session: "Session",
     temp_dir_prefix: str = "listing_images_",
+    page_hook: Callable[[Page], None] | None = None,
 ) -> Optional[str]:
     """
     Fetch each image URL via HTTP, save to a temporary directory and S3, and create
     Images database records. Returns the path to the temporary directory, or None
-    if no images were saved.
+    if no images were saved. When page_hook is given it is invoked between image
+    downloads so scrapers can dismiss late cookie banners during long galleries.
     """
 
     if not image_urls:
@@ -140,12 +245,19 @@ def download_and_save_listing_images(
     saved_count = 0
     for index, img_url in enumerate(image_urls):
         try:
+            if page_hook is not None:
+                page_hook(page)
+
             # pause between downloading images
             if index > 0:
                 pause(0.5, 1.5)
+                if page_hook is not None:
+                    page_hook(page)
 
             # fetch the image, retrying transient proxy/tls disconnects
-            download = _download_image_bytes(page, img_url)
+            download = _download_image_bytes(
+                page, img_url, page_hook=page_hook
+            )
             if download is None:
                 continue
             image_bytes, content_type = download

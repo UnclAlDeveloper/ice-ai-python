@@ -58,11 +58,23 @@ def load_environment():
     else:
         override_filename = ".env.prod"
 
-    # path to parent directory (one level up from this file's package)
+    # path to env files: docker copies this package to /app (so .env sits beside
+    # environments.py), while the local monorepo keeps .env one level above python/
     current_file = Path(__file__).resolve()
-    parent_dir = current_file.parent.parent
-    base_env_file = parent_dir / ".env"
-    override_env_file = parent_dir / override_filename
+    search_dirs = [current_file.parent, current_file.parent.parent]
+
+    base_env_file = next(
+        (directory / ".env" for directory in search_dirs if (directory / ".env").exists()),
+        search_dirs[0] / ".env",
+    )
+    override_env_file = next(
+        (
+            directory / override_filename
+            for directory in search_dirs
+            if (directory / override_filename).exists()
+        ),
+        search_dirs[0] / override_filename,
+    )
 
     # load the shared base first; its values become defaults for the override step
     if base_env_file.exists():

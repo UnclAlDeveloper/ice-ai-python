@@ -48,21 +48,23 @@ def run_scraper_subprocess(script_name: str) -> int:
 # RUN DAILY SCRAPES
 def run_daily_scrapes() -> None:
     """
-    Run the Autotrader classics scrape and then the Car & Classic scrape
-    back-to-back under a single daily trigger. The second scrape always runs
-    even if the first one exits non-zero, so a failure in one source never
-    silently suppresses the other. Both run sequentially because they both
-    launch non-headless Chromium and would fight over the same display if run
+    Run the Autotrader classics, Car & Classic, and PistonHeads scrapes
+    back-to-back under a single daily trigger. Later scrapes always run even
+    if an earlier one exits non-zero, so a failure in one source never
+    silently suppresses the others. All run sequentially because they launch
+    non-headless Chromium and would fight over the same display if run
     concurrently.
     """
 
     # run the autotrader classics scrape first; ignore its exit code for
-    # sequencing purposes so a failure there does not skip car & classic
+    # sequencing purposes so a failure there does not skip later scrapers
     run_scraper_subprocess("autotrader_classics.py")
 
     # then run the car & classic scrape; its exit code is logged inside the
     # helper, and any uncaught exception here is logged by apscheduler
     run_scraper_subprocess("car_and_classic.py")
+
+    run_scraper_subprocess("pistonheads.py")
 
 
 # MAIN

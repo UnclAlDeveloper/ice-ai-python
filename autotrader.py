@@ -1,7 +1,6 @@
 import os
 import random
 import re
-import shutil
 import time
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -21,8 +20,8 @@ from stealth_browser import (
     goto_with_captcha_handling,
     is_captcha_present,
     is_proxy_network_error,
-    launch_stealth_chromium,
-    new_stealth_page,
+    locator_is_present,
+    locator_is_visible,
     wait_for_captcha_solve,
 )
 from sqlalchemy.orm import sessionmaker
@@ -32,16 +31,14 @@ from common import (
     generate_hash_code,
     get_existing_source_ids,
     is_http_not_found,
+    parse_mileage,
+    pause_with_poll,
     wait_for_selector_with_backoff,
-    with_db_retry,
+    wait_with_poll,
 )
-from listing_images import (
-    delete_listing,
-    download_and_save_listing_images,
-)
-from ai_analysis import process_ai_analysis_for_listing
-from models.auto_ads import Images, ProspectListings
-from models.enums import ListingSource, ListingTable, ListingType, ProspectListingStatus
+from listing_images import download_and_save_listing_images
+from models.auto_ads import ProspectListings
+from models.enums import ListingSource, ListingType, ProspectListingStatus
 from scraper_driver import (
     ProxyRotationConfig,
     ProxySessionExpired,
@@ -60,7 +57,11 @@ from scraper_driver import (
     log_scrape_finished,
     log_skipping,
     log_timestamp,
+    open_proxied_session,
+    persist_listing_with_images_and_ai,
     persist_unavailable_listing_stub,
+    reraise_or_log_listing_error,
+    run_consent_dismiss_loop,
     run_with_proxy_rotation,
     search_results_present,
     update_new_listings_availability,
@@ -249,20 +250,14 @@ def _iter_consent_search_roots(page: Page):
 def _locator_is_present(locator) -> bool:
     """Return True when a locator resolves to at least one element."""
 
-    try:
-        return locator.count() > 0
-    except Exception:
-        return False
+    return locator_is_present(locator)
 
 
 # LOCATOR IS VISIBLE
 def _locator_is_visible(locator) -> bool:
     """Return True when a locator resolves to a visible element."""
 
-    try:
-        return locator.count() > 0 and locator.first.is_visible()
-    except Exception:
-        return False
+    return locator_is_visible(locator)
 
 
 # CONSENT NOTICE LOCATORS
@@ -433,44 +428,16 @@ def dismiss_cookie_consent(page: Page, *, wait_for_banner: bool = False) -> None
     not probe for a new banner to appear.
     """
 
-    appear_deadline = time.time() + (
-        _CONSENT_APPEAR_TIMEOUT_S if wait_for_banner else 0.0
+    run_consent_dismiss_loop(
+        is_visible=lambda: _is_cookie_consent_visible(page),
+        click_dismiss=lambda: _click_cookie_consent_dismiss_button(page),
+        wait_attached=lambda: _wait_for_cookie_consent_banner(page),
+        wait_for_banner=wait_for_banner,
+        timeout=_CONSENT_APPEAR_TIMEOUT_S * 1000,
+        appear_timeout_s=_CONSENT_APPEAR_TIMEOUT_S,
+        clear_timeout_s=_CONSENT_CLEAR_TIMEOUT_S,
+        dismiss_timeout_s=_CONSENT_DISMISS_TIMEOUT_S,
     )
-    dismiss_deadline = time.time() + (
-        _CONSENT_DISMISS_TIMEOUT_S if wait_for_banner else 5.0
-    )
-
-    while time.time() < dismiss_deadline:
-        if wait_for_banner or _is_cookie_consent_visible(page):
-            if _click_cookie_consent_dismiss_button(page):
-                clear_deadline = time.time() + _CONSENT_CLEAR_TIMEOUT_S
-                while time.time() < clear_deadline:
-                    if not _is_cookie_consent_visible(page):
-                        return
-                    time.sleep(0.25)
-                return
-
-            time.sleep(0.25)
-            continue
-
-        if wait_for_banner and time.time() < appear_deadline:
-            _wait_for_cookie_consent_banner(page)
-            time.sleep(0.25)
-            continue
-
-        return
-
-
-# PAUSE DELAY SECONDS
-def _pause_delay_seconds(min_seconds: float, max_seconds: float) -> float:
-    """Return a human-like delay using the same gamma distribution as pause()."""
-
-    if max_seconds <= min_seconds:
-        return max(min_seconds, 0.0)
-
-    scale = (max_seconds - min_seconds) / 1.8
-    shape = ((min_seconds * 0.9) / scale) + 1.0
-    return min_seconds * 0.1 + random.gammavariate(shape, scale)
 
 
 # CONSENT POLL INTERVAL S
@@ -503,15 +470,12 @@ def pause_for_page(page: Page, min_seconds: float = 1.0, max_seconds: float = 3.
     delays so it can be dismissed before it blocks interactions.
     """
 
-    delay = _pause_delay_seconds(min_seconds, max_seconds)
-    deadline = time.time() + delay
-
-    while time.time() < deadline:
-        _poll_cookie_consent(page)
-        remaining = deadline - time.time()
-        if remaining <= 0:
-            break
-        time.sleep(min(_CONSENT_POLL_INTERVAL_S, remaining))
+    pause_with_poll(
+        lambda: _poll_cookie_consent(page),
+        min_seconds=min_seconds,
+        max_seconds=max_seconds,
+        poll_interval=_CONSENT_POLL_INTERVAL_S,
+    )
 
 
 # WAIT FOR LOAD STATE WITH COOKIE CONSENT
@@ -526,24 +490,15 @@ def _wait_for_load_state_with_cookie_consent(
     between attempts so a late modal does not block the rest of the wait.
     """
 
-    deadline = time.time() + timeout_ms / 1000
-    last_error: Exception | None = None
+    def wait_slice(slice_ms: int) -> None:
+        page.wait_for_load_state(state, timeout=slice_ms)
 
-    while time.time() < deadline:
-        _poll_cookie_consent(page)
-        try:
-            remaining_ms = max(100, int((deadline - time.time()) * 1000))
-            page.wait_for_load_state(state, timeout=min(1000, remaining_ms))
-            return
-        except Exception as exc:
-            last_error = exc
-
-        time.sleep(_CONSENT_POLL_INTERVAL_S)
-
-    if last_error is not None:
-        raise last_error
-
-    raise TimeoutError(f"Timed out waiting for load state {state!r}")
+    wait_with_poll(
+        wait_slice,
+        poll=lambda: _poll_cookie_consent(page),
+        timeout_ms=timeout_ms,
+        poll_interval=_CONSENT_POLL_INTERVAL_S,
+    )
 
 
 # SELECT CLASSIC CARS FILTER
@@ -1405,15 +1360,7 @@ def read_full_prospect_listing(
 
     # extract overview fields using helper function
     mileage_text = get_overview_value(page, "mileage")
-    mileage = None
-    mileage_unit = None
-    if mileage_text:
-        parts = mileage_text.replace(",", "").split(" ")
-        try:
-            mileage = int(parts[0])
-            mileage_unit = parts[1] if len(parts) > 1 else None  # 'm' for miles
-        except (ValueError, IndexError):
-            pass
+    mileage, mileage_unit = parse_mileage(mileage_text)
 
     # get year and registration
     reg_text = get_overview_value(page, "registration")
@@ -1540,64 +1487,28 @@ def read_full_prospect_listing(
     engine = create_engine_with_retry(database_url)
     SessionLocal = sessionmaker(bind=engine)
 
+    image_url_count = 0
     with SessionLocal() as session:
-        # retry the initial persist so a transient db connection failure does
-        # not drop the listing; nothing is committed until this block succeeds
-        def persist_listing():
-            session.add(prospect_listing)
-            session.flush()
-            session.commit()
+        def download_images(active_session, saved_listing):
+            nonlocal image_url_count
+            temp_dir, image_url_count = save_gallery_images(
+                page,
+                saved_listing,
+                active_session,
+                log_index=log_index,
+                log_title=log_title,
+            )
+            return temp_dir, image_url_count
 
-        with_db_retry(persist_listing, description="persist prospect listing")
-
-        # save gallery images after listing is committed
-        temp_image_dir, image_url_count = save_gallery_images(
-            page,
-            prospect_listing,
+        prospect_listing = persist_listing_with_images_and_ai(
             session,
-            log_index=log_index,
-            log_title=log_title,
+            prospect_listing,
+            ai_prompt_filename=ai_prompt_filename,
+            listing_url=url,
+            download_images=download_images,
+            refresh_listing=True,
+            expunge_listing=True,
         )
-
-        # count the images that actually persisted so a partial save can be detected
-        saved_image_count = (
-            session.query(Images)
-            .filter(
-                Images.listing_id == prospect_listing.id,
-                Images.listing_table == ListingTable.PROSPECT,
-            )
-            .count()
-        )
-
-        # a shortfall means some images failed to download; discard the whole
-        # listing so it is not kept incomplete and gets re-fetched on a later pass
-        if image_url_count > 0 and saved_image_count < image_url_count:
-            print(
-                f"  Partial save ({saved_image_count}/{image_url_count} images) — "
-                f"deleting listing {prospect_listing.id}"
-            )
-            if temp_image_dir and os.path.isdir(temp_image_dir):
-                shutil.rmtree(temp_image_dir)
-            delete_listing(prospect_listing, session)
-            raise PageUnresponsiveError(
-                f"partial image download for {url} "
-                f"({saved_image_count}/{image_url_count} images saved)"
-            )
-
-        # generate and apply ai analysis using temp image directory
-        prospect_listing = process_ai_analysis_for_listing(
-            ai_prompt_filename, prospect_listing, session, temp_image_dir
-        )
-
-        # clean up temp directory after use
-        if temp_image_dir and os.path.isdir(temp_image_dir):
-            shutil.rmtree(temp_image_dir)
-
-        # reload column values before detach: the ai-analysis commit expires
-        # attributes, and an expired+expunged instance cannot be read by the
-        # caller (DetachedInstanceError / sqlalchemy code bhk3)
-        session.refresh(prospect_listing)
-        session.expunge(prospect_listing)
 
     log_timestamp()
     return prospect_listing, image_url_count
@@ -1849,22 +1760,14 @@ def scrape_listings(
                 )
 
                 pause_for_page(page,2.0, 10.0)
-            except CaptchaSolveError:
-                # an unsolved challenge will block the rest of the sweep on
-                # this exit ip too, so bubble up for a proxy rotation
-                raise
-            except PageUnresponsiveError:
-                # the chromium renderer or proxy exit ip is wedged; relaunch
-                # on a fresh decodo port rather than skipping listings silently
-                raise
-            except ProxySessionExpired:
-                # availability checks share the scrape deadline; when it elapses
-                # mid-sweep rotate immediately instead of skipping the listing
-                raise
             except Exception as e:
-                if is_proxy_network_error(e):
-                    raise
-                log_listing_error(index, title, e)
+                reraise_or_log_listing_error(
+                    index,
+                    title,
+                    listing_url,
+                    e,
+                    promote_timeouts=False,
+                )
 
         # advance to the next results page
         page_number += 1
@@ -1884,14 +1787,12 @@ def _open_session(playwright) -> tuple:
     session yields a new exit IP. Returns the browser and its page.
     """
 
-    browser = launch_stealth_chromium(playwright, headless=is_headless, use_proxy=True)
-    page = new_stealth_page(browser)
-
-    # allow long per-listing actions but keep navigation short for proxy rotation
-    page.set_default_timeout(LISTING_ACTION_TIMEOUT_MS)
-    page.set_default_navigation_timeout(NAVIGATION_TIMEOUT_MS)
-
-    return browser, page
+    return open_proxied_session(
+        playwright,
+        headless=is_headless,
+        default_timeout_ms=LISTING_ACTION_TIMEOUT_MS,
+        default_navigation_timeout_ms=NAVIGATION_TIMEOUT_MS,
+    )
 
 
 # RUN AUTOTRADER

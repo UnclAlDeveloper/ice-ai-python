@@ -8,10 +8,9 @@ import json
 import os
 import random
 import re
-import shutil
 import time
 from datetime import date, datetime
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qsl, urlparse
 
 from runtime_flags import resolve_runtime_flags
 
@@ -22,37 +21,35 @@ from environments import load_environment
 load_environment()
 
 from stealth_browser import (
-    CaptchaSolveError,
     Page,
     PageUnresponsiveError,
     goto_with_captcha_handling,
-    is_proxy_network_error,
-    launch_stealth_chromium,
-    new_stealth_page,
     page_html,
     quick_locator_count,
     run_quick_page_action,
 )
 from sqlalchemy.orm import sessionmaker
 
-from ai_analysis import process_ai_analysis_for_listing
 from common import (
     create_engine_with_retry,
     generate_hash_code,
     get_existing_source_ids,
     is_http_not_found,
     is_playwright_timeout,
+    parse_mileage,
     pause,
+    pause_with_poll,
     run_with_timeout_backoff,
     wait_for_selector_with_backoff,
-    with_db_retry,
 )
 from listing_images import (
-    delete_listing,
-    download_and_save_listing_images,
+    append_unique_image_url,
+    cap_gallery_urls,
+    merge_image_url_lists,
+    normalize_image_url,
 )
-from models.auto_ads import Images, ProspectListings
-from models.enums import ListingSource, ListingTable, ListingType, ProspectListingStatus
+from models.auto_ads import ProspectListings
+from models.enums import ListingSource, ListingType, ProspectListingStatus
 from scraper_driver import (
     ProxyRotationConfig,
     ProxySessionExpired,
@@ -64,7 +61,6 @@ from scraper_driver import (
     log_no_listings_on_page,
     log_not_available,
     log_paginating_start,
-    log_partial_save,
     log_repeat_page,
     log_resume_scrape,
     log_results_page,
@@ -72,10 +68,15 @@ from scraper_driver import (
     log_scrape_finished,
     log_sold_under_offer_card,
     log_timestamp,
+    mark_listing_processed_and_check_availability,
+    open_proxied_session,
+    persist_listing_with_images_and_ai,
     persist_unavailable_listing_stub,
+    replace_query_params,
+    reraise_or_log_listing_error,
+    run_consent_dismiss_loop,
     run_with_proxy_rotation,
     search_results_present,
-    update_new_listings_availability,
     with_page_param,
 )
 
@@ -149,8 +150,7 @@ def _normalize_image_url(url: str) -> str:
     kept once when collecting gallery image urls.
     """
 
-    parsed = urlparse(url)
-    return urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", "", ""))
+    return normalize_image_url(url)
 
 
 # APPEND UNIQUE IMAGE URL
@@ -160,13 +160,7 @@ def _append_unique_image_url(image_urls: list[str], seen: set[str], src: str | N
     already been collected.
     """
 
-    if not src or not src.startswith("http"):
-        return
-    key = _normalize_image_url(src)
-    if key in seen:
-        return
-    seen.add(key)
-    image_urls.append(src)
+    append_unique_image_url(image_urls, seen, src)
 
 
 # MERGE IMAGE URL LISTS
@@ -176,12 +170,7 @@ def _merge_image_url_lists(*sources: list[str]) -> list[str]:
     keeping the first url variant encountered for each photo.
     """
 
-    image_urls: list[str] = []
-    seen: set[str] = set()
-    for source in sources:
-        for src in source:
-            _append_unique_image_url(image_urls, seen, src)
-    return image_urls
+    return merge_image_url_lists(*sources)
 
 
 # INERTIA GALLERY IMAGES MARKER
@@ -687,38 +676,25 @@ def accept_cookies(
     repeated calls do not probe for a new banner to appear.
     """
 
-    appear_deadline = time.time() + (
-        min(timeout / 1000, _CONSENT_APPEAR_TIMEOUT_S) if wait_for_banner else 0.0
-    )
-    dismiss_deadline = time.time() + (
-        timeout / 1000 if wait_for_banner else 5.0
-    )
     click_timeout = min(timeout, 5000.0)
 
-    while time.time() < dismiss_deadline:
-        if wait_for_banner or _is_cookie_consent_visible(page):
-            if _click_accept_cookies(page, timeout=click_timeout):
-                clear_deadline = time.time() + _CONSENT_CLEAR_TIMEOUT_S
-                while time.time() < clear_deadline:
-                    if not _is_cookie_consent_visible(page):
-                        return
-                    time.sleep(0.25)
-                return
+    def wait_attached() -> None:
+        try:
+            page.locator("#onetrust-accept-btn-handler").wait_for(
+                state="attached", timeout=1000
+            )
+        except Exception:
+            pass
 
-            time.sleep(0.25)
-            continue
-
-        if wait_for_banner and time.time() < appear_deadline:
-            try:
-                page.locator("#onetrust-accept-btn-handler").wait_for(
-                    state="attached", timeout=1000
-                )
-            except Exception:
-                pass
-            time.sleep(0.25)
-            continue
-
-        return
+    run_consent_dismiss_loop(
+        is_visible=lambda: _is_cookie_consent_visible(page),
+        click_dismiss=lambda: _click_accept_cookies(page, timeout=click_timeout),
+        wait_attached=wait_attached,
+        wait_for_banner=wait_for_banner,
+        timeout=timeout,
+        appear_timeout_s=_CONSENT_APPEAR_TIMEOUT_S,
+        clear_timeout_s=_CONSENT_CLEAR_TIMEOUT_S,
+    )
 
 
 # POLL COOKIE CONSENT
@@ -731,18 +707,6 @@ def _poll_cookie_consent(page: Page) -> None:
         accept_cookies(page)
 
 
-# PAUSE DELAY SECONDS
-def _pause_delay_seconds(min_seconds: float, max_seconds: float) -> float:
-    """Return a human-like delay using the same gamma distribution as pause()."""
-
-    if max_seconds <= min_seconds:
-        return max(min_seconds, 0.0)
-
-    scale = (max_seconds - min_seconds) / 1.8
-    shape = ((min_seconds * 0.9) / scale) + 1.0
-    return min_seconds * 0.1 + random.gammavariate(shape, scale)
-
-
 # PAUSE FOR PAGE
 def pause_for_page(
     page: Page, min_seconds: float = 1.0, max_seconds: float = 3.0
@@ -752,15 +716,12 @@ def pause_for_page(
     delays so it can be dismissed before it blocks interactions.
     """
 
-    delay = _pause_delay_seconds(min_seconds, max_seconds)
-    deadline = time.time() + delay
-
-    while time.time() < deadline:
-        _poll_cookie_consent(page)
-        remaining = deadline - time.time()
-        if remaining <= 0:
-            break
-        time.sleep(min(_CONSENT_POLL_INTERVAL_S, remaining))
+    pause_with_poll(
+        lambda: _poll_cookie_consent(page),
+        min_seconds=min_seconds,
+        max_seconds=max_seconds,
+        poll_interval=_CONSENT_POLL_INTERVAL_S,
+    )
 
 
 # DISMISS BLOCKING OVERLAYS
@@ -851,16 +812,11 @@ def _canonical_newest_search_url(url: str) -> str:
     preserving every other filter query parameter from url.
     """
 
-    parsed = urlparse(url)
-    pairs = [
-        (key, value)
-        for key, value in parse_qsl(parsed.query, keep_blank_values=True)
-        if key not in ("sort", "source", "page")
-    ]
-    pairs.append(("sort", "latest"))
-    pairs.append(("source", "modal-sort"))
-
-    return urlunparse(parsed._replace(query=urlencode(pairs)))
+    return replace_query_params(
+        url,
+        drop=("sort", "source", "page"),
+        set_params={"sort": "latest", "source": "modal-sort"},
+    )
 
 
 # EXTRACT SOURCE ID
@@ -873,19 +829,6 @@ def extract_source_id(url: str | None) -> str | None:
 
     match = re.search(r"/l/([^/?#]+)", url or "")
     return match.group(1) if match else None
-
-
-# PARSE MILEAGE
-def parse_mileage(raw: str) -> tuple[int | None, str]:
-    """
-    Split a mileage string like '138,100 Miles' into the numeric value
-    as an integer and the unit string.
-    """
-
-    match = re.match(r"^([\d,]+)\s+(.+)$", raw.strip())
-    if match:
-        return int(match.group(1).replace(",", "")), match.group(2)
-    return None, ""
 
 
 # DISMISS INERTIA ERROR DIALOG
@@ -946,14 +889,7 @@ def extract_gallery_images(page: Page) -> list[str]:
         structured_urls,
     )
 
-    if len(image_urls) > _MAX_GALLERY_IMAGES:
-        print(
-            f"  Gallery returned {len(image_urls)} images "
-            f"(site max is {_MAX_GALLERY_IMAGES}); truncating"
-        )
-        image_urls = image_urls[:_MAX_GALLERY_IMAGES]
-
-    return image_urls
+    return cap_gallery_urls(image_urls, max_images=_MAX_GALLERY_IMAGES)
 
 
 # EXTRACT LISTING DETAILS
@@ -1345,141 +1281,65 @@ def scrape_listings(
 
                 # save to database and download images
                 with SessionLocal() as session:
-                    # retry the initial persist so a transient db connection
-                    # failure (e.g. a momentary dns hiccup) does not drop the
-                    # listing; nothing is committed until this block succeeds
-                    def persist_listing():
-                        session.add(prospect_listing)
-                        session.flush()
-                        session.commit()
-                        session.refresh(prospect_listing)
-
-                    with_db_retry(
-                        persist_listing, description="persist prospect listing"
-                    )
-
-                    # log details once fields and gallery urls are known, before
-                    # the slow download / ai work
-                    log_saved_listing(
-                        index,
-                        title,
-                        make_and_model=prospect_listing.make_and_model,
-                        year=prospect_listing.year,
-                        location=prospect_listing.location,
-                        image_count=len(image_urls),
-                    )
-
-                    temp_image_dir = download_and_save_listing_images(
-                        image_urls,
-                        page,
-                        prospect_listing,
-                        session,
-                        temp_dir_prefix="car_and_classic_images_",
-                    )
-
-                    # count the images that actually persisted so a partial
-                    # save (e.g. a proxy that died mid-download) can be detected
-                    saved_image_count = (
-                        session.query(Images)
-                        .filter(
-                            Images.listing_id == prospect_listing.id,
-                            Images.listing_table == ListingTable.PROSPECT,
-                        )
-                        .count()
-                    )
-
-                    # a shortfall means some images failed to download; discard
-                    # the whole listing (row, images and s3 objects) so it is not
-                    # kept incomplete and gets re-fetched cleanly on a later pass
-                    if image_urls and saved_image_count < len(image_urls):
-                        log_partial_save(
+                    def on_after_persist(saved: ProspectListings) -> None:
+                        log_saved_listing(
                             index,
-                            saved_image_count,
-                            len(image_urls),
-                            prospect_listing.id,
+                            title,
+                            make_and_model=saved.make_and_model,
+                            year=saved.year,
+                            location=saved.location,
+                            image_count=len(image_urls),
                         )
-                        if temp_image_dir and os.path.isdir(temp_image_dir):
-                            shutil.rmtree(temp_image_dir)
-                        delete_listing(prospect_listing, session)
+
+                    try:
+                        persist_listing_with_images_and_ai(
+                            session,
+                            prospect_listing,
+                            ai_prompt_filename="classic_car_prompt.md",
+                            listing_url=listing_url,
+                            image_urls=image_urls,
+                            page=page,
+                            temp_dir_prefix="car_and_classic_images_",
+                            on_after_persist=on_after_persist,
+                            log_index=index,
+                        )
+                    except PageUnresponsiveError:
                         new_count -= 1
-                        raise PageUnresponsiveError(
-                            f"partial image download for {listing_url} "
-                            f"({saved_image_count}/{len(image_urls)} images saved)"
-                        )
+                        raise
 
-                    process_ai_analysis_for_listing(
-                        "classic_car_prompt.md",
-                        prospect_listing,
-                        session,
-                        temp_image_dir,
-                    )
-
-                    if temp_image_dir and os.path.isdir(temp_image_dir):
-                        shutil.rmtree(temp_image_dir)
-
-                    # reload column values before the session closes: the
-                    # ai-analysis commit expires attributes, and an expired
-                    # instance cannot be read after detach (DetachedInstanceError)
-                    session.refresh(prospect_listing)
-
-                log_timestamp()
-
-                if source_id is not None:
-                    existing_source_ids.add(source_id)
-                processed_ids.add(card_id)
-
-                # after each newly saved listing, run a randomized availability sweep
-                update_new_listings_availability(
+                mark_listing_processed_and_check_availability(
                     page,
+                    source_id=source_id,
+                    card_id=card_id,
+                    existing_source_ids=existing_source_ids,
+                    processed_ids=processed_ids,
                     listing_source=ListingSource.CAR_AND_CLASSIC,
+                    listing_type=ListingType.CLASSIC,
                     is_unavailable_fn=is_listing_no_longer_available,
-                    limit=random.randint(1, 4),
                     config=CONFIG,
                     deadline=deadline,
-                    listing_type=ListingType.CLASSIC,
                 )
 
-            except CaptchaSolveError:
-                # an unsolved challenge will block the rest of the sweep on
-                # this exit ip too, so bubble up for a proxy rotation
-                raise
-            except PageUnresponsiveError:
-                # the chromium renderer or proxy exit ip is wedged; relaunch
-                # on a fresh decodo port rather than skipping listings silently
-                raise
-            except ProxySessionExpired:
-                # availability checks share the scrape deadline; when it elapses
-                # mid-sweep rotate immediately instead of skipping the listing
-                raise
             except Exception as e:
-                if is_proxy_network_error(e):
-                    # tunnel/connection failures mean the sticky session is dead;
-                    # rotate rather than skipping every remaining listing
-                    raise
-                if is_playwright_timeout(e):
-                    if _unavailable_banner_in_page_html(page):
-                        log_not_available(index, title, "unavailable")
-                        with SessionLocal() as session:
-                            persist_unavailable_listing_stub(
-                                session,
-                                listing_source=ListingSource.CAR_AND_CLASSIC,
-                                listing_type=ListingType.CLASSIC,
-                                hash_code=hash_code,
-                                source_id=source_id,
-                                url=listing_url,
-                                make_and_model=title,
-                                short_description=title,
-                            )
-                        if source_id is not None:
-                            existing_source_ids.add(source_id)
-                        processed_ids.add(card_id)
-                        continue
+                if is_playwright_timeout(e) and _unavailable_banner_in_page_html(page):
+                    log_not_available(index, title, "unavailable")
+                    with SessionLocal() as session:
+                        persist_unavailable_listing_stub(
+                            session,
+                            listing_source=ListingSource.CAR_AND_CLASSIC,
+                            listing_type=ListingType.CLASSIC,
+                            hash_code=hash_code,
+                            source_id=source_id,
+                            url=listing_url,
+                            make_and_model=title,
+                            short_description=title,
+                        )
+                    if source_id is not None:
+                        existing_source_ids.add(source_id)
+                    processed_ids.add(card_id)
+                    continue
 
-                    raise PageUnresponsiveError(
-                        f"listing page timed out for {listing_url}"
-                    ) from e
-
-                log_listing_error(index, title, e)
+                reraise_or_log_listing_error(index, title, listing_url, e)
 
         # new-vehicles section has no pagination, so stop after one pass
         if use_new_section:
@@ -1510,16 +1370,16 @@ def _open_session(playwright) -> tuple:
     exit IP. Returns the browser and its page.
     """
 
-    browser = launch_stealth_chromium(playwright, headless=is_headless, use_proxy=True)
-    page = new_stealth_page(browser)
+    def on_ready(page: Page) -> None:
+        pause_for_page(page)
+        accept_cookies(page, wait_for_banner=True)
 
-    # land on the search page, solving any captcha that interrupts the load
-    goto_with_captcha_handling(page, "https://www.carandclassic.com/search")
-
-    pause_for_page(page)
-    accept_cookies(page, wait_for_banner=True)
-
-    return browser, page
+    return open_proxied_session(
+        playwright,
+        headless=is_headless,
+        landing_url="https://www.carandclassic.com/search",
+        on_ready=on_ready,
+    )
 
 
 # APPLY SEARCH FILTERS

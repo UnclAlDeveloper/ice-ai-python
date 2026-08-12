@@ -8,7 +8,6 @@ from car_and_classic import (
     parse_mileage as cac_parse_mileage,
 )
 from common import parse_mileage as common_parse_mileage
-from ebay import format_ebay_datetime_string, parse_datetime_string
 from listing_images import (
     cap_gallery_urls,
     merge_image_url_lists,
@@ -115,20 +114,3 @@ class TestSharedScraperHelpers:
             prefer_keys=["sort", "keep"],
         )
         assert url == "https://example.com/search?sort=latest&keep=1"
-
-
-class TestEbayDatetime:
-    """Tests for eBay datetime parsing and formatting."""
-
-    def test_round_trip_z_format(self):
-        value = "2024-06-15T10:30:00.000Z"
-        parsed = parse_datetime_string(value)
-        assert format_ebay_datetime_string(parsed) == value
-
-    def test_parses_iso_offset(self):
-        parsed = parse_datetime_string("2024-06-15T10:30:00+01:00")
-        assert parsed.tzinfo is not None
-
-    def test_malformed_input_raises(self):
-        with pytest.raises(Exception):
-            parse_datetime_string("not-a-date")

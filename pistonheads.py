@@ -107,6 +107,9 @@ _IMAGE_URL_PATTERN = re.compile(r"https://img\.pistonheads\.com/[^\"'\\\s>]+")
 _DESCRIPTION_CONTAINER_SELECTOR = 'div[class*="Description_description"]'
 _READ_MORE_SUFFIX = re.compile(r"\s*Read more\s*$", re.IGNORECASE)
 _DRAWER_SELECTOR = ".MuiDrawer-root"
+_DRAWER_CONTENT_SELECTOR = "h3, dl dt, li"
+_DRAWER_CONTENT_TIMEOUT_MS = 12_000
+_CARD_TO_NAVIGATE_BUTTON_SELECTOR = 'button[class*="CardToNavigate_button"]'
 _OVERVIEW_SPECS_BUTTON_TEXT = "Overview and specs"
 _VEHICLE_HISTORY_BUTTON_TEXT = "Vehicle history"
 _MOT_EXPIRY_DATE_PATTERN = re.compile(
@@ -129,8 +132,8 @@ _PAUSE_LISTING_MIN_S = 2.5
 _PAUSE_LISTING_MAX_S = 6.0
 _PAUSE_BATCH_MIN_S = 2.0
 _PAUSE_BATCH_MAX_S = 4.0
-_PAUSE_DRAWER_MIN_S = 0.8
-_PAUSE_DRAWER_MAX_S = 1.5
+_PAUSE_DRAWER_MIN_S = 1.0
+_PAUSE_DRAWER_MAX_S = 2.0
 _PAUSE_BETWEEN_LISTINGS_MIN_S = 1.5
 _PAUSE_BETWEEN_LISTINGS_MAX_S = 3.5
 _PAUSE_SESSION_MIN_S = 3.0
@@ -178,12 +181,47 @@ def _locator_is_visible(locator) -> bool:
     return locator_is_visible(locator)
 
 
+# QUANTCAST OVERLAY BLOCKS PAGE
+def _quantcast_overlay_blocks_page(page: Page) -> bool:
+    """
+    Return True when a Quantcast CMP node is still in the layout and can
+    intercept clicks even if the usual banner visibility checks miss it.
+    """
+
+    try:
+        return bool(
+            page.evaluate(
+                """() => {
+                    const nodes = document.querySelectorAll(
+                        '#qc-cmp2-container, #qc-cmp2-ui, .qc-cmp-cleanslate'
+                    );
+                    for (const el of nodes) {
+                        const style = getComputedStyle(el);
+                        if (style.display === 'none' || style.visibility === 'hidden') {
+                            continue;
+                        }
+                        const rect = el.getBoundingClientRect();
+                        if (rect.width > 0 && rect.height > 0) {
+                            return true;
+                        }
+                    }
+                    return false;
+                }"""
+            )
+        )
+    except Exception:
+        return False
+
+
 # IS QUANTCAST CONSENT VISIBLE
 def _is_quantcast_consent_visible(page: Page) -> bool:
     """
     Return True when the Quantcast Choice consent banner is visible on the page
     or inside a consent iframe.
     """
+
+    if _quantcast_overlay_blocks_page(page):
+        return True
 
     for root in _iter_consent_search_roots(page):
         for selector in _QUANTCAST_CONSENT_NOTICE_SELECTORS:
@@ -243,8 +281,9 @@ def _click_quantcast_consent(page: Page, timeout: float = 5000) -> bool:
                 except Exception:
                     continue
 
-                if not _is_quantcast_consent_visible(page):
-                    return True
+                # CMP often leaves a cleanslate shell that still eats clicks
+                _remove_consent_overlays(page)
+                return True
 
             for button_name in _QUANTCAST_ACCEPT_BUTTON_NAMES:
                 button = root.get_by_role("button", name=button_name, exact=True)
@@ -256,15 +295,17 @@ def _click_quantcast_consent(page: Page, timeout: float = 5000) -> bool:
                 except Exception:
                     continue
 
-                if not _is_quantcast_consent_visible(page):
-                    return True
+                _remove_consent_overlays(page)
+                return True
 
         if not _is_quantcast_consent_visible(page):
+            _remove_consent_overlays(page)
             return True
 
         time.sleep(_CONSENT_POLL_INTERVAL_S)
 
-    return not _is_quantcast_consent_visible(page)
+    _remove_consent_overlays(page)
+    return not _quantcast_overlay_blocks_page(page)
 
 
 # CLICK ONETRUST COOKIES
@@ -300,16 +341,20 @@ def _remove_consent_overlays(page: Page) -> None:
     intercept pointer events after consent is recorded.
     """
 
-    page.evaluate(
-        """() => {
-            document
-                .querySelectorAll(
-                    '.onetrust-pc-dark-filter, #onetrust-banner-sdk, ' +
-                    '.qc-cmp2-container, #qc-cmp2-ui, .qc-cmp2-summary-section'
-                )
-                .forEach((el) => el.remove());
-        }"""
-    )
+    try:
+        page.evaluate(
+            """() => {
+                document
+                    .querySelectorAll(
+                        '.onetrust-pc-dark-filter, #onetrust-banner-sdk, ' +
+                        '.qc-cmp2-container, #qc-cmp2-ui, .qc-cmp2-summary-section, ' +
+                        '.qc-cmp-cleanslate'
+                    )
+                    .forEach((el) => el.remove());
+            }"""
+        )
+    except Exception:
+        pass
 
 
 # CLICK ACCEPT COOKIES
@@ -330,11 +375,9 @@ def _click_accept_cookies(page: Page, timeout: float = 5000) -> bool:
     if _is_onetrust_consent_visible(page):
         _click_onetrust_cookies(page, timeout=timeout)
 
-    if not _is_cookie_consent_visible(page):
-        _remove_consent_overlays(page)
-        return True
-
-    return False
+    # always strip leftover CMP shells that keep intercepting clicks
+    _remove_consent_overlays(page)
+    return not _is_cookie_consent_visible(page)
 
 
 # WAIT FOR CONSENT BANNER ATTACHED
@@ -633,31 +676,78 @@ def _extract_listing_description(page: Page) -> tuple[str | None, str | None]:
     return short_description, full_text
 
 
+# LISTING DRAWER
+def _listing_drawer(page: Page):
+    """
+    Return the temporary listing detail drawer (Overview/specs or Vehicle
+    history). Filters to MuiDrawer roots that expose a Close button so a
+    permanent nav drawer is not mistaken for an open listing panel.
+    """
+
+    return page.locator(_DRAWER_SELECTOR).filter(
+        has=page.locator('button[aria-label="Close"]')
+    ).first
+
+
+# LISTING DRAWER CLOSE BUTTON
+def _listing_drawer_close_button(page: Page):
+    """
+    Return the Close control inside the temporary listing detail drawer.
+    """
+
+    return _listing_drawer(page).locator('button[aria-label="Close"]').first
+
+
+# LISTING DRAWER IS OPEN
+def _listing_drawer_is_open(page: Page) -> bool:
+    """
+    Return True when the listing detail drawer Close button is visible.
+    Uses a short Playwright visibility timeout so a stuck count cannot trip
+    the hard page-kill watchdog.
+    """
+
+    try:
+        return _listing_drawer_close_button(page).is_visible(timeout=500)
+    except Exception:
+        return False
+
+
+# WAIT FOR DRAWER CONTENT
+def _wait_for_drawer_content(
+    page: Page,
+    *,
+    timeout_ms: float = _DRAWER_CONTENT_TIMEOUT_MS,
+) -> bool:
+    """
+    Wait until the open listing drawer has rendered section headings or list
+    content rather than only the empty drawer shell. Returns True when content
+    is visible within the timeout.
+    """
+
+    content = _listing_drawer(page).locator(_DRAWER_CONTENT_SELECTOR).first
+    try:
+        content.wait_for(state="visible", timeout=timeout_ms)
+        return True
+    except Exception:
+        return False
+
+
 # CLOSE OPEN DRAWER
 def _close_open_drawer(page: Page) -> None:
     """
     Close the listing detail drawer when one is open so another section can be
-    opened without its backdrop intercepting clicks.
+    opened without its backdrop intercepting clicks. Only clicks the drawer
+    Close button; Escape is avoided because it can dismiss unrelated UI.
     """
 
-    drawer = page.locator(_DRAWER_SELECTOR)
-    if quick_locator_count(drawer, description="listing drawer") == 0:
+    if not _listing_drawer_is_open(page):
         return
 
-    close_button = page.locator('button[aria-label="Close"]')
-    if quick_locator_count(close_button, description="drawer close button") > 0:
-        try:
-            close_button.first.click(timeout=2000)
-            pause_for_page(
-                page,
-                min_seconds=_PAUSE_DRAWER_MIN_S,
-                max_seconds=_PAUSE_DRAWER_MAX_S,
-            )
-            return
-        except Exception:
-            pass
+    try:
+        _listing_drawer_close_button(page).click(timeout=2000)
+    except Exception:
+        return
 
-    page.keyboard.press("Escape")
     pause_for_page(
         page,
         min_seconds=_PAUSE_DRAWER_MIN_S,
@@ -669,20 +759,44 @@ def _close_open_drawer(page: Page) -> None:
 def _open_drawer(page: Page, button_text: str) -> bool:
     """
     Open a listing detail drawer such as Overview and specs or Vehicle history.
-    Returns True when the drawer becomes visible.
+    Returns True when the drawer is visible and has populated content.
     """
 
     _close_open_drawer(page)
-    _poll_cookie_consent(page)
+    # Quantcast often re-injects a cleanslate overlay that intercepts the
+    # CardToNavigate click; dismiss then forcibly detach any leftover shell
+    accept_cookies(page, wait_for_banner=False, timeout=5000)
+    _remove_consent_overlays(page)
 
-    button = page.locator(f'button:has-text("{button_text}")').first
-    if quick_locator_count(button, description=f"{button_text} button") == 0:
+    button = page.locator(_CARD_TO_NAVIGATE_BUTTON_SELECTOR).filter(
+        has=page.get_by_role("heading", name=button_text, exact=True)
+    )
+    try:
+        button.first.wait_for(state="visible", timeout=5000)
+    except Exception:
         return False
 
-    button.click()
+    for attempt in range(2):
+        try:
+            _remove_consent_overlays(page)
+            button.first.scroll_into_view_if_needed(timeout=5000)
+            _remove_consent_overlays(page)
+            button.first.click(timeout=8000)
+            break
+        except Exception:
+            if attempt == 0:
+                accept_cookies(page, wait_for_banner=False, timeout=5000)
+                _remove_consent_overlays(page)
+                continue
+            return False
+
     try:
-        page.locator(_DRAWER_SELECTOR).first.wait_for(state="visible", timeout=5000)
+        _listing_drawer_close_button(page).wait_for(state="visible", timeout=5000)
     except Exception:
+        return False
+
+    # drawer shell can paint before overview/history sections hydrate
+    if not _wait_for_drawer_content(page):
         return False
 
     pause_for_page(
@@ -691,6 +805,23 @@ def _open_drawer(page: Page, button_text: str) -> bool:
         max_seconds=_PAUSE_DRAWER_MAX_S,
     )
     return True
+
+
+# DRAWER SECTION LIST LOCATOR
+def _drawer_section_list_locator(heading, tag_name: str):
+    """
+    Locate the dl or ul that belongs to a drawer section heading. Prefer a
+    direct following sibling, then a list nested in the immediately following
+    sibling container (common when PistonHeads wraps the definition list).
+    """
+
+    direct = heading.locator(f"xpath=following-sibling::{tag_name}[1]")
+    if quick_locator_count(direct, description=f"drawer section {tag_name}") > 0:
+        return direct
+
+    return heading.locator(
+        f"xpath=following-sibling::*[1]//{tag_name}[1]"
+    )
 
 
 # APPEND DRAWER SECTION TO MARKDOWN
@@ -705,7 +836,7 @@ def _append_drawer_section_to_markdown(
     """
 
     section_items: list[str] = []
-    definition_list = heading.locator("xpath=following-sibling::dl[1]")
+    definition_list = _drawer_section_list_locator(heading, "dl")
     if quick_locator_count(definition_list, description="drawer section dl") > 0:
         labels = definition_list.locator("dt")
         values = definition_list.locator("dd")
@@ -719,7 +850,7 @@ def _append_drawer_section_to_markdown(
             if label and value:
                 section_items.append(f"- {label}: {value}")
 
-    feature_list = heading.locator("xpath=following-sibling::ul[1]")
+    feature_list = _drawer_section_list_locator(heading, "ul")
     if quick_locator_count(feature_list, description="drawer section ul") > 0:
         list_items = feature_list.locator("li")
         item_count = quick_locator_count(
@@ -748,7 +879,7 @@ def _extract_specs_and_features(page: Page) -> str | None:
     if not _open_drawer(page, _OVERVIEW_SPECS_BUTTON_TEXT):
         return None
 
-    drawer = page.locator(_DRAWER_SELECTOR).first
+    drawer = _listing_drawer(page)
     markdown_parts: list[str] = []
     headings = drawer.locator("h3")
     heading_count = quick_locator_count(
@@ -818,7 +949,7 @@ def _extract_vehicle_history_mot(page: Page) -> tuple[str | None, date | None]:
     if not _open_drawer(page, _VEHICLE_HISTORY_BUTTON_TEXT):
         return None, None
 
-    drawer = page.locator(_DRAWER_SELECTOR).first
+    drawer = _listing_drawer(page)
     mot_status = None
     mot_expiry = None
 
@@ -988,13 +1119,11 @@ def extract_listing_details(
     return a populated ProspectListings instance along with gallery image URLs.
     """
 
-    return run_quick_page_action(
-        page,
-        lambda: _extract_listing_details_impl(
-            page, hash_code, source_id, fallback_title
-        ),
-        description="listing field extraction",
-        timeout_ms=90_000,
+    # deliberately not wrapped in run_quick_page_action: drawer opens, consent
+    # waits and gallery loads are expected to take longer than the hard-kill
+    # watchdog budget, and that watchdog terminates the whole Chromium process
+    return _extract_listing_details_impl(
+        page, hash_code, source_id, fallback_title
     )
 
 

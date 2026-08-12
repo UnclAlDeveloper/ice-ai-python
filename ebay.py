@@ -1,44 +1,57 @@
-import argparse
 import os
-import sys
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Generator, Optional, Union
 
-# parse --env before load_environment so the chosen env file is selected at import time
-_pre_parser = argparse.ArgumentParser(add_help=False)
-_pre_parser.add_argument("--env", choices=["dev", "prod"], default=None)
-_pre_args, _remaining_argv = _pre_parser.parse_known_args()
-if _pre_args.env is not None:
-    os.environ["ENVIRONMENT"] = "production" if _pre_args.env == "prod" else "dev"
-sys.argv[:] = [sys.argv[0]] + _remaining_argv
+from runtime_flags import resolve_runtime_flags
+
+is_headless = resolve_runtime_flags()
 
 from environments import load_environment
 load_environment()
 
-import shutil
-from datetime import datetime, timezone
-from typing import Generator, Optional, Union
-
 from pydantic import BaseModel, PrivateAttr
-from stealth_browser import Page, launch_stealth_chromium, sync_stealth_playwright
 from sqlalchemy.orm import sessionmaker
+
+from ebay_rest import API, Error
+from ebay_rest.date_time import DateTime
 
 from common import (
     create_engine_with_retry,
     generate_hash_code,
-    get_existing_hash_codes,
+    get_existing_source_ids,
     get_oauth_tokens,
-    is_http_not_found,
-    is_not_found_error,
+    parse_mileage,
     pause,
-    save_oauth_tokens,
-    with_db_retry,
 )
-from listing_images import delete_listing_images, download_and_save_listing_images
 from models.auto_ads import ProspectListings
-from ai_analysis import process_ai_analysis_for_listing
 from models.enums import ListingSource, ListingType, ProspectListingStatus
+from scraper_driver import (
+    ProxyRotationConfig,
+    log_already_exists,
+    log_listing_error,
+    log_loaded_source_ids,
+    log_not_available,
+    log_processing_new_listing,
+    log_saved_listing,
+    log_scrape_finished,
+    log_skipping,
+    mark_listing_processed_and_check_availability,
+    persist_listing_with_images_and_ai,
+    run_consent_dismiss_loop,
+    update_new_listings_availability as scraper_update_new_listings_availability,
+)
+from stealth_browser import (
+    Page,
+    goto_with_captcha_handling,
+    launch_stealth_chromium,
+    sync_stealth_playwright,
+)
 
-from ebay_rest import API, Error
-from ebay_rest.date_time import DateTime
+EBAY_VANS_CATEGORY_ID = "122202"
+EBAY_CLASSICS_CATEGORY_ID = "1839833"
+
+CONFIG = ProxyRotationConfig.from_env_prefix("EBAY")
 
 UNAVAILABLE_ADVERT_TEXTS = (
     "Bidding ended on",
@@ -46,6 +59,27 @@ UNAVAILABLE_ADVERT_TEXTS = (
     "This listing sold on",
     "This listing was ended",
 )
+
+
+# EBAY SCRAPE CONFIG
+@dataclass
+class EbayScrapeConfig:
+    """
+    Parameters that distinguish a vans scrape from a classics scrape while
+    sharing the same eBay API search and browser enrichment pipeline.
+    """
+
+    listing_type: ListingType
+    ai_prompt_filename: str
+    query: str
+    category_id: str
+    marketplace: str = "GB"
+    limit: Optional[int] = None
+    min_price: Optional[float] = None
+    max_price: Optional[float] = None
+    pickup_postal_code: Optional[str] = None
+    pickup_radius: Optional[int] = None
+    availability_check_limit: int = 500
 
 
 # PARSE DATETIME STRING
@@ -88,17 +122,209 @@ def format_ebay_datetime_string(value: Union[datetime, str]) -> str:
     return DateTime.to_string(dt)
 
 
-# ACCEPT EBAY COOKIE CONSENT IF PRESENT
-def accept_ebay_cookie_consent_if_present(page: Page) -> None:
+# PARSE AUCTION CLOSE DATETIME
+def parse_auction_close_datetime(text: str) -> Optional[datetime]:
     """
-    Click 'Accept all' on the eBay GDPR cookie banner if visible, then wait
-    until the banner has disappeared. No-op if the banner is not present.
+    Parse auction close datetime from eBay timer format (dd/mm, hh:mi).
+    Returns a datetime or None if parsing fails. Infers year from current date.
+    """
+
+    try:
+        parts = text.split(",")
+        if len(parts) != 2:
+            return None
+        date_part = parts[0].strip()
+        time_part = parts[1].strip()
+        day, month = map(int, date_part.split("/"))
+        hour, minute = map(int, time_part.split(":"))
+        now = datetime.now()
+        parsed = datetime(now.year, month, day, hour, minute, 0, 0)
+        if parsed < now:
+            parsed = datetime(now.year + 1, month, day, hour, minute, 0, 0)
+        return parsed
+    except (ValueError, IndexError):
+        return None
+
+
+# BUILD SEARCH FILTERS
+def build_search_filters(
+    *,
+    min_price: Optional[float] = None,
+    max_price: Optional[float] = None,
+    pickup_postal_code: Optional[str] = None,
+    pickup_radius: Optional[int] = None,
+) -> list[str]:
+    """
+    Build eBay Browse API filter strings for price and local pickup constraints.
+    Raises ValueError when only one pickup parameter is provided.
+    """
+
+    filters: list[str] = []
+    if min_price is not None or max_price is not None:
+        price_min = min_price if min_price is not None else 0
+        price_max = max_price if max_price is not None else ""
+        filters.append(f"price:[{price_min}..{price_max}]")
+
+    if pickup_postal_code is not None and pickup_radius is not None:
+        filters.append(f"pickupPostalCode:{pickup_postal_code}")
+        filters.append(f"pickupRadius:{pickup_radius}")
+        filters.append("pickupCountry:GB")
+        filters.append("pickupRadiusUnit:mi")
+        filters.append("deliveryOptions:{SELLER_ARRANGED_LOCAL_PICKUP}")
+    elif pickup_postal_code is not None or pickup_radius is not None:
+        raise ValueError(
+            "For local pickup searches, both pickup_postal_code and pickup_radius "
+            "must be provided"
+        )
+
+    return filters
+
+
+# PARSE ASKING PRICE
+def parse_asking_price(price_value: object) -> int:
+    """
+    Convert an eBay Browse API price value to an integer pounds/dollars amount.
+    """
+
+    if isinstance(price_value, str):
+        return int(float(price_value.replace(",", "")))
+    return int(float(price_value))
+
+
+# CURRENCY SYMBOL FROM CODE
+def currency_symbol_from_code(currency: str) -> str:
+    """
+    Map an ISO currency code from the Browse API to a display symbol.
+    """
+
+    if currency == "GBP":
+        return "£"
+    if currency == "USD":
+        return "$"
+    return ""
+
+
+# BUILD MAKE AND MODEL
+def build_make_and_model(
+    details: dict,
+    *,
+    title: str,
+) -> str:
+    """
+    Build make_and_model from extracted item specifics, falling back to the title.
+    """
+
+    make = details.get("make") or ""
+    model = details.get("model") or ""
+    if make or model:
+        return f"{make} {model}".strip()
+    if make:
+        return make
+    if model:
+        return model
+    return title
+
+
+# BUILD PROSPECT LISTING
+def build_prospect_listing(
+    *,
+    listing: dict,
+    details: dict,
+    listing_type: ListingType,
+    hash_code: str,
+    make_and_model: str,
+    current_datetime: datetime,
+) -> ProspectListings:
+    """
+    Build a ProspectListings row from a Browse API record and page-extracted details.
+    """
+
+    title = listing.get("title", "")
+    item_web_url = listing.get("item_web_url", "")
+    price_info = listing.get("price", {})
+    asking_price_raw = price_info.get("value")
+    currency = price_info.get("currency", "")
+    item_location = listing.get("item_location", {})
+    location = item_location.get("city", "")
+    source_id = listing.get("item_id")
+
+    return ProspectListings(
+        hash_code=hash_code,
+        source_id=source_id,
+        listing_source=ListingSource.EBAY,
+        listing_type=listing_type,
+        status=ProspectListingStatus.NEW,
+        short_description=title,
+        full_description=details.get("full_description"),
+        url=item_web_url,
+        asking_price=parse_asking_price(asking_price_raw),
+        currency_symbol=currency_symbol_from_code(currency),
+        location=location,
+        make_and_model=make_and_model,
+        body_type=details.get("body_type"),
+        engine_size=details.get("engine_size"),
+        fuel_type=details.get("fuel_type"),
+        gearbox_type=details.get("transmission"),
+        year=details.get("year"),
+        colour=details.get("colour"),
+        mileage=details.get("mileage"),
+        mileage_unit=details.get("mileage_unit"),
+        auction_closes=details.get("auction_closes"),
+        created_at=current_datetime,
+        updated_at=current_datetime,
+    )
+
+
+# IS EBAY COOKIE CONSENT VISIBLE
+def _is_ebay_cookie_consent_visible(page: Page) -> bool:
+    """
+    Return True when the eBay GDPR cookie banner or its accept button is present.
+    """
+
+    if page.query_selector("#gdpr-banner-accept") is not None:
+        return True
+    return page.query_selector("#gdpr-banner") is not None
+
+
+# CLICK EBAY COOKIE CONSENT DISMISS
+def _click_ebay_cookie_consent_dismiss(page: Page) -> bool:
+    """
+    Click 'Accept all' on the eBay GDPR cookie banner when the button is present.
     """
 
     accept_btn = page.query_selector("#gdpr-banner-accept")
-    if accept_btn:
-        accept_btn.click()
-        page.wait_for_selector("#gdpr-banner", state="hidden", timeout=10000)
+    if accept_btn is None:
+        return False
+
+    accept_btn.click()
+    return True
+
+
+# DISMISS EBAY COOKIE CONSENT
+def dismiss_ebay_cookie_consent(page: Page, *, wait_for_banner: bool = False) -> None:
+    """
+    Dismiss the eBay GDPR cookie banner using the shared consent dismiss loop.
+    """
+
+    run_consent_dismiss_loop(
+        is_visible=lambda: _is_ebay_cookie_consent_visible(page),
+        click_dismiss=lambda: _click_ebay_cookie_consent_dismiss(page),
+        wait_attached=lambda: page.wait_for_selector(
+            "#gdpr-banner-accept", state="attached", timeout=5000
+        ),
+        wait_for_banner=wait_for_banner,
+        timeout=10000,
+    )
+
+
+# ACCEPT EBAY COOKIE CONSENT IF PRESENT
+def accept_ebay_cookie_consent_if_present(page: Page) -> None:
+    """
+    Dismiss the eBay GDPR cookie banner when visible. Kept for compatibility with
+    older call sites; prefer dismiss_ebay_cookie_consent.
+    """
+
+    dismiss_ebay_cookie_consent(page, wait_for_banner=False)
 
 
 # IS LISTING NO LONGER AVAILABLE
@@ -113,107 +339,59 @@ def is_listing_no_longer_available(page: Page) -> bool:
     return False
 
 
-# UPDATE NEW LISTINGS AVAILABILITY
-def update_new_listings_availability(page: Page) -> None:
+# EBAY IS UNAVAILABLE
+def _ebay_is_unavailable(page: Page) -> bool:
     """
-    Visit each eBay prospect listing with status New and mark any that are
-    no longer available as NotAvailable.
+    Accept cookie consent when needed, then detect ended eBay listing pages.
     """
 
-    database_url = os.getenv("AUTO_ADS_DATABASE_URL")
-    engine = create_engine_with_retry(database_url)
-    SessionLocal = sessionmaker(bind=engine)
-
-    with SessionLocal() as session:
-        # retry the initial load so a transient db hiccup at sweep start does
-        # not abort the whole availability check
-        new_listings = with_db_retry(
-            lambda: (
-                session.query(ProspectListings)
-                .filter(
-                    ProspectListings.listing_source == ListingSource.EBAY,
-                    ProspectListings.status == ProspectListingStatus.NEW,
-                )
-                .order_by(ProspectListings.id)
-                .all()
-            ),
-            description="load New listings for availability check",
-        )
-
-        if not new_listings:
-            print("No New eBay listings to check for availability")
-            return
-
-        print(f"Checking availability of {len(new_listings)} New eBay listings...")
-
-        for listing in new_listings:
-            print(
-                f"Checking: {listing.make_and_model} - {listing.short_description[:50]}..."
-            )
-
-            # guard each visit so one bad listing does not abort the whole sweep
-            try:
-                response = page.goto(listing.url, wait_until="domcontentloaded")
-
-                if is_http_not_found(response):
-                    listing.status = ProspectListingStatus.NOT_AVAILABLE
-                    listing.updated_at = datetime.now()
-                    session.commit()
-                    print(f"  Marked as NotAvailable (404): {listing.url}")
-
-                    # drop the now-orphaned photos from s3 and the images table
-                    delete_listing_images(listing, session)
-                else:
-                    accept_ebay_cookie_consent_if_present(page)
-
-                    if is_listing_no_longer_available(page):
-                        listing.status = ProspectListingStatus.NOT_AVAILABLE
-                        listing.updated_at = datetime.now()
-                        session.commit()
-                        print(f"  Marked as NotAvailable (unavailable): {listing.url}")
-
-                        # drop the now-orphaned photos from s3 and the images table
-                        delete_listing_images(listing, session)
-                    else:
-                        print("  Still available")
-            except Exception as e:
-                if is_not_found_error(e):
-                    listing.status = ProspectListingStatus.NOT_AVAILABLE
-                    listing.updated_at = datetime.now()
-                    session.commit()
-                    print(f"  Marked as NotAvailable (404): {listing.url}")
-
-                    # drop the now-orphaned photos from s3 and the images table
-                    delete_listing_images(listing, session)
-                else:
-                    session.rollback()
-                    print(f"  Error checking {listing.url}: {e}")
-
-            pause(1.0, 2.0)
-
-        print("Finished availability check for New listings")
+    dismiss_ebay_cookie_consent(page)
+    return is_listing_no_longer_available(page)
 
 
 # EBAY DOWNLOADER
 class EbayDownloader(BaseModel):
     """
-    Download and process van listings from eBay. Holds configuration as model fields
-    and browser/API state as private attributes. Use as a context for consistent
-    marketplace, search, and filter settings across operations.
+    Download and process eBay listings via the Browse API and browser enrichment.
+    Holds configuration as model fields and browser/API state as private attributes.
     """
 
+    listing_type: ListingType
+    ai_prompt_filename: str
     marketplace: str = "GB"
     query: str = "van"
-    category_id: str = "122202"
+    category_id: str = EBAY_VANS_CATEGORY_ID
     limit: Optional[int] = None
     min_price: Optional[float] = None
     max_price: Optional[float] = None
     pickup_postal_code: Optional[str] = None
     pickup_radius: Optional[int] = None
+    availability_check_limit: int = 500
 
     _api: Optional[API] = PrivateAttr(default=None)
     _browser: Optional[object] = PrivateAttr(default=None)
     _page: Optional[object] = PrivateAttr(default=None)
+
+    # FROM CONFIG
+    @classmethod
+    def from_config(cls, config: EbayScrapeConfig) -> "EbayDownloader":
+        """
+        Build an EbayDownloader from a scrape config dataclass.
+        """
+
+        return cls(
+            listing_type=config.listing_type,
+            ai_prompt_filename=config.ai_prompt_filename,
+            marketplace=config.marketplace,
+            query=config.query,
+            category_id=config.category_id,
+            limit=config.limit,
+            min_price=config.min_price,
+            max_price=config.max_price,
+            pickup_postal_code=config.pickup_postal_code,
+            pickup_radius=config.pickup_radius,
+            availability_check_limit=config.availability_check_limit,
+        )
 
     def _get_api(self) -> API:
         """
@@ -294,10 +472,7 @@ class EbayDownloader(BaseModel):
             "refresh_token_expiry": refresh_token_expiry,
         }
 
-        # create and return the api instance
-        api = API(application=application, user=user, header=header)
-
-        return api
+        return API(application=application, user=user, header=header)
 
     def print_category_suggestions(self) -> list[dict]:
         """
@@ -321,10 +496,8 @@ class EbayDownloader(BaseModel):
             q=self.query,
         )
 
-        # extract the suggestions
         suggestions = response.get("category_suggestions", [])
 
-        # print the suggestions
         print(f"\nCategory suggestions for '{self.query}':")
         print("-" * 50)
         for i, suggestion in enumerate(suggestions, 1):
@@ -332,7 +505,6 @@ class EbayDownloader(BaseModel):
             category_id_val = category.get("category_id", "N/A")
             category_name = category.get("category_name", "N/A")
 
-            # build the category path from ancestors
             ancestors = suggestion.get("category_tree_node_ancestors", [])
             path_parts = [a.get("category_name", "") for a in reversed(ancestors)]
             path_parts.append(category_name)
@@ -343,78 +515,43 @@ class EbayDownloader(BaseModel):
 
         return suggestions
 
-    def search_van_listings(self) -> Generator[dict, None, None]:
+    def search_listings(self) -> Generator[dict, None, None]:
         """
-        Search for van listings on eBay using the Browse API.
-        Yields individual listing records as dictionaries.
-        Handles pagination automatically to fetch all available listings.
-
-        For local pickup searches, both pickup parameters must be provided together:
-        - pickup_postal_code: The postal/zip code for local pickup location
-        - pickup_radius: The search radius in miles from the postal code
+        Search for listings on eBay using the Browse API.
+        Yields individual listing records as dictionaries and handles pagination.
         """
 
         api = self._get_api()
+        filters = build_search_filters(
+            min_price=self.min_price,
+            max_price=self.max_price,
+            pickup_postal_code=self.pickup_postal_code,
+            pickup_radius=self.pickup_radius,
+        )
 
-        # build filter string for additional constraints
-        filters = []
-        if self.min_price is not None or self.max_price is not None:
-            price_min = self.min_price if self.min_price is not None else 0
-            price_max = self.max_price if self.max_price is not None else ""
-            filters.append(f"price:[{price_min}..{price_max}]")
-
-        # add local pickup filters if both required parameters are provided
-        if self.pickup_postal_code is not None and self.pickup_radius is not None:
-            filters.append(f"pickupPostalCode:{self.pickup_postal_code}")
-            filters.append(f"pickupRadius:{self.pickup_radius}")
-            filters.append("pickupCountry:GB")
-            filters.append("pickupRadiusUnit:mi")
-            filters.append("deliveryOptions:{SELLER_ARRANGED_LOCAL_PICKUP}")
-        elif self.pickup_postal_code is not None or self.pickup_radius is not None:
-            raise ValueError(
-                "For local pickup searches, both pickup_postal_code and pickup_radius must be provided"
-            )
-
-        # prepare search parameters - q parameter is required by the api
         search_params = {
             "q": self.query,
             "category_ids": self.category_id,
         }
-
-        # add filter string if there are any filters
         if filters:
             search_params["filter"] = ",".join(filters)
-
-        # only set limit if specified - the API handles pagination automatically
         if self.limit is not None:
             search_params["limit"] = self.limit
 
-        # execute search and yield results
-        # the API generator handles pagination automatically, so we just iterate through it
         records_yielded = 0
         for record in api.buy_browse_search(**search_params):
             if "record" in record:
                 records_yielded += 1
                 yield record["record"]
             elif "total" in record:
-                # metadata record with totals
                 total_info = record.get("total", {})
                 print(f"Total records available: {total_info.get('records_available', 'unknown')}")
 
         print(f"Total records yielded: {records_yielded}")
 
-    def _accept_cookie_consent_if_present(self) -> None:
-        """
-        Click 'Accept all' on the eBay GDPR cookie banner if visible, then wait
-        until the banner has disappeared. No-op if the banner is not present.
-        """
-
-        accept_ebay_cookie_consent_if_present(self._page)
-
     def _extract_listing_details(self) -> dict:
         """
         Extract the seller description and item specifics from the current eBay listing page.
-        Returns a dictionary with full_description and item specifics fields.
         """
 
         details = {
@@ -427,6 +564,8 @@ class EbayDownloader(BaseModel):
             "transmission": None,
             "year": None,
             "colour": None,
+            "mileage": None,
+            "mileage_unit": None,
             "auction_closes": None,
         }
 
@@ -436,22 +575,20 @@ class EbayDownloader(BaseModel):
         page = self._page
 
         try:
-            # extract the seller description from iframe or direct content
-            description_iframe = page.query_selector('iframe#desc_ifr')
+            description_iframe = page.query_selector("iframe#desc_ifr")
             if description_iframe:
-                # get content from iframe
                 frame = description_iframe.content_frame()
                 if frame:
-                    body = frame.query_selector('body')
+                    body = frame.query_selector("body")
                     if body:
                         details["full_description"] = body.inner_text().strip()
             else:
-                # try direct description container
-                desc_container = page.query_selector('[data-testid="ux-layout-section-module__content"]')
+                desc_container = page.query_selector(
+                    '[data-testid="ux-layout-section-module__content"]'
+                )
                 if desc_container:
                     details["full_description"] = desc_container.inner_text().strip()
 
-            # extract item specifics - try multiple layouts (legacy and evo)
             label_value_pairs = []
             for section_selector in (
                 ".ux-layout-section-evo.ux-layout-section--features",
@@ -492,13 +629,16 @@ class EbayDownloader(BaseModel):
                                 pass
                         else:
                             details[key] = value_text
+                    elif label_text == "Mileage":
+                        mileage, mileage_unit = parse_mileage(value_text)
+                        details["mileage"] = mileage
+                        details["mileage_unit"] = mileage_unit
 
-            # extract auction close time from timer module if present (auctions only)
             timer_el = page.query_selector("span.ux-timer__time-left")
             if timer_el:
                 time_left_text = timer_el.inner_text().strip()
                 if time_left_text:
-                    parsed = self._parse_auction_close_datetime(time_left_text)
+                    parsed = parse_auction_close_datetime(time_left_text)
                     if parsed:
                         details["auction_closes"] = parsed
 
@@ -507,12 +647,10 @@ class EbayDownloader(BaseModel):
 
         return details
 
-    # _EXTRACT_SELLER_TYPE
+    # EXTRACT SELLER TYPE
     def _extract_seller_type(self) -> Optional[str]:
         """
         Extract the seller type (Private or Business) from the current eBay listing page.
-        Returns "Private" if the seller is a private seller, "Business" if a business,
-        or None if the seller type cannot be determined.
         """
 
         if self._page is None:
@@ -521,26 +659,23 @@ class EbayDownloader(BaseModel):
         page = self._page
 
         try:
-            # look for the seller type span within the seller card
             seller_type_elements = page.query_selector_all(
-                '.x-sellercard-atf__about-seller-item span.ux-textspans.ux-textspans--SECONDARY'
+                ".x-sellercard-atf__about-seller-item span.ux-textspans.ux-textspans--SECONDARY"
             )
-            
+
             for element in seller_type_elements:
                 text = element.inner_text().strip()
-                # check if this element contains "Private" or "Business"
                 if text == "Private":
                     return "Private"
-                elif text == "Business":
+                if text == "Business":
                     return "Business"
-            
-            # alternative selector: direct search for the text
-            seller_info_section = page.query_selector('.x-sellercard-atf__about-seller')
+
+            seller_info_section = page.query_selector(".x-sellercard-atf__about-seller")
             if seller_info_section:
                 all_text = seller_info_section.inner_text()
                 if "Private" in all_text:
                     return "Private"
-                elif "Business" in all_text:
+                if "Business" in all_text:
                     return "Business"
 
         except Exception as e:
@@ -548,34 +683,9 @@ class EbayDownloader(BaseModel):
 
         return None
 
-    # _PARSE_AUCTION_CLOSE_DATETIME
-    def _parse_auction_close_datetime(self, text: str) -> Optional[datetime]:
-        """
-        Parse auction close datetime from eBay timer format (dd/mm, hh:mi).
-        Returns a datetime or None if parsing fails. Infers year from current date.
-        """
-
-        try:
-            parts = text.split(",")
-            if len(parts) != 2:
-                return None
-            date_part = parts[0].strip()
-            time_part = parts[1].strip()
-            day, month = map(int, date_part.split("/"))
-            hour, minute = map(int, time_part.split(":"))
-            now = datetime.now()
-            parsed = datetime(now.year, month, day, hour, minute, 0, 0)
-            if parsed < now:
-                parsed = datetime(now.year + 1, month, day, hour, minute, 0, 0)
-            return parsed
-        except (ValueError, IndexError):
-            return None
-
     def _extract_listing_images(self) -> list[str]:
         """
-        Iterate through the eBay listing page to collect all image URLs. Clicks each
-        thumbnail in the filmstrip to ensure lazy-loaded images are available, then
-        collects the full-size URL from the carousel (data-zoom-src or src).
+        Iterate through the eBay listing page to collect all image URLs.
         """
 
         if self._page is None:
@@ -585,21 +695,17 @@ class EbayDownloader(BaseModel):
         image_urls: list[str] = []
 
         try:
-            # wait for photos container to be visible
             photos_container = page.query_selector('[data-testid="x-photos-min-view"]')
             if not photos_container:
                 return []
 
-            # get all thumbnail buttons in the grid
             thumb_buttons = page.query_selector_all(
-                'div.ux-image-grid button.ux-image-grid-item'
+                "div.ux-image-grid button.ux-image-grid-item"
             )
             if not thumb_buttons:
                 return []
 
-            # iterate through each thumbnail by clicking it
             for idx in range(len(thumb_buttons)):
-                # click the thumbnail for this index
                 thumb = page.query_selector(
                     f'button.ux-image-grid-item[data-idx="{idx}"]'
                 )
@@ -607,22 +713,21 @@ class EbayDownloader(BaseModel):
                     thumb.click()
                     pause(0.3, 0.6)
 
-                # get current active image from carousel (full-size preferred)
                 active_img = page.query_selector(
-                    'div.ux-image-carousel-item.active img'
+                    "div.ux-image-carousel-item.active img"
                 )
                 if active_img:
-                    url = active_img.get_attribute("data-zoom-src") or active_img.get_attribute("src")
+                    url = active_img.get_attribute("data-zoom-src") or active_img.get_attribute(
+                        "src"
+                    )
                     if url and url not in image_urls:
                         image_urls.append(url)
 
-            # fallback: if no urls from carousel, collect from grid thumbnails
             if not image_urls:
-                grid_imgs = page.query_selector_all('div.ux-image-grid img[src]')
+                grid_imgs = page.query_selector_all("div.ux-image-grid img[src]")
                 for img in grid_imgs:
                     src = img.get_attribute("src")
                     if src:
-                        # upgrade to full-size (s-l140 -> s-l1600)
                         full_url = src.replace("/s-l140.webp", "/s-l1600.webp")
                         if full_url not in image_urls:
                             image_urls.append(full_url)
@@ -632,24 +737,39 @@ class EbayDownloader(BaseModel):
 
         return image_urls
 
-    def download_all_van_listings(self) -> list[dict]:
+    def _visit_listing_page(
+        self, listing_url: str, *, title: str
+    ) -> tuple[dict, list[str], str]:
         """
-        Download all van listings from eBay for the configured marketplace.
-        Returns a list of listing dictionaries. Each listing's URL is visited
-        in a headless browser to extract full description and item specifics,
-        then the prospect listing is saved to the database.
-        Skips listings that have already been processed based on hash code.
-
-        For local pickup searches, both pickup parameters must be provided together:
-        - pickup_postal_code: The postal/zip code for local pickup location
-        - pickup_radius: The search radius in miles from the postal code
+        Navigate to a listing, dismiss consent, validate seller type, and extract
+        page details and image urls. Raises on navigation or validation failure.
         """
 
-        # load existing hash codes from database at startup
-        existing_hash_codes = get_existing_hash_codes(ListingSource.EBAY)
-        print(f"Loaded {len(existing_hash_codes)} existing hash codes from database")
+        goto_with_captcha_handling(self._page, listing_url)
+        pause(0.1, 0.5)
+        dismiss_ebay_cookie_consent(self._page, wait_for_banner=True)
 
-        # initialize database session for prospect_listing records
+        seller_type = self._extract_seller_type()
+        if seller_type != "Private":
+            raise ValueError(f"seller is {seller_type} (not Private)")
+
+        if is_listing_no_longer_available(self._page):
+            raise ValueError("listing unavailable")
+
+        details = self._extract_listing_details()
+        image_urls = self._extract_listing_images()
+        make_and_model = build_make_and_model(details, title=title)
+        return details, image_urls, make_and_model
+
+    def download_all_listings(self) -> list[dict]:
+        """
+        Download all listings from eBay for the configured marketplace and listing type.
+        Each listing URL is visited in a browser to extract details, then persisted.
+        """
+
+        existing_source_ids = get_existing_source_ids(ListingSource.EBAY)
+        log_loaded_source_ids(len(existing_source_ids))
+
         database_url = os.getenv("AUTO_ADS_DATABASE_URL")
         engine = create_engine_with_retry(database_url)
         SessionLocal = sessionmaker(bind=engine)
@@ -657,160 +777,122 @@ class EbayDownloader(BaseModel):
         print(f"Initializing eBay API for marketplace: {self.marketplace}")
         self._get_api()
 
-        print(f"Searching for '{self.query}' listings in {self.query} category (ID: {self.category_id})...")
-        listings = []
+        print(
+            f"Searching for '{self.query}' listings in category "
+            f"(ID: {self.category_id}) for {self.listing_type.value}..."
+        )
+        listings: list[dict] = []
+        saved_count = 0
+        processed_ids: set[str] = set()
+        listing_index = 0
 
         try:
             with sync_stealth_playwright() as p:
-                # launch browser once for all listings
-                self._browser = launch_stealth_chromium(p, headless=False)
+                self._browser = launch_stealth_chromium(
+                    p, headless=is_headless, use_proxy=False
+                )
                 self._page = self._browser.new_page()
 
-                update_new_listings_availability(self._page)
+                scraper_update_new_listings_availability(
+                    self._page,
+                    listing_source=ListingSource.EBAY,
+                    is_unavailable_fn=_ebay_is_unavailable,
+                    limit=self.availability_check_limit,
+                    config=CONFIG,
+                    listing_type=self.listing_type,
+                )
 
                 with SessionLocal() as session:
-                    for listing in self.search_van_listings():
-                        # generate hash code from listing title
+                    for listing in self.search_listings():
+                        listing_index += 1
                         title = listing.get("title", "")
+                        source_id = listing.get("item_id")
                         hash_code = generate_hash_code(title)
+                        title_short = title[:50] if title else "Unknown"
+                        card_id = source_id or hash_code
 
-                        # check if already processed - skip if duplicate found
-                        if hash_code in existing_hash_codes:
-                            print(
-                                f"Found existing listing (hash: {hash_code}), "
-                                "continuing..."
-                            )
+                        if source_id is not None and source_id in existing_source_ids:
+                            log_already_exists(listing_index, title_short)
                             continue
 
-                        listings.append(listing)
-
-                        # create prospect_listing
                         item_web_url = listing.get("item_web_url")
-                        if item_web_url:
-                            # extract price value and currency from listing
-                            price_info = listing.get("price", {})
-                            asking_price_raw = price_info.get("value")
-                            currency = price_info.get("currency", "")
+                        if not item_web_url:
+                            log_skipping(listing_index, title_short, "missing listing url")
+                            continue
 
-                            # convert asking_price to int, handling string format with commas and decimals
-                            if isinstance(asking_price_raw, str):
-                                # remove commas and convert to float, then int
-                                asking_price = int(float(asking_price_raw.replace(",", "")))
-                            else:
-                                asking_price = int(float(asking_price_raw))
+                        log_processing_new_listing(
+                            listing_index,
+                            title_short,
+                            item_web_url,
+                            source_id=source_id,
+                        )
 
-                            # determine currency_symbol based on currency
-                            if currency == "GBP":
-                                currency_symbol = "£"
-                            elif currency == "USD":
-                                currency_symbol = "$"
-                            else:
-                                currency_symbol = ""
-
-                            # extract location from listing
-                            item_location = listing.get("item_location", {})
-                            location = item_location.get("city", "")
-
-                            # set created_at and updated_at to current datetime
-                            current_datetime = datetime.now()
-
-                            # visit the listing url and extract details
-                            title_short = title[:50] if title else "Unknown"
-                            print(f"Visiting listing {len(listings)}: {title_short}...")
-
-                            image_urls: list[str] = []
-                            try:
-                                self._page.goto(item_web_url, wait_until="domcontentloaded")
-                                pause(0.1, 0.5)
-                                self._accept_cookie_consent_if_present()
-
-                                # check seller type and skip if not private
-                                seller_type = self._extract_seller_type()
-                                if seller_type != "Private" or seller_type is None:
-                                    print(f"  Skipping listing: seller is {seller_type} (not Private)")
-                                    continue
-
-                                # extract full description and item specifics from page
-                                details = self._extract_listing_details()
-
-                                # iterate through listing page to collect all van images
-                                image_urls = self._extract_listing_images()
-
-                                # build make_and_model from extracted make and model
-                                make = details.get("make") or ""
-                                model = details.get("model") or ""
-                                if make or model:
-                                    make_and_model = f"{make} {model}".strip()
-                                elif make:
-                                    make_and_model = make
-                                elif model:
-                                    make_and_model = model
-                                else:
-                                    # fallback to title if no make/model found
-                                    make_and_model = title
-
-                            except Exception as e:
-                                print(f"  Error visiting {item_web_url}: {e}")
-                                details = {}
-                                make_and_model = title
-
-                            # create ProspectListings instance with extracted details
-                            prospect_listing = ProspectListings(
-                                hash_code=hash_code,
-                                listing_source=ListingSource.EBAY,
-                                listing_type=ListingType.VAN,
-                                status=ProspectListingStatus.NEW,
-                                short_description=title,
-                                full_description=details.get("full_description"),
-                                url=item_web_url,
-                                asking_price=asking_price,
-                                currency_symbol=currency_symbol,
-                                location=location,
-                                make_and_model=make_and_model,
-                                body_type=details.get("body_type"),
-                                engine_size=details.get("engine_size"),
-                                fuel_type=details.get("fuel_type"),
-                                gearbox_type=details.get("transmission"),
-                                year=details.get("year"),
-                                colour=details.get("colour"),
-                                auction_closes=details.get("auction_closes"),
-                                created_at=current_datetime,
-                                updated_at=current_datetime,
+                        try:
+                            details, image_urls, make_and_model = self._visit_listing_page(
+                                item_web_url,
+                                title=title,
                             )
+                        except ValueError as error:
+                            message = str(error)
+                            if message == "listing unavailable":
+                                log_not_available(listing_index, title_short, "unavailable")
+                            elif "not Private" in message:
+                                log_skipping(listing_index, title_short, message)
+                            else:
+                                log_listing_error(listing_index, title_short, error)
+                            continue
+                        except Exception as error:
+                            log_listing_error(listing_index, title_short, error)
+                            continue
 
-                            # save prospect listing to database
-                            session.add(prospect_listing)
-                            session.commit()
-                            session.refresh(prospect_listing)
+                        log_saved_listing(
+                            listing_index,
+                            title_short,
+                            make_and_model=make_and_model,
+                            year=details.get("year"),
+                            location=listing.get("item_location", {}).get("city"),
+                            image_count=len(image_urls),
+                        )
 
-                            # download images after id is known, save to temp dir and s3
-                            temp_image_dir = None
-                            if image_urls:
-                                temp_image_dir = download_and_save_listing_images(
-                                    image_urls,
-                                    self._page,
-                                    prospect_listing,
-                                    session,
-                                    temp_dir_prefix="ebay_images_",
-                                )
+                        current_datetime = datetime.now()
+                        prospect_listing = build_prospect_listing(
+                            listing=listing,
+                            details=details,
+                            listing_type=self.listing_type,
+                            hash_code=hash_code,
+                            make_and_model=make_and_model,
+                            current_datetime=current_datetime,
+                        )
 
-                            # generate and apply ai analysis using temp image directory
-                            prospect_listing = process_ai_analysis_for_listing(
-                                "van_prompt.md", prospect_listing, session, temp_image_dir
-                            )
+                        persist_listing_with_images_and_ai(
+                            session,
+                            prospect_listing,
+                            ai_prompt_filename=self.ai_prompt_filename,
+                            listing_url=item_web_url,
+                            image_urls=image_urls,
+                            page=self._page,
+                            temp_dir_prefix="ebay_images_",
+                        )
 
-                            # clean up temp directory after use
-                            if temp_image_dir and os.path.isdir(temp_image_dir):
-                                shutil.rmtree(temp_image_dir)
+                        listings.append(listing)
+                        saved_count += 1
 
-                        # add hash code to existing set to avoid duplicates in this run
-                        existing_hash_codes.add(hash_code)
+                        mark_listing_processed_and_check_availability(
+                            self._page,
+                            source_id=source_id,
+                            card_id=card_id,
+                            existing_source_ids=existing_source_ids,
+                            processed_ids=processed_ids,
+                            listing_source=ListingSource.EBAY,
+                            listing_type=self.listing_type,
+                            is_unavailable_fn=_ebay_is_unavailable,
+                            config=CONFIG,
+                            deadline=None,
+                        )
 
-                        # print progress every 100 listings
-                        if len(listings) % 100 == 0:
-                            print(f"Downloaded {len(listings)} listings...")
+                        if saved_count % 100 == 0:
+                            print(f"Downloaded {saved_count} listings...")
 
-                # close browser when done
                 self._browser.close()
                 self._browser = None
                 self._page = None
@@ -821,7 +903,7 @@ class EbayDownloader(BaseModel):
                 print(f"Detail: {error.detail}")
             raise
 
-        print(f"Download complete. Total listings: {len(listings)}")
+        log_scrape_finished(1, saved_count, processed_count=listing_index)
         return listings
 
     @staticmethod
@@ -845,40 +927,11 @@ class EbayDownloader(BaseModel):
         print("-" * 50)
 
 
-# MAIN
-def main():
+# RUN EBAY
+def run_ebay(config: EbayScrapeConfig) -> list[dict]:
     """
-    Main entry point for downloading van listings from eBay.
+    Run an eBay listings download for the given vans or classics configuration.
     """
 
-    print("=" * 60)
-    print("eBay Van Listings Downloader")
-    print("=" * 60)
-
-    try:
-        # download all listings (set limit=None to get all results)
-        downloader = EbayDownloader(
-            marketplace="GB",
-            limit=None,  # set to None to fetch all available listings
-            pickup_postal_code="LS1 3AD",
-            pickup_radius=100,
-        )
-        listings = downloader.download_all_van_listings()
-
-        # print summaries for first 10 listings
-        print("\n" + "=" * 60)
-        print("Sample Listings:")
-        print("=" * 60 + "\n")
-
-        for listing in listings[:10]:
-            EbayDownloader.print_listing_summary(listing)
-
-    except Error as error:
-        print(f"\nFailed to download listings: {error}")
-        return 1
-
-    return 0
-
-
-if __name__ == "__main__":
-    exit(main())
+    downloader = EbayDownloader.from_config(config)
+    return downloader.download_all_listings()

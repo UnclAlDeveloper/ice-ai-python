@@ -17,10 +17,10 @@ def ebay_classics() -> None:
         EbayScrapeConfig(
             listing_type=ListingType.CLASSIC,
             ai_prompt_filename="classic_car_prompt.md",
-            query="classic car",
             category_id=EBAY_CLASSICS_CATEGORY_ID,
-            pickup_postal_code="LS1 3AD",
-            pickup_radius=100,
+            item_location_country="GB",
+            buying_options=["FIXED_PRICE", "CLASSIFIED_AD"],
+            sort="newlyListed",
         )
     )
 

@@ -36,7 +36,11 @@ from common import (
     wait_for_selector_with_backoff,
     wait_with_poll,
 )
-from listing_images import download_and_save_listing_images
+from listing_images import (
+    MAX_GALLERY_IMAGES,
+    cap_gallery_urls,
+    download_and_save_listing_images,
+)
 from models.auto_ads import ProspectListings
 from models.enums import ListingSource, ListingType, ProspectListingStatus
 from scraper_driver import (
@@ -1037,8 +1041,9 @@ def save_gallery_images(
     log_title: str | None = None,
 ) -> tuple[str | None, int]:
     """
-    Open the full gallery view, load all images (via carousel or scrolling),
-    fetch them via HTTP, save to S3 and temporary directory, and create Images database records.
+    Open the full gallery view, load images (via carousel or scrolling) up to
+    MAX_GALLERY_IMAGES, fetch them via HTTP, save to S3 and a temporary
+    directory, and create Images database records.
     Returns the path to the temporary directory containing the images and the
     number of image URLs collected, or (None, 0) if no images were saved.
     When log_index and log_title are given, prints listing details after gallery
@@ -1112,6 +1117,18 @@ def save_gallery_images(
         img_elements = page.locator("img").all()
         current_image_count = len(img_elements)
 
+        for img_element in img_elements:
+            try:
+                src = img_element.get_attribute("src")
+                if src and src not in seen_urls and src.startswith("http"):
+                    seen_urls.add(src)
+                    image_urls.append(src)
+            except Exception:
+                continue
+
+        if len(image_urls) >= MAX_GALLERY_IMAGES:
+            break
+
         # scroll the scrollable container or window
         page.evaluate(
             """
@@ -1180,6 +1197,8 @@ def save_gallery_images(
             if src and src not in seen_urls and src.startswith("http"):
                 seen_urls.add(src)
                 image_urls.append(src)
+                if len(image_urls) >= MAX_GALLERY_IMAGES:
+                    break
         except Exception:
             continue
 
@@ -1188,8 +1207,8 @@ def save_gallery_images(
         carousel_next_button = page.locator('button[data-testid="carousel-next-icon"]')
 
         if carousel_next_button.count() > 0:
-            # carousel mode: click through to collect all images
-            max_carousel_clicks = 50
+            # carousel mode: click through until the download cap is reached
+            max_carousel_clicks = MAX_GALLERY_IMAGES
             carousel_clicks = 0
 
             while carousel_clicks < max_carousel_clicks:
@@ -1203,6 +1222,9 @@ def save_gallery_images(
                             image_urls.append(src)
                     except Exception:
                         continue
+
+                if len(image_urls) >= MAX_GALLERY_IMAGES:
+                    break
 
                 # check if next button is still available and enabled
                 if carousel_next_button.count() == 0:
@@ -1220,6 +1242,8 @@ def save_gallery_images(
                     carousel_clicks += 1
                 except Exception:
                     break
+
+    image_urls = cap_gallery_urls(image_urls)
 
     # log details once urls are known, before the slow download / ai work
     if log_index is not None and log_title is not None:

@@ -4,15 +4,16 @@ import re
 import shutil
 import signal
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
 from contextlib import contextmanager
-from typing import Callable, Iterator, Optional, TypeVar
+from typing import Callable, Iterator, Optional, TypeVar, Union
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import requests
-from playwright.sync_api import Browser, Page, Playwright
+from playwright.sync_api import Browser, BrowserContext, Page, Playwright
 from playwright.sync_api import sync_playwright as _sync_playwright
 from playwright_stealth import Stealth
 
@@ -31,6 +32,7 @@ __all__ = [
     "detect_captcha_task",
     "detect_cloudflare_interstitial",
     "detect_datadome_captcha_url",
+    "ensure_headed_window_visible",
     "get_active_proxy_settings",
     "get_capsolver_api_key",
     "get_decodo_settings",
@@ -73,6 +75,16 @@ STEALTH_WEBGL_RENDERER = os.getenv(
     "Direct3D11 vs_5_0 ps_5_0, D3D11)",
 )
 
+# persistent on-disk profiles keep cookies and local storage across navigations
+# within one proxy session; disable with STEALTH_USE_PERSISTENT_PROFILE=0
+STEALTH_USE_PERSISTENT_PROFILE = os.getenv(
+    "STEALTH_USE_PERSISTENT_PROFILE", "1"
+).strip().lower() not in ("0", "false", "no")
+
+StealthSession = Union[Browser, BrowserContext]
+
+_active_stealth: "Stealth | None" = None
+
 
 # DETECT CHROME FULL VERSION
 def _detect_chrome_full_version() -> str | None:
@@ -97,15 +109,48 @@ def _detect_chrome_full_version() -> str | None:
     return None
 
 
+# GREASED BRAND LIST FOR MAJOR
+def _greased_brand_list_for_major(major: str) -> list[tuple[str, str]]:
+    """
+    Build the ordered Sec-CH-UA brand list for a Chrome major version using
+    Chromium's deterministic GREASE algorithm rather than a static string.
+    """
+
+    major_int = int(major)
+    greasy_chars = [" ", "(", ")", "-", ".", "/", ":", ";", "=", "?", "_"]
+    greased_versions = [8, 99, 24]
+    grease_brand = (
+        f"Not{greasy_chars[major_int % len(greasy_chars)]}"
+        f"A{greasy_chars[(major_int // len(greasy_chars)) % len(greasy_chars)]}"
+        "Brand"
+    )
+    grease_version = str(greased_versions[major_int % len(greased_versions)])
+    brands = [
+        ("Chromium", major),
+        ("Google Chrome", major),
+        (grease_brand, grease_version),
+    ]
+    permutations = (
+        (0, 1, 2),
+        (0, 2, 1),
+        (1, 0, 2),
+        (1, 2, 0),
+        (2, 0, 1),
+        (2, 1, 0),
+    )
+    order = permutations[major_int % len(permutations)]
+    return [brands[index] for index in order]
+
+
 # SEC CH UA FOR MAJOR
 def _sec_ch_ua_for_major(major: str) -> str:
     """
     Build a modern greased Sec-CH-UA header for the given Chrome major version.
     """
 
-    return (
-        f'"Not=A?Brand";v="99", "Google Chrome";v="{major}", '
-        f'"Chromium";v="{major}"'
+    return ", ".join(
+        f'"{brand}";v="{version}"'
+        for brand, version in _greased_brand_list_for_major(major)
     )
 
 
@@ -604,24 +649,30 @@ def check_proxy_health(
     )
 
 
-# SYNC STEALTH PLAYWRIGHT
-@contextmanager
-def sync_stealth_playwright() -> Iterator[Playwright]:
+# STEALTH EXTRA HTTP HEADERS
+def _stealth_extra_http_headers() -> dict[str, str]:
     """
-    Yield a Playwright instance with stealth evasions applied to every
-    browser context created within the block. The evasions also pin a Windows
-    Chrome identity (user agent, navigator.platform and Sec-CH-UA) so the
-    JS-visible fingerprint stays coherent with the Windows user agent the pages
-    advertise over HTTP.
+    Return the Sec-CH-UA client-hint headers that playwright-stealth normally
+    injects when creating a browser context. Persistent contexts bypass those
+    hooks, so they must be supplied explicitly at launch.
     """
 
-    # refresh identity from the installed chrome before constructing stealth so
-    # init scripts and sec-ch-ua headers match the channel we are about to launch
-    detected = _detect_chrome_full_version()
-    if detected:
-        _sync_stealth_identity(detected)
+    return {
+        "sec-ch-ua": STEALTH_SEC_CH_UA,
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
+    }
 
-    stealth = Stealth(
+
+# BUILD STEALTH
+def _build_stealth() -> Stealth:
+    """
+    Construct the stealth profile for all launches. Restores the pre-tuning
+    evasion set (including chrome.runtime) that keeps Linux/WSL Chrome from
+    looking like an automation bundle while pinning a Windows Chrome identity.
+    """
+
+    return Stealth(
         navigator_user_agent_override=STEALTH_USER_AGENT,
         navigator_platform_override="Win32",
         sec_ch_ua_override=STEALTH_SEC_CH_UA,
@@ -629,44 +680,84 @@ def sync_stealth_playwright() -> Iterator[Playwright]:
         webgl_vendor_override=STEALTH_WEBGL_VENDOR,
         webgl_renderer_override=STEALTH_WEBGL_RENDERER,
     )
-    with stealth.use_sync(_sync_playwright()) as playwright:
-        yield playwright
 
 
-# LAUNCH STEALTH CHROMIUM
-def launch_stealth_chromium(
-    playwright: Playwright, *, headless: bool = False, use_proxy: bool = False
-) -> Browser:
+# WARN IF WSLG COPY MODE
+def _warn_if_wslg_copy_mode() -> None:
     """
-    Launch a stealth-patched Chromium browser, optionally routing traffic
-    through the configured Decodo gateway when use_proxy is enabled.
+    Print a actionable warning when WSLg failed to allocate shared memory and
+    fell back to COPY MODE, which prefixes window titles with [WARN: COPY MODE]
+    and slows GUI rendering.
     """
 
-    global _active_proxy_settings
+    try:
+        with open("/proc/version", encoding="utf-8") as handle:
+            if "microsoft" not in handle.read().lower():
+                return
+    except OSError:
+        return
 
-    # pin a fresh per-launch sticky session id so this browser and the CapSolver
-    # solve share one Decodo exit ip; relaunches (e.g. proxy rotation) get a new
-    # id and therefore a new exit ip
-    session_id = uuid.uuid4().hex[:16] if use_proxy else None
-    proxy = get_decodo_settings(session_id=session_id) if use_proxy else None
+    weston_log = "/mnt/wslg/weston.log"
+    if not os.path.isfile(weston_log):
+        return
 
-    # fail loudly if a proxy was requested but never configured
-    if use_proxy and proxy is None:
-        raise RuntimeError(
-            "use_proxy=True but DECODO_SERVER is not set in the environment"
-        )
+    try:
+        with open(weston_log, encoding="utf-8", errors="ignore") as handle:
+            log_text = handle.read()
+    except OSError:
+        return
 
-    # remember the single proxy chosen for this session so cookie-based captcha
-    # solving can reuse the same sticky exit ip that the browser is using
-    _active_proxy_settings = proxy
+    if "rdp_allocate_shared_memory" not in log_text:
+        return
 
-    # container-hardening flags: /dev/shm defaults to 64MB inside docker, which
-    # is too small for chromium's renderer on heavy pages and crashes the target
-    # (surfacing as a hung sync call after "Target closed"); routing shared
-    # memory to /tmp with --disable-dev-shm-usage avoids the crash, and
-    # --no-sandbox is required to launch under most containerised/root setups.
-    # renderer-process-limit keeps chrome from spawning unbounded renderers in
-    # the small fargate task that hosts both the api and the scraper.
+    print(
+        "  Warning: WSLg is in COPY MODE (shared-memory allocation failed). "
+        "Window titles may show '[WARN: COPY MODE]' and the browser may feel "
+        "sluggish. Run `wsl --shutdown` from Windows PowerShell, then restart "
+        "WSL before scraping."
+    )
+
+
+# PERSISTENT PROFILE DIR
+def _persistent_profile_dir(session_id: str) -> str:
+    """
+    Return a per-session user-data directory for launch_persistent_context so
+    cookies and local storage survive across navigations in one proxy session.
+    """
+
+    base = os.getenv(
+        "STEALTH_PROFILE_DIR",
+        os.path.join(tempfile.gettempdir(), "ice-stealth-profiles"),
+    )
+    profile_dir = os.path.join(base, session_id)
+    os.makedirs(profile_dir, exist_ok=True)
+    return profile_dir
+
+
+# SESSION FULL VERSION
+def _session_full_version(session: StealthSession) -> str:
+    """
+    Read the Chromium full version from a Browser or persistent BrowserContext.
+    """
+
+    if isinstance(session, Browser):
+        return getattr(session, "version", "") or ""
+
+    inner = getattr(session, "browser", None)
+    if inner is not None:
+        return getattr(inner, "version", "") or ""
+    return STEALTH_CHROME_FULL_VERSION
+
+
+# STEALTH LAUNCH ARGS
+def _stealth_launch_args(*, headless: bool) -> tuple[list[str], dict]:
+    """
+    Build Chromium CLI flags and environment for stealth launches. Headless mode
+    disables the GPU for container stability. Headed WSLg still disables GPU
+    compositing so the window paints on the Windows desktop instead of opening
+    off-screen; WebGL vendor strings are spoofed separately in init scripts.
+    """
+
     launch_args = [
         "--no-sandbox",
         "--disable-dev-shm-usage",
@@ -674,13 +765,7 @@ def launch_stealth_chromium(
     ]
     browser_env = os.environ.copy()
 
-    # playwright's headless=True still passes legacy --headless to channel=chrome,
-    # which is easier for cloudflare to detect and more prone to wedging on
-    # challenge pages (captcha probes then hard-timeout and kill chromium). use
-    # chrome's new headless mode instead: full browser binary, no window
-    playwright_headless = headless
     if headless:
-        playwright_headless = False
         launch_args.extend(
             [
                 "--headless=new",
@@ -691,10 +776,7 @@ def launch_stealth_chromium(
         )
     else:
         # headed chromium under wslg commonly ends up as a taskbar-only /
-        # unrestorable (or fully transparent) rail window: it opens far off the
-        # visible desktop, prefers wayland, and breaks when the d3d12/glamor path
-        # fails. pin geometry, force x11, and disable gpu compositing so the
-        # window actually paints on the windows desktop
+        # unrestorable (or fully transparent) rail window without these flags
         launch_args.extend(
             [
                 "--window-position=50,50",
@@ -708,11 +790,26 @@ def launch_stealth_chromium(
         browser_env.pop("WAYLAND_DISPLAY", None)
         browser_env.pop("ELECTRON_OZONE_PLATFORM_HINT", None)
 
-    # prefer real google chrome over chrome-for-testing so the window title and
-    # product name stop advertising automation; fall back to the bundled build
-    # when the channel is unset or unavailable on this machine
+    return launch_args, browser_env
+
+
+# LAUNCH STEALTH SESSION
+def _launch_stealth_session(
+    playwright: Playwright,
+    *,
+    headless: bool,
+    proxy: dict | None,
+    session_id: str,
+) -> StealthSession:
+    """
+    Launch either a persistent BrowserContext or a vanilla Browser with shared
+    stealth launch settings. Persistent profiles are preferred when enabled.
+    """
+
+    launch_args, browser_env = _stealth_launch_args(headless=headless)
+    playwright_headless = False if headless else False
     channel = STEALTH_BROWSER_CHANNEL or None
-    launch_kwargs: dict = {
+    base_launch_kwargs: dict = {
         "headless": playwright_headless,
         "proxy": proxy,
         "args": launch_args,
@@ -720,32 +817,134 @@ def launch_stealth_chromium(
         "ignore_default_args": ["--enable-automation"],
     }
     if channel:
-        launch_kwargs["channel"] = channel
+        base_launch_kwargs["channel"] = channel
 
-    try:
-        browser = playwright.chromium.launch(**launch_kwargs)
-    except Exception as exc:
-        if not channel:
-            raise
-        print(
-            f"  Warning: failed to launch channel={channel!r} "
-            f"({exc}); falling back to bundled Chromium"
+    def _launch_persistent() -> BrowserContext:
+        profile_dir = _persistent_profile_dir(session_id)
+        persistent_kwargs = {
+            **base_launch_kwargs,
+            "user_agent": STEALTH_USER_AGENT,
+            "extra_http_headers": _stealth_extra_http_headers(),
+            "locale": "en-US",
+        }
+        if not headless:
+            persistent_kwargs["viewport"] = {"width": 1280, "height": 800}
+        try:
+            context = playwright.chromium.launch_persistent_context(
+                profile_dir,
+                **persistent_kwargs,
+            )
+        except Exception as exc:
+            if not channel:
+                raise
+            print(
+                f"  Warning: failed to launch persistent channel={channel!r} "
+                f"({exc}); falling back to bundled Chromium"
+            )
+            persistent_kwargs.pop("channel", None)
+            context = playwright.chromium.launch_persistent_context(
+                profile_dir,
+                **persistent_kwargs,
+            )
+        if _active_stealth is not None:
+            _build_stealth().apply_stealth_sync(context)
+        setattr(context, "_ice_headed_display", not headless)
+        setattr(context, "_ice_is_persistent", True)
+        return context
+
+    def _launch_browser() -> Browser:
+        try:
+            browser = playwright.chromium.launch(**base_launch_kwargs)
+        except Exception as exc:
+            if not channel:
+                raise
+            print(
+                f"  Warning: failed to launch channel={channel!r} "
+                f"({exc}); falling back to bundled Chromium"
+            )
+            base_launch_kwargs.pop("channel", None)
+            browser = playwright.chromium.launch(**base_launch_kwargs)
+        setattr(browser, "_ice_headed_display", not headless)
+        setattr(browser, "_ice_is_persistent", False)
+        return browser
+
+    if STEALTH_USE_PERSISTENT_PROFILE:
+        return _launch_persistent()
+    return _launch_browser()
+
+
+# SYNC STEALTH PLAYWRIGHT
+@contextmanager
+def sync_stealth_playwright() -> Iterator[Playwright]:
+    """
+    Yield a Playwright instance with stealth evasions applied to every
+    browser context created within the block. The evasions also pin a Windows
+    Chrome identity (user agent, navigator.platform and Sec-CH-UA) so the
+    JS-visible fingerprint stays coherent with the Windows user agent the pages
+    advertise over HTTP.
+    """
+
+    global _active_stealth
+
+    # refresh identity from the installed chrome before constructing stealth so
+    # init scripts and sec-ch-ua headers match the channel we are about to launch
+    detected = _detect_chrome_full_version()
+    if detected:
+        _sync_stealth_identity(detected)
+
+    _active_stealth = _build_stealth()
+    with _active_stealth.use_sync(_sync_playwright()) as playwright:
+        yield playwright
+
+
+# LAUNCH STEALTH CHROMIUM
+def launch_stealth_chromium(
+    playwright: Playwright, *, headless: bool = False, use_proxy: bool = False
+) -> StealthSession:
+    """
+    Launch a stealth-patched Chromium browser or persistent context, optionally
+    routing traffic through the configured Decodo gateway when use_proxy is enabled.
+    """
+
+    global _active_proxy_settings
+
+    # pin a fresh per-launch sticky session id so this browser and the CapSolver
+    # solve share one Decodo exit ip; relaunches (e.g. proxy rotation) get a new
+    # id and therefore a new exit ip
+    session_id = uuid.uuid4().hex[:16]
+    proxy = get_decodo_settings(session_id=session_id) if use_proxy else None
+
+    # fail loudly if a proxy was requested but never configured
+    if use_proxy and proxy is None:
+        raise RuntimeError(
+            "use_proxy=True but DECODO_SERVER is not set in the environment"
         )
-        launch_kwargs.pop("channel", None)
-        channel = None
-        browser = playwright.chromium.launch(**launch_kwargs)
+
+    # remember the single proxy chosen for this session so cookie-based captcha
+    # solving can reuse the same sticky exit ip that the browser is using
+    _active_proxy_settings = proxy
+
+    session = _launch_stealth_session(
+        playwright,
+        headless=headless,
+        proxy=proxy,
+        session_id=session_id,
+    )
+
+    if not headless:
+        _warn_if_wslg_copy_mode()
 
     # align ua / client-hint constants with the binary we actually started
-    _sync_stealth_identity(getattr(browser, "version", "") or "")
-    setattr(browser, "_ice_headed_display", not headless)
+    _sync_stealth_identity(_session_full_version(session))
 
     headless_mode = "new" if headless else "headed"
+    persistent = getattr(session, "_ice_is_persistent", False)
     print(
-        f"  Launched Chromium version={browser.version} "
-        f"channel={channel or 'bundled'} headless={headless_mode} "
-        f"proxy={'yes' if proxy else 'no'}"
+        f"  Launched Chromium version={_session_full_version(session)} "
+        f"channel={STEALTH_BROWSER_CHANNEL or 'bundled'} headless={headless_mode} "
+        f"proxy={'yes' if proxy else 'no'} persistent={'yes' if persistent else 'no'}"
     )
-    return browser
+    return session
 
 
 # GET ACTIVE PROXY SETTINGS
@@ -771,16 +970,18 @@ def _windows_user_agent_metadata(
 
     resolved_full = full_version or STEALTH_CHROME_FULL_VERSION
     resolved_major = major or resolved_full.split(".")[0]
-    brands = [
-        {"brand": "Not=A?Brand", "version": "99"},
-        {"brand": "Google Chrome", "version": resolved_major},
-        {"brand": "Chromium", "version": resolved_major},
-    ]
-    full_version_list = [
-        {"brand": "Not=A?Brand", "version": "99.0.0.0"},
-        {"brand": "Google Chrome", "version": resolved_full},
-        {"brand": "Chromium", "version": resolved_full},
-    ]
+    brand_list = _greased_brand_list_for_major(resolved_major)
+    brands = [{"brand": brand, "version": version} for brand, version in brand_list]
+    full_version_list = []
+    for brand, version in brand_list:
+        if brand.startswith("Not"):
+            full_version_list.append(
+                {"brand": brand, "version": f"{version}.0.0.0"}
+            )
+        else:
+            full_version_list.append(
+                {"brand": brand, "version": resolved_full}
+            )
     return {
         "brands": brands,
         "fullVersion": resolved_full,
@@ -796,34 +997,55 @@ def _windows_user_agent_metadata(
 
 
 # ENSURE HEADED WINDOW VISIBLE
-def _ensure_headed_window_visible(page: Page) -> None:
+def ensure_headed_window_visible(page: Page, *, attempts: int = 3) -> bool:
     """
     Force a headed Chromium window onto the visible desktop via CDP. Under WSLg
     the window manager often leaves the first surface off-screen or minimized in
     a state the Windows taskbar cannot restore, so an explicit bounds + bring
-    to front after page creation is required.
+    to front after page creation is required. Retries a few times because the
+    window may not exist until the first renderer attaches.
     """
 
-    try:
-        cdp_session = page.context.new_cdp_session(page)
-        target = cdp_session.send("Browser.getWindowForTarget")
-        window_id = target["windowId"]
-        cdp_session.send(
-            "Browser.setWindowBounds",
-            {
-                "windowId": window_id,
-                "bounds": {
-                    "windowState": "normal",
-                    "left": 50,
-                    "top": 50,
-                    "width": 1280,
-                    "height": 800,
+    left = int(os.getenv("STEALTH_HEADED_WINDOW_LEFT", "50"))
+    top = int(os.getenv("STEALTH_HEADED_WINDOW_TOP", "50"))
+    width = int(os.getenv("STEALTH_HEADED_WINDOW_WIDTH", "1280"))
+    height = int(os.getenv("STEALTH_HEADED_WINDOW_HEIGHT", "800"))
+
+    last_error: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            cdp_session = page.context.new_cdp_session(page)
+            target = cdp_session.send("Browser.getWindowForTarget")
+            window_id = target["windowId"]
+            cdp_session.send(
+                "Browser.setWindowBounds",
+                {
+                    "windowId": window_id,
+                    "bounds": {
+                        "windowState": "normal",
+                        "left": left,
+                        "top": top,
+                        "width": width,
+                        "height": height,
+                    },
                 },
-            },
+            )
+            cdp_session.send("Page.bringToFront")
+            return True
+        except Exception as exc:
+            last_error = exc
+            if attempt < attempts:
+                try:
+                    page.wait_for_timeout(400)
+                except Exception:
+                    time.sleep(0.4)
+
+    if last_error is not None:
+        print(
+            "  Warning: could not restore headed Chromium window to the visible "
+            f"desktop after {attempts} attempt(s): {last_error}"
         )
-        cdp_session.send("Page.bringToFront")
-    except Exception:
-        return
+    return False
 
 
 # APPLY WINDOWS IDENTITY
@@ -843,6 +1065,8 @@ def _apply_windows_identity(page: Page, user_agent: str | None = None) -> None:
     full_version = STEALTH_CHROME_FULL_VERSION
     if browser is not None and getattr(browser, "version", None):
         full_version = browser.version
+    elif page.context is not None:
+        full_version = _session_full_version(page.context)
 
     match = re.search(r"Chrome/(\d+)", resolved_user_agent)
     major = match.group(1) if match else full_version.split(".")[0]
@@ -861,14 +1085,19 @@ def _apply_windows_identity(page: Page, user_agent: str | None = None) -> None:
 
 
 # NEW STEALTH PAGE
-def new_stealth_page(browser: Browser) -> Page:
+def new_stealth_page(session: StealthSession) -> Page:
     """
     Create a new page that advertises the pinned Windows Chrome user agent over
     HTTP and applies matching client-hint metadata before any navigation, so
     every page in the session presents one coherent Windows identity.
     """
 
-    page = browser.new_page(user_agent=STEALTH_USER_AGENT)
+    # persistent contexts inherit user_agent from launch_persistent_context and
+    # reject user_agent on new_page(); they also open with one initial tab
+    if isinstance(session, BrowserContext):
+        page = session.pages[0] if session.pages else session.new_page()
+    else:
+        page = session.new_page(user_agent=STEALTH_USER_AGENT)
 
     # bound navigations and element actions so a stalled proxy exit ip or a slow
     # render surfaces as a timeout the rotation loop can act on, rather than a
@@ -885,11 +1114,21 @@ def new_stealth_page(browser: Browser) -> Page:
 
     _apply_windows_identity(page)
 
+    # persistent contexts open a blank tab before init scripts are registered;
+    # reload once so the stealth bundle and windows identity apply before the
+    # first real navigation (avoids leaking linux chrome signals on first load)
+    if isinstance(session, BrowserContext):
+        try:
+            page.goto("about:blank", wait_until="domcontentloaded")
+            _apply_windows_identity(page)
+        except Exception:
+            pass
+
     # headed wslg sessions need an explicit on-screen restore after the first
     # page exists; launch flags alone are not enough once chromium 148+ /
     # weston have already placed the rail window off-desktop
-    if getattr(browser, "_ice_headed_display", False):
-        _ensure_headed_window_visible(page)
+    if getattr(session, "_ice_headed_display", False):
+        ensure_headed_window_visible(page)
 
     return page
 
@@ -1019,21 +1258,22 @@ def _force_close_page(page: Page, description: str, timeout_ms: int) -> None:
 
 # CLOSE BROWSER QUIETLY
 def close_browser_quietly(
-    browser: Browser | None,
+    session: StealthSession | None,
     *,
     timeout_s: float = 5.0,
     force_kill_first: bool = False,
 ) -> None:
     """
-    Close a Playwright browser without raising. Close always runs on the calling
-    (Playwright) thread so greenlets stay valid. When force_kill_first is set
-    (e.g. scheduled proxy rotation), SIGKILL Chromium before close so in-flight
-    navigations abort promptly instead of leaving a wedged CDP session. If close
-    itself hangs after a wedged CDP session, a watchdog SIGKILLs Chromium so the
-    sync call can error out and the rotation loop can relaunch.
+    Close a Playwright browser or persistent context without raising. Close
+    always runs on the calling (Playwright) thread so greenlets stay valid.
+    When force_kill_first is set (e.g. scheduled proxy rotation), SIGKILL
+    Chromium before close so in-flight navigations abort promptly instead of
+    leaving a wedged CDP session. If close itself hangs after a wedged CDP
+    session, a watchdog SIGKILLs Chromium so the sync call can error out and the
+    rotation loop can relaunch.
     """
 
-    if browser is None:
+    if session is None:
         return
 
     if force_kill_first:
@@ -1054,7 +1294,7 @@ def close_browser_quietly(
     )
     watcher.start()
     try:
-        browser.close()
+        session.close()
     except Exception:
         pass
     finally:
@@ -1223,7 +1463,7 @@ def _capsolver_proxy_fields() -> dict | None:
 @contextmanager
 def launch_stealth_browser(
     *, headless: bool = False, use_proxy: bool = False
-) -> Iterator[tuple[Browser, Page]]:
+) -> Iterator[tuple[StealthSession, Page]]:
     """
     Launch Chromium with stealth patches and yield a browser and page pair.
     The browser is closed when the context exits.
@@ -1347,6 +1587,121 @@ def _capsolver_get_result(
     )
 
 
+# EXTRACT TURNSTILE SITEKEY FROM HTML
+def extract_turnstile_sitekey_from_html(content: str) -> dict | None:
+    """
+    Parse a Turnstile sitekey and optional action/cdata metadata from raw HTML
+    when the widget is rendered inside a Cloudflare iframe rather than a
+    .cf-turnstile container.
+    """
+
+    if not content:
+        return None
+
+    for pattern in (
+        r'class=["\']cf-turnstile["\'][^>]*data-sitekey=["\'](0x[^"\']+)["\']',
+        r'data-sitekey=["\'](0x[^"\']+)["\']',
+        r'(?:sitekey|websiteKey)\s*[=:]\s*["\'](0x[^"\']+)["\']',
+        r'challenges\.cloudflare\.com[^"\']*[?&]k=(0x[^"&\']+)',
+    ):
+        match = re.search(pattern, content, re.IGNORECASE)
+        if match:
+            return {"sitekey": match.group(1)}
+
+    return None
+
+
+# EXTRACT TURNSTILE TASK
+def _extract_turnstile_task(page: Page) -> dict | None:
+    """
+    Build a CapSolver Turnstile task from DOM widgets, iframe src parameters, or
+    inline script configuration on the current page.
+    """
+
+    website_url = page.url
+
+    widget_data = run_quick_page_action(
+        page,
+        lambda: page.evaluate(
+            """() => {
+                const widget = document.querySelector(
+                    '.cf-turnstile[data-sitekey], [data-sitekey^="0x"]'
+                );
+                if (widget) {
+                    return {
+                        sitekey: widget.getAttribute('data-sitekey'),
+                        action: widget.getAttribute('data-action'),
+                        cdata: widget.getAttribute('data-cdata'),
+                    };
+                }
+
+                const iframe = document.querySelector(
+                    'iframe[src*="challenges.cloudflare.com"]'
+                );
+                if (iframe) {
+                    try {
+                        const src = new URL(iframe.getAttribute('src'), location.href);
+                        const sitekey = src.searchParams.get('k')
+                            || src.searchParams.get('sitekey');
+                        if (sitekey) {
+                            return {
+                                sitekey,
+                                action: src.searchParams.get('action'),
+                                cdata: src.searchParams.get('cdata'),
+                            };
+                        }
+                    } catch (e) {
+                        return null;
+                    }
+                }
+
+                for (const script of document.scripts) {
+                    const text = script.textContent || '';
+                    const match = text.match(
+                        /(?:sitekey|websiteKey)\\s*[:=]\\s*['"](0x[^'"]+)['"]/i
+                    );
+                    if (match) {
+                        return { sitekey: match[1] };
+                    }
+                }
+
+                return null;
+            }"""
+        ),
+        description="turnstile widget probe",
+        timeout_ms=CAPTCHA_PROBE_TIMEOUT_MS,
+    )
+
+    if not widget_data or not widget_data.get("sitekey"):
+        try:
+            html = page_html(page)
+        except Exception:
+            html = ""
+        widget_data = extract_turnstile_sitekey_from_html(html)
+        if not widget_data:
+            return None
+
+    sitekey = widget_data.get("sitekey")
+    if not sitekey:
+        return None
+
+    task: dict = {
+        "type": "AntiTurnstileTaskProxyLess",
+        "websiteURL": website_url,
+        "websiteKey": sitekey,
+    }
+    metadata: dict = {}
+    action = widget_data.get("action")
+    cdata = widget_data.get("cdata")
+    if action:
+        metadata["action"] = action
+    if cdata:
+        metadata["cdata"] = cdata
+    if metadata:
+        task["metadata"] = metadata
+    return task
+
+
 # DETECT CAPTCHA TASK
 def detect_captcha_task(page: Page) -> dict | None:
     """
@@ -1355,22 +1710,11 @@ def detect_captcha_task(page: Page) -> dict | None:
     v2, and hCaptcha. Returns None when no solvable widget sitekey is found.
     """
 
-    website_url = page.url
+    turnstile_task = _extract_turnstile_task(page)
+    if turnstile_task is not None:
+        return turnstile_task
 
-    # cloudflare turnstile renders a .cf-turnstile element carrying the sitekey
-    turnstile = page.locator(".cf-turnstile[data-sitekey]")
-    if turnstile.count() > 0:
-        sitekey = turnstile.first.get_attribute("data-sitekey")
-        if sitekey:
-            task: dict = {
-                "type": "AntiTurnstileTaskProxyLess",
-                "websiteURL": website_url,
-                "websiteKey": sitekey,
-            }
-            action = turnstile.first.get_attribute("data-action")
-            if action:
-                task["metadata"] = {"action": action}
-            return task
+    website_url = page.url
 
     # recaptcha v2 exposes the sitekey on the .g-recaptcha container
     recaptcha = page.locator(".g-recaptcha[data-sitekey]")
@@ -1651,35 +1995,54 @@ def _apply_user_agent(page: Page, user_agent: str) -> None:
     Sec-CH-UA-* headers stay consistent with the new user agent.
     """
 
+    global STEALTH_USER_AGENT, STEALTH_SEC_CH_UA
+
+    STEALTH_USER_AGENT = user_agent
+    match = re.search(r"Chrome/(\d+)", user_agent)
+    if match:
+        STEALTH_SEC_CH_UA = _sec_ch_ua_for_major(match.group(1))
+
     _apply_windows_identity(page, user_agent)
 
 
-# COOKIE BASE URL
-def _cookie_base_url(page: Page) -> str:
+# PLAYWRIGHT COOKIE ENTRIES
+def _playwright_cookie_entries(page: Page, cookies: dict) -> list[dict]:
     """
-    Return the scheme://host origin of the current page, used as the target
-    url when applying solved challenge cookies to the browser context.
+    Convert a name -> value cookie mapping into Playwright cookie dicts with
+    domain, path, and security attributes Cloudflare expects to honour.
     """
 
     parsed = urlparse(page.url)
-    return f"{parsed.scheme}://{parsed.hostname}"
+    hostname = parsed.hostname or ""
+    secure = parsed.scheme == "https"
+    entries: list[dict] = []
+    for name, value in cookies.items():
+        if not value:
+            continue
+        entries.append(
+            {
+                "name": name,
+                "value": value,
+                "domain": hostname,
+                "path": "/",
+                "secure": secure,
+                "httpOnly": name in ("cf_clearance", "__cf_bm", "datadome"),
+                "sameSite": "Lax",
+            }
+        )
+    return entries
 
 
 # APPLY COOKIES
 def _apply_cookies(page: Page, cookies: dict) -> None:
     """
     Attach a name -> value mapping of solved challenge cookies to the active
-    browser context, scoped to the current page origin.
+    browser context, scoped to the current page origin with full attributes.
     """
 
-    base_url = _cookie_base_url(page)
-    page.context.add_cookies(
-        [
-            {"name": name, "value": value, "url": base_url}
-            for name, value in cookies.items()
-            if value
-        ]
-    )
+    entries = _playwright_cookie_entries(page, cookies)
+    if entries:
+        page.context.add_cookies(entries)
 
 
 # DETECT CLOUDFLARE INTERSTITIAL
@@ -1721,13 +2084,22 @@ def _probe_cloudflare_interstitial(page: Page) -> bool:
                 return { present: true };
             }
 
-            const selector = [
-                "#challenge-running",
-                "#cf-chl-widget",
-                'iframe[src*="challenges.cloudflare.com"]',
-                'div[id^="cf-chl"]',
-            ].join(", ");
-            return { present: !!document.querySelector(selector) };
+            if (document.querySelector(
+                "#challenge-running, #cf-challenge-running"
+            )) {
+                return { present: true };
+            }
+
+            const bodyText = (document.body ? document.body.innerText : "")
+                .toLowerCase();
+            if (
+                bodyText.includes("checking your browser before accessing")
+                || bodyText.includes("verify you are human by completing")
+            ) {
+                return { present: true };
+            }
+
+            return { present: false };
         }""",
         timeout=CAPTCHA_PROBE_TIMEOUT_MS,
     )
@@ -1841,13 +2213,14 @@ def solve_cloudflare_interstitial(page: Page) -> None:
         )
 
     # cloudflare binds cf_clearance to the exact user agent it was solved
-    # with, so adopt capsolver's user agent whenever it differs from the page
+    # with, so adopt capsolver's user agent whenever it is provided
     solved_user_agent = solution.get("userAgent")
-    if solved_user_agent and solved_user_agent != page_user_agent:
-        print(
-            "  CapSolver solved with a different user agent; overriding the "
-            "page user agent to match the clearance cookie"
-        )
+    if solved_user_agent:
+        if solved_user_agent != page_user_agent:
+            print(
+                "  CapSolver solved with a different user agent; overriding the "
+                "page user agent to match the clearance cookie"
+            )
         _apply_user_agent(page, solved_user_agent)
 
     _apply_cookies(page, cookies)
@@ -2041,6 +2414,25 @@ def is_target_closed_error(exc: BaseException) -> bool:
     )
 
 
+# NAVIGATION CLEAR AFTER CAPTCHA SOLVE
+def _navigation_clear_after_captcha_solve(
+    page: Page, response: Optional[object]
+) -> Optional[object]:
+    """
+    Return the navigation response when a captcha solve cleared the page so the
+    caller does not immediately issue another goto and trigger a fresh challenge.
+    """
+
+    if page.is_closed():
+        raise RuntimeError("Target page closed after captcha solve")
+
+    if not is_captcha_present(page):
+        reset_consecutive_captcha_count()
+        return response
+
+    return None
+
+
 # GOTO WITH CAPTCHA HANDLING
 def goto_with_captcha_handling(
     page: Page, url: str, max_retries: int = 3
@@ -2071,9 +2463,13 @@ def goto_with_captcha_handling(
                     "(renderer likely crashed)"
                 )
 
-            # if a captcha appeared after a successful load, solve then retry
+            # if a captcha appeared after a successful load, solve then continue
+            # only when the challenge is still present (interstitial solves reload)
             if is_captcha_present(page):
                 wait_for_captcha_solve(page)
+                cleared = _navigation_clear_after_captcha_solve(page, response)
+                if cleared is not None:
+                    return cleared
                 continue
 
             reset_consecutive_captcha_count()
@@ -2148,6 +2544,9 @@ def goto_with_captcha_handling(
 
             if captcha_showing:
                 wait_for_captcha_solve(page)
+                cleared = _navigation_clear_after_captcha_solve(page, None)
+                if cleared is not None:
+                    return cleared
                 continue
 
             # ERR_ABORTED is often a superseded/transient navigation, and a

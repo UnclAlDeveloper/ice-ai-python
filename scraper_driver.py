@@ -23,6 +23,7 @@ from common import (
     with_db_retry,
 )
 from listing_images import (
+    cap_gallery_urls,
     delete_listing,
     delete_listing_images,
     download_and_save_listing_images,
@@ -37,6 +38,7 @@ from stealth_browser import (
     check_proxy_health,
     close_browser_quietly,
     configure_consecutive_captcha_rotation,
+    ensure_headed_window_visible,
     goto_with_captcha_handling,
     is_navigation_timeout,
     is_proxy_network_error,
@@ -595,6 +597,9 @@ def open_proxied_session(
     if landing_url is not None:
         goto_with_captcha_handling(page, landing_url)
 
+    if getattr(browser, "_ice_headed_display", False):
+        ensure_headed_window_visible(page)
+
     if on_ready is not None:
         on_ready(page)
 
@@ -649,6 +654,7 @@ def persist_listing_with_images_and_ai(
             session, prospect_listing
         )
     elif image_urls is not None and page is not None:
+        image_urls = cap_gallery_urls(image_urls)
         expected_image_count = len(image_urls)
         temp_image_dir = download_and_save_listing_images(
             image_urls,

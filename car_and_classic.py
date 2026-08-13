@@ -123,12 +123,36 @@ _NON_TITLE_HEADINGS = frozenset(
     }
 )
 
-# car & classic allows at most 100 photos per advert; anything beyond that is
-# almost certainly gallery-extraction noise (thumbnails, related cars, etc.)
-_MAX_GALLERY_IMAGES = 100
+# LISTING PAUSE MIN S
+_LISTING_PAUSE_MIN_S = 5.0
+
+# LISTING PAUSE MAX S
+_LISTING_PAUSE_MAX_S = 12.0
+
+# SEARCH WARMUP MIN S
+_SEARCH_WARMUP_MIN_S = 2.0
+
+# SEARCH WARMUP MAX S
+_SEARCH_WARMUP_MAX_S = 5.0
 
 # cap search pagination at 20 pages (~60 cards per page, ~1200 listings total)
 _MAX_SEARCH_PAGES = 20
+
+
+# WARM UP SEARCH SESSION
+def _warm_up_search_session(page: Page) -> None:
+    """
+    Scroll and idle on the search results page so the first Cloudflare session
+    looks less like an immediate automation burst after filter navigation.
+    """
+
+    try:
+        page.mouse.wheel(0, 500)
+        pause(_SEARCH_WARMUP_MIN_S, _SEARCH_WARMUP_MAX_S)
+        page.mouse.wheel(0, -250)
+        pause(1.0, 2.0)
+    except Exception:
+        pass
 
 
 # IS NON TITLE HEADING
@@ -822,12 +846,26 @@ def _canonical_newest_search_url(url: str) -> str:
 # EXTRACT SOURCE ID
 def extract_source_id(url: str | None) -> str | None:
     """
-    Extract the Car & Classic listing reference (e.g. 'C2085940') from a
-    listing URL such as 'https://www.carandclassic.com/l/C2085940'. Returns
-    None when the URL does not contain a /l/ reference segment.
+    Extract the Car & Classic listing reference from a listing URL. Classified
+    ads store a C-prefixed id in /l/, /la/, or /car/ (e.g. 'C1032137').
+    Auction and make-an-offer pages use the trailing slug token (e.g. 'n9v0O4'
+    from .../auctions/2004-mercedes-benz-sl500-r230-n9v0O4). Returns None when
+    the URL does not contain a recognised listing id.
     """
 
-    match = re.search(r"/l/([^/?#]+)", url or "")
+    if not url:
+        return None
+
+    # classified ads store the c-prefixed id in /l/, /la/ or /car/
+    match = re.search(r"/(?:la|l|car)/([^/?#]+)", url)
+    if match:
+        return match.group(1)
+
+    # auctions and make-an-offer pages use the trailing slug token as the id
+    match = re.search(
+        r"/(?:auctions|make-an-offer)/[^/?#]*-([A-Za-z0-9]+)(?:[/?#]|$)",
+        url,
+    )
     return match.group(1) if match else None
 
 
@@ -889,7 +927,7 @@ def extract_gallery_images(page: Page) -> list[str]:
         structured_urls,
     )
 
-    return cap_gallery_urls(image_urls, max_images=_MAX_GALLERY_IMAGES)
+    return cap_gallery_urls(image_urls)
 
 
 # EXTRACT LISTING DETAILS
@@ -1143,7 +1181,7 @@ def scrape_listings(
         page_url = with_page_param(search_url, page_number)
         goto_with_captcha_handling(page, page_url)
         accept_cookies(page, wait_for_banner=True, timeout=8000)
-        pause_for_page(page)
+        pause_for_page(page, min_seconds=2.0, max_seconds=4.0)
 
         if not search_results_present(page, _SEARCH_RESULTS_CARD_SELECTOR):
             log_no_listings_on_page(page_number)
@@ -1240,7 +1278,11 @@ def scrape_listings(
                 response = goto_with_captcha_handling(page, listing_url)
                 accept_cookies(page, wait_for_banner=True, timeout=8000)
                 wait_for_listing_detail_page(page)
-                pause_for_page(page)
+                pause_for_page(
+                    page,
+                    min_seconds=_LISTING_PAUSE_MIN_S,
+                    max_seconds=_LISTING_PAUSE_MAX_S,
+                )
 
                 if is_http_not_found(response) or is_listing_no_longer_available(
                     page
@@ -1371,7 +1413,7 @@ def _open_session(playwright) -> tuple:
     """
 
     def on_ready(page: Page) -> None:
-        pause_for_page(page)
+        pause_for_page(page, min_seconds=2.0, max_seconds=5.0)
         accept_cookies(page, wait_for_banner=True)
 
     return open_proxied_session(
@@ -1409,6 +1451,8 @@ def _apply_search_filters(page: Page) -> str:
     # page did not pick it up (e.g. a soft redirect dropped the param)
     if not _is_sorted_by_newest(page):
         _apply_newest_listed_sort(page)
+
+    _warm_up_search_session(page)
 
     return _canonical_newest_search_url(page.url)
 

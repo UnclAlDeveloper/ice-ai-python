@@ -25,7 +25,12 @@ if TYPE_CHECKING:
 # how many times to retry a single s3 put when the socket stalls or the
 # connection drops mid-upload (read timeouts now surface via awsaccess config)
 _S3_SAVE_ATTEMPTS = 3
-_DEFAULT_MAX_GALLERY_IMAGES = 100
+
+# download at most this many photos per listing, across every source site
+MAX_GALLERY_IMAGES = 30
+
+# consecutive image download failures that mean the proxy is dead
+CONSECUTIVE_IMAGE_DOWNLOAD_FAILURES_BEFORE_ROTATE = 3
 
 
 # NORMALIZE IMAGE URL
@@ -100,7 +105,7 @@ def merge_image_url_lists(
 def cap_gallery_urls(
     image_urls: list[str],
     *,
-    max_images: int = _DEFAULT_MAX_GALLERY_IMAGES,
+    max_images: int = MAX_GALLERY_IMAGES,
 ) -> list[str]:
     """
     Truncate a gallery url list to max_images, logging when the site returns
@@ -112,7 +117,7 @@ def cap_gallery_urls(
 
     print(
         f"  Gallery returned {len(image_urls)} images "
-        f"(site max is {max_images}); truncating"
+        f"(download max is {max_images}); truncating"
     )
     return image_urls[:max_images]
 
@@ -225,11 +230,16 @@ def download_and_save_listing_images(
 ) -> Optional[str]:
     """
     Fetch each image URL via HTTP, save to a temporary directory and S3, and create
-    Images database records. Returns the path to the temporary directory, or None
-    if no images were saved. When page_hook is given it is invoked between image
-    downloads so scrapers can dismiss late cookie banners during long galleries.
+    Images database records. Truncates the gallery to MAX_GALLERY_IMAGES first so
+    every source site downloads the same maximum. Stops after
+    CONSECUTIVE_IMAGE_DOWNLOAD_FAILURES_BEFORE_ROTATE failed downloads in a row
+    so the caller can discard the listing and rotate the proxy. Returns the path
+    to the temporary directory, or None if no images were saved. When page_hook
+    is given it is invoked between image downloads so scrapers can dismiss late
+    cookie banners during long galleries.
     """
 
+    image_urls = cap_gallery_urls(image_urls)
     if not image_urls:
         return None
 
@@ -243,6 +253,7 @@ def download_and_save_listing_images(
     print(f"  Downloading {total} images...")
 
     saved_count = 0
+    consecutive_failures = 0
     for index, img_url in enumerate(image_urls):
         try:
             if page_hook is not None:
@@ -259,7 +270,20 @@ def download_and_save_listing_images(
                 page, img_url, page_hook=page_hook
             )
             if download is None:
+                consecutive_failures += 1
+                if (
+                    consecutive_failures
+                    >= CONSECUTIVE_IMAGE_DOWNLOAD_FAILURES_BEFORE_ROTATE
+                ):
+                    # remaining photos would likely fail on the same dead proxy
+                    print(
+                        f"  {consecutive_failures} consecutive image downloads "
+                        "failed; assuming the proxy is broken"
+                    )
+                    break
                 continue
+
+            consecutive_failures = 0
             image_bytes, content_type = download
 
             # determine file extension from content type or url

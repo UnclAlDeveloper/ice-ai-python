@@ -17,7 +17,9 @@ from stealth_browser import (
     Page,
     PageUnresponsiveError,
     goto_with_captcha_handling,
+    is_proxy_network_error,
     locator_is_visible,
+    new_stealth_page,
     page_html,
     quick_locator_count,
     run_quick_page_action,
@@ -85,8 +87,7 @@ CONFIG = ProxyRotationConfig.from_env_prefix(
 # query params are required because camelCase sellerType/listingType are ignored
 _FILTERED_SEARCH_URL = (
     "https://www.pistonheads.com/buy/search"
-    "?keywords=classic"
-    "&seller-type=Private"
+    "?seller-type=Private"
     "&listing-type=classifieds"
     "&sort=mostRecent"
 )
@@ -95,12 +96,30 @@ _SEARCH_RESULTS_LINK_SELECTOR = 'a[href*="/buy/listing/"]'
 _SORT_SELECT_SELECTOR = "#srp-sort-option-select"
 _MOST_RECENT_SORT_VALUE = "Date"
 _VIEW_MORE_BUTTON_SELECTOR = 'button:has-text("View more")'
+_SEARCH_PAGE_GRAPHQL_MARKER = "operationName=SearchPage"
+_VIEW_MORE_WAIT_S = 15.0
+_VIEW_MORE_RATE_LIMIT_RETRIES = 3
+_VIEW_MORE_RATE_LIMIT_BACKOFF_S = 10.0
+
+# next.js client prefetch of unrelated routes (buy.json A-Z, search.json, etc.)
+# floods the origin and 429s the SearchPage GraphQL fetch that powers View more
+_ABORTED_REQUEST_GLOBS = (
+    "**/pistonheads.com/_next/data/**",
+    "**/pistonheads.com/auth/profile*",
+    "**/google-analytics.com/**",
+    "**/google.co.uk/ads/**",
+    "**/googlesyndication.com/**",
+    "**/googleadservices.com/**",
+    "**/doubleclick.net/**",
+    "**/doubleverify.com/**",
+    "**/clarity.ms/**",
+    "**/nr-data.net/**",
+    "**/2mdn.net/**",
+)
+_ORIGIN_RATE_LIMIT_ATTR = "_ice_ph_rate_limit_reasons"
 
 # cap view-more batches (~16 cards each; ~89 results today, headroom for growth)
 _MAX_SEARCH_BATCHES = 20
-
-# pistonheads allows many photos; cap gallery extraction noise
-_MAX_GALLERY_IMAGES = 100
 
 _LISTING_ID_PATTERN = re.compile(r"/buy/listing/(\d+)")
 _IMAGE_URL_PATTERN = re.compile(r"https://img\.pistonheads\.com/[^\"'\\\s>]+")
@@ -189,26 +208,25 @@ def _quantcast_overlay_blocks_page(page: Page) -> bool:
     """
 
     try:
-        return bool(
-            page.evaluate(
-                """() => {
-                    const nodes = document.querySelectorAll(
-                        '#qc-cmp2-container, #qc-cmp2-ui, .qc-cmp-cleanslate'
-                    );
-                    for (const el of nodes) {
-                        const style = getComputedStyle(el);
-                        if (style.display === 'none' || style.visibility === 'hidden') {
-                            continue;
-                        }
-                        const rect = el.getBoundingClientRect();
-                        if (rect.width > 0 && rect.height > 0) {
-                            return true;
-                        }
+        result = page.evaluate(
+            """() => {
+                const nodes = document.querySelectorAll(
+                    '#qc-cmp2-container, #qc-cmp2-ui, .qc-cmp-cleanslate'
+                );
+                for (const el of nodes) {
+                    const style = getComputedStyle(el);
+                    if (style.display === 'none' || style.visibility === 'hidden') {
+                        continue;
                     }
-                    return false;
-                }"""
-            )
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width > 0 && rect.height > 0) {
+                        return true;
+                    }
+                }
+                return false;
+            }"""
         )
+        return result is True
     except Exception:
         return False
 
@@ -437,6 +455,18 @@ def _poll_cookie_consent(page: Page) -> None:
         accept_cookies(page)
 
 
+# ENSURE CONSENT CLEARED
+def _ensure_consent_cleared(page: Page) -> None:
+    """
+    Dismiss a visible cookie banner and strip leftover CMP overlays so they
+    cannot intercept the next View more click. Quantcast often appears after
+    the first search interaction on a fresh proxy session.
+    """
+
+    _poll_cookie_consent(page)
+    _remove_consent_overlays(page)
+
+
 # PAUSE FOR PAGE
 def pause_for_page(
     page: Page,
@@ -467,13 +497,11 @@ def _canonical_filtered_search_url(url: str) -> str:
         url,
         drop=("offset", "page", "p", "limit"),
         set_params={
-            "keywords": "classic",
             "seller-type": "Private",
             "listing-type": "classifieds",
             "sort": "mostRecent",
         },
         prefer_keys=[
-            "keywords",
             "seller-type",
             "listing-type",
             "sort",
@@ -528,50 +556,288 @@ def _apply_most_recent_sort(page: Page) -> None:
 
 
 # LOAD SEARCH BATCH
-def _load_search_batch(page: Page, search_url: str, batch_number: int) -> None:
+def _load_search_batch(page: Page, search_url: str, batch_number: int) -> int:
     """
     Open the filtered search url and click View more until the requested batch
-    number is reached. Batch one is the first page of results without extra clicks.
+    number is reached. Batch one is the first page of results without extra
+    clicks. Returns the batch depth actually reached (1 = initial page only).
     """
 
     goto_with_captcha_handling(page, search_url)
     accept_cookies(page, wait_for_banner=True, timeout=8000)
     pause_for_page(page)
+    _raise_if_origin_rate_limited(page)
     _apply_most_recent_sort(page)
 
-    for _ in range(max(batch_number - 1, 0)):
+    # each successful click appends another results batch; batch N needs N-1 clicks
+    reached = 1
+    clicks_needed = max(batch_number - 1, 0)
+    for click_index in range(clicks_needed):
+        _ensure_consent_cleared(page)
         if not _click_view_more(page):
+            print(
+                f"View more stopped after {reached} batch(es); "
+                f"wanted batch {batch_number} "
+                f"({click_index}/{clicks_needed} clicks done)"
+            )
             break
-        pause_for_page(page, min_seconds=_PAUSE_BATCH_MIN_S, max_seconds=_PAUSE_BATCH_MAX_S)
+        reached += 1
+        pause_for_page(
+            page,
+            min_seconds=_PAUSE_BATCH_MIN_S,
+            max_seconds=_PAUSE_BATCH_MAX_S,
+        )
+
+    return reached
+
+
+# SEARCH PAGE GRAPHQL PROXY FAILURE
+def _search_page_graphql_proxy_failure(request) -> str | None:
+    """
+    Return the Chromium error text when a SearchPage GraphQL request dies at
+    the proxy tunnel, or None when the failed request is unrelated (ads,
+    analytics) or is not a transport-level proxy failure.
+    """
+
+    url = getattr(request, "url", "") or ""
+    if _SEARCH_PAGE_GRAPHQL_MARKER not in url:
+        return None
+
+    failure = getattr(request, "failure", None) or ""
+    if not is_proxy_network_error(Exception(failure)):
+        return None
+
+    return failure
+
+
+# SEARCH PAGE GRAPHQL RATE LIMITED
+def _search_page_graphql_rate_limited(response) -> bool:
+    """
+    Return True when a SearchPage GraphQL response is HTTP 429. Unlike a
+    tunnel failure this is a completed response, so it never fires
+    requestfailed.
+    """
+
+    url = getattr(response, "url", "") or ""
+    if _SEARCH_PAGE_GRAPHQL_MARKER not in url:
+        return False
+
+    return int(getattr(response, "status", 0) or 0) == 429
+
+
+# STATIC BUNDLE RATE LIMITED
+def _static_bundle_rate_limited(response) -> str | None:
+    """
+    Return the asset URL when a Next.js search/runtime JS bundle is HTTP 429.
+    Cloudflare serves those 429s as text/plain, so Chromium refuses to execute
+    them and View more's fetchMore handler never attaches.
+    """
+
+    url = getattr(response, "url", "") or ""
+    if int(getattr(response, "status", 0) or 0) != 429:
+        return None
+    if "pistonheads.com" not in url:
+        return None
+
+    path = urlparse(url).path
+    if "/_next/static/" not in path:
+        return None
+
+    filename = path.rsplit("/", 1)[-1]
+    if filename.endswith(".js") or "_buildManifest" in filename or "_ssgManifest" in filename:
+        return url.split("?", 1)[0]
+
+    return None
+
+
+# RECORD ORIGIN RATE LIMIT
+def _record_origin_rate_limit(page: Page, response) -> None:
+    """
+    Remember essential Next.js bundle 429s on this page so later View more
+    clicks can rotate the proxy instead of treating a broken SPA as the end
+    of results.
+    """
+
+    reason = _static_bundle_rate_limited(response)
+    if reason is None:
+        return
+
+    reasons = getattr(page, _ORIGIN_RATE_LIMIT_ATTR, None)
+    if not isinstance(reasons, list):
+        reasons = []
+        setattr(page, _ORIGIN_RATE_LIMIT_ATTR, reasons)
+    reasons.append(reason)
+
+
+# RAISE IF ORIGIN RATE LIMITED
+def _raise_if_origin_rate_limited(page: Page) -> None:
+    """
+    Raise ProxySessionExpired when this session has already 429'd a Next.js
+    JS bundle that View more needs.
+    """
+
+    reasons = getattr(page, _ORIGIN_RATE_LIMIT_ATTR, None)
+    if not isinstance(reasons, list) or not reasons:
+        return
+
+    raise ProxySessionExpired(
+        "PistonHeads origin rate limited essential assets (HTTP 429): "
+        f"{reasons[-1]}"
+    )
 
 
 # CLICK VIEW MORE
 def _click_view_more(page: Page) -> bool:
     """
     Click the View more button when present and wait for additional listing
-    cards to attach. Returns False when no button is visible.
+    cards to attach. Returns False when the button is missing or the card
+    count does not increase after the click. Dismisses a Quantcast cookie
+    overlay that often appears after the first successful click on a fresh
+    proxy session, and retries when that overlay intercepts the click. On
+    SearchPage GraphQL HTTP 429, waits and re-clicks a few times. Raises
+    ProxySessionExpired when the GraphQL fetch dies at the proxy tunnel,
+    when 429s persist, or when a Next.js search/runtime JS bundle is 429'd
+    (View more's handler never loads in that case), so the caller can
+    relaunch on a fresh exit IP.
     """
 
     view_more = page.locator(_VIEW_MORE_BUTTON_SELECTOR)
-    if quick_locator_count(view_more, description="view more button") == 0:
+
+    _raise_if_origin_rate_limited(page)
+    _ensure_consent_cleared(page)
+
+    # wait for the control to appear; an instant count races hydration
+    try:
+        view_more.first.wait_for(state="visible", timeout=10_000)
+    except Exception:
         return False
 
     before_count = quick_locator_count(
         page.locator(_SEARCH_RESULTS_LINK_SELECTOR),
         description="listing links before view more",
     )
-    view_more.first.click()
-    deadline = time.time() + 15.0
-    while time.time() < deadline:
-        after_count = quick_locator_count(
-            page.locator(_SEARCH_RESULTS_LINK_SELECTOR),
-            description="listing links after view more",
-        )
-        if after_count > before_count:
-            return True
-        time.sleep(0.5)
 
-    return True
+    # bring the control into view; some sessions keep it below the fold
+    try:
+        view_more.first.scroll_into_view_if_needed(timeout=5000)
+    except Exception:
+        pass
+
+    for attempt in range(_VIEW_MORE_RATE_LIMIT_RETRIES + 1):
+        failed_proxy: list[str] = []
+        static_429: list[str] = []
+        rate_limited = False
+
+        def on_request_failed(request) -> None:
+            failure = _search_page_graphql_proxy_failure(request)
+            if failure is not None:
+                failed_proxy.append(failure)
+
+        def on_response(response) -> None:
+            nonlocal rate_limited
+            if _search_page_graphql_rate_limited(response):
+                rate_limited = True
+            bundle = _static_bundle_rate_limited(response)
+            if bundle is not None:
+                static_429.append(bundle)
+                _record_origin_rate_limit(page, response)
+
+        # quantcast often injects after the previous successful fetchMore
+        _ensure_consent_cleared(page)
+
+        page.on("requestfailed", on_request_failed)
+        page.on("response", on_response)
+        try:
+            try:
+                view_more.first.click(timeout=5000)
+            except Exception as e:
+                print(f"View more click failed: {e}")
+                if (
+                    attempt < _VIEW_MORE_RATE_LIMIT_RETRIES
+                    and _is_cookie_consent_visible(page)
+                ):
+                    print(
+                        "Cookie consent overlay blocked View more; "
+                        "dismissing and retrying"
+                    )
+                    _ensure_consent_cleared(page)
+                    continue
+                return False
+
+            # poll at least once so a fast success is not missed when the wait is short
+            deadline = time.time() + _VIEW_MORE_WAIT_S
+            while True:
+                after_count = quick_locator_count(
+                    page.locator(_SEARCH_RESULTS_LINK_SELECTOR),
+                    description="listing links after view more",
+                )
+                if after_count > before_count:
+                    # cmp often appears as soon as the new cards attach
+                    _ensure_consent_cleared(page)
+                    return True
+                # 429 and tunnel errors will not grow the card list; stop waiting
+                if (
+                    failed_proxy
+                    or static_429
+                    or rate_limited
+                    or time.time() >= deadline
+                ):
+                    break
+                # dismiss banners that may have blocked the click mid-wait
+                _poll_cookie_consent(page)
+                time.sleep(0.5)
+        finally:
+            page.remove_listener("requestfailed", on_request_failed)
+            page.remove_listener("response", on_response)
+
+        # search/runtime js 429s leave the spa without fetchMore; rotate now
+        if static_429:
+            raise ProxySessionExpired(
+                "PistonHeads origin rate limited essential assets (HTTP 429): "
+                f"{static_429[0]}"
+            )
+
+        # apollo retries the same fetchMore on a dead tunnel; re-clicking cannot
+        # recover, so rotate rather than stopping pagination
+        if failed_proxy:
+            raise ProxySessionExpired(
+                "View more GraphQL fetch failed through the proxy "
+                f"({failed_proxy[0]})"
+            )
+
+        # a later click on the same page often works once the 429 window lifts
+        if rate_limited:
+            if attempt < _VIEW_MORE_RATE_LIMIT_RETRIES:
+                print(
+                    f"View more GraphQL returned HTTP 429; waiting "
+                    f"{_VIEW_MORE_RATE_LIMIT_BACKOFF_S:.0f}s then retrying "
+                    f"(attempt {attempt + 1}/{_VIEW_MORE_RATE_LIMIT_RETRIES})"
+                )
+                time.sleep(_VIEW_MORE_RATE_LIMIT_BACKOFF_S)
+                continue
+            raise ProxySessionExpired(
+                "View more GraphQL rate limited (HTTP 429)"
+            )
+
+        # playwright can report a successful click that actually hit the cmp
+        if (
+            attempt < _VIEW_MORE_RATE_LIMIT_RETRIES
+            and _is_cookie_consent_visible(page)
+        ):
+            print(
+                "Cookie consent overlay covered View more; dismissing and retrying "
+                f"(attempt {attempt + 1}/{_VIEW_MORE_RATE_LIMIT_RETRIES})"
+            )
+            _ensure_consent_cleared(page)
+            continue
+
+        print(
+            f"View more click did not add listings "
+            f"(still {before_count} card links)"
+        )
+        return False
+
+    return False
 
 
 # EXTRACT SOURCE ID
@@ -622,7 +888,7 @@ def _extract_gallery_images_from_html(content: str) -> list[str]:
             store_normalized=True,
         )
 
-    return cap_gallery_urls(image_urls, max_images=_MAX_GALLERY_IMAGES)
+    return cap_gallery_urls(image_urls)
 
 
 # EXTRACT GALLERY IMAGES
@@ -1290,6 +1556,7 @@ def _apply_search_filters(page: Page) -> str:
     accept_cookies(page, wait_for_banner=True, timeout=8000)
     pause_for_page(page)
     _apply_most_recent_sort(page)
+    _raise_if_origin_rate_limited(page)
     wait_for_selector_with_backoff(
         page,
         _SEARCH_RESULTS_LINK_SELECTOR,
@@ -1298,6 +1565,38 @@ def _apply_search_filters(page: Page) -> str:
     )
 
     return _canonical_filtered_search_url(page.url)
+
+
+# OPEN LISTING PAGE
+def _open_listing_page(search_page: Page) -> Page:
+    """
+    Open a second tab on the same proxied browser so listing visits do not
+    unload the search grid. Reloading /buy/search re-fetches every Next.js
+    chunk and is what 429s View more.
+    """
+
+    browser = search_page.context.browser
+    if browser is None:
+        return search_page
+
+    listing_page = new_stealth_page(browser)
+    _install_request_filters(listing_page)
+    return listing_page
+
+
+# CLOSE LISTING PAGE
+def _close_listing_page(listing_page: Page, search_page: Page) -> None:
+    """
+    Close the extra listing tab when it is not the search page itself.
+    """
+
+    if listing_page is search_page:
+        return
+
+    try:
+        listing_page.close()
+    except Exception:
+        pass
 
 
 # SCRAPE LISTINGS
@@ -1309,9 +1608,9 @@ def scrape_listings(
 ):
     """
     Walk up to _MAX_SEARCH_BATCHES of PistonHeads search result batches and
-    save new listings. Each batch loads the filtered search url, optionally
-    clicks View more to reach the saved batch number, snapshots cards, then
-    visits each candidate directly without returning to the grid between items.
+    save new listings. The search grid stays open in one tab and View more
+    expands it in place; a second tab visits each batch's new cards so the
+    Next.js search bundle is not re-fetched (which 429s View more).
     """
 
     existing_source_ids = get_existing_source_ids(ListingSource.PISTONHEADS)
@@ -1324,7 +1623,6 @@ def scrape_listings(
     new_count = 0
     processed_ids = resume.processed_ids if resume is not None else set()
     batch_number = resume.page_number if resume is not None else 1
-    previous_batch_listing_ids: set[str] = set()
 
     if resume is not None and resume.search_url is not None:
         search_url = _canonical_filtered_search_url(resume.search_url)
@@ -1332,27 +1630,13 @@ def scrape_listings(
 
     log_paginating_start("PistonHeads")
 
-    while True:
-        _load_search_batch(page, search_url, batch_number)
-        accept_cookies(page, wait_for_banner=True, timeout=8000)
-        pause_for_page(page)
+    listing_page = _open_listing_page(page)
 
-        if not search_results_present(page, _SEARCH_RESULTS_LINK_SELECTOR):
-            log_no_listings_on_page(batch_number)
-            break
-
-        listing_candidates = _snapshot_listing_candidates(page)
-        batch_listing_ids = {card_id for card_id, _, _, _ in listing_candidates}
-
-        if batch_listing_ids and batch_listing_ids == previous_batch_listing_ids:
-            log_repeat_page(batch_number)
-            break
-
-        previous_batch_listing_ids = batch_listing_ids
-        log_results_page(batch_number, len(listing_candidates))
+    def scrape_current_batch(candidates: list) -> None:
+        nonlocal new_count
 
         for index, (card_id, listing_url, source_id, title) in enumerate(
-            listing_candidates, start=1
+            candidates, start=1
         ):
             if card_id in processed_ids:
                 log_already_processed(index, title)
@@ -1380,17 +1664,17 @@ def scrape_listings(
             log_timestamp()
 
             try:
-                response = goto_with_captcha_handling(page, listing_url)
-                accept_cookies(page, wait_for_banner=True, timeout=15000)
-                wait_for_listing_detail_page(page)
+                response = goto_with_captcha_handling(listing_page, listing_url)
+                accept_cookies(listing_page, wait_for_banner=True, timeout=15000)
+                wait_for_listing_detail_page(listing_page)
                 pause_for_page(
-                    page,
+                    listing_page,
                     min_seconds=_PAUSE_LISTING_MIN_S,
                     max_seconds=_PAUSE_LISTING_MAX_S,
                 )
 
                 if is_http_not_found(response) or is_listing_no_longer_available(
-                    page
+                    listing_page
                 ):
                     reason = (
                         "404"
@@ -1415,7 +1699,7 @@ def scrape_listings(
                     continue
 
                 prospect_listing, image_urls = extract_listing_details(
-                    page, hash_code, source_id, fallback_title=title
+                    listing_page, hash_code, source_id, fallback_title=title
                 )
                 prospect_listing.status_checked_at = datetime.now()
                 new_count += 1
@@ -1432,7 +1716,7 @@ def scrape_listings(
                         )
 
                     def before_ai() -> None:
-                        _poll_cookie_consent(page)
+                        _poll_cookie_consent(listing_page)
 
                     try:
                         persist_listing_with_images_and_ai(
@@ -1441,7 +1725,7 @@ def scrape_listings(
                             ai_prompt_filename="classic_car_prompt.md",
                             listing_url=listing_url,
                             image_urls=image_urls,
-                            page=page,
+                            page=listing_page,
                             temp_dir_prefix="pistonheads_images_",
                             page_hook=_poll_cookie_consent,
                             before_ai=before_ai,
@@ -1454,7 +1738,7 @@ def scrape_listings(
                         raise
 
                 mark_listing_processed_and_check_availability(
-                    page,
+                    listing_page,
                     source_id=source_id,
                     card_id=card_id,
                     existing_source_ids=existing_source_ids,
@@ -1470,38 +1754,97 @@ def scrape_listings(
                 reraise_or_log_listing_error(index, title, listing_url, e)
 
             pause_for_page(
-                page,
+                listing_page,
                 min_seconds=_PAUSE_BETWEEN_LISTINGS_MIN_S,
                 max_seconds=_PAUSE_BETWEEN_LISTINGS_MAX_S,
             )
+
+    try:
+        reached = _load_search_batch(page, search_url, batch_number)
+        accept_cookies(page, wait_for_banner=True, timeout=8000)
+        pause_for_page(page)
+        _raise_if_origin_rate_limited(page)
+
+        if not search_results_present(page, _SEARCH_RESULTS_LINK_SELECTOR):
+            log_no_listings_on_page(batch_number)
+            log_scrape_finished(batch_number, new_count, len(processed_ids))
+            return
+
+        # resume/proxy path asked for batch N but View more stopped early
+        if reached < batch_number:
+            print(
+                f"Only reached batch {reached} while targeting "
+                f"{batch_number}; processing loaded cards and continuing"
+            )
+            batch_number = reached
+
+        listing_candidates = _snapshot_listing_candidates(page)
+        previous_batch_listing_ids = {
+            card_id for card_id, _, _, _ in listing_candidates
+        }
+        log_results_page(batch_number, len(listing_candidates))
+        scrape_current_batch(listing_candidates)
+
+        # keep clicking on this document; reloading /buy/search re-fetches every
+        # /_next/static chunk and is what 429s search-*.js
+        while batch_number < _MAX_SEARCH_BATCHES:
+            if not _click_view_more(page):
+                break
+
+            batch_number += 1
+            pause_for_page(
+                page,
+                min_seconds=_PAUSE_BATCH_MIN_S,
+                max_seconds=_PAUSE_BATCH_MAX_S,
+            )
+            listing_candidates = _snapshot_listing_candidates(page)
+            batch_listing_ids = {
+                card_id for card_id, _, _, _ in listing_candidates
+            }
+            if (
+                batch_listing_ids
+                and batch_listing_ids == previous_batch_listing_ids
+            ):
+                log_repeat_page(batch_number)
+                break
+
+            previous_batch_listing_ids = batch_listing_ids
+            log_results_page(batch_number, len(listing_candidates))
+            if resume is not None:
+                resume.page_number = batch_number
+                resume.processed_ids = processed_ids
+            scrape_current_batch(listing_candidates)
 
         if batch_number >= _MAX_SEARCH_BATCHES:
             print(
                 f"Reached max search batches ({_MAX_SEARCH_BATCHES}); "
                 "stopping pagination"
             )
-            break
-
-        # the next loop reloads search and clicks View more batch_number times
-        probe_batch = batch_number + 1
-        _load_search_batch(page, search_url, probe_batch)
-        if not search_results_present(page, _SEARCH_RESULTS_LINK_SELECTOR):
-            break
-
-        probe_ids = {
-            card_id
-            for card_id, _, _, _ in _snapshot_listing_candidates(page)
-        }
-        if not probe_ids or probe_ids == batch_listing_ids:
-            break
-
-        batch_number = probe_batch
-        if resume is not None:
-            resume.page_number = batch_number
-            resume.processed_ids = processed_ids
-        pause_for_page(page, min_seconds=_PAUSE_BATCH_MIN_S, max_seconds=_PAUSE_BATCH_MAX_S)
+    finally:
+        _close_listing_page(listing_page, page)
 
     log_scrape_finished(batch_number, new_count, len(processed_ids))
+
+
+# INSTALL REQUEST FILTERS
+def _install_request_filters(page: Page) -> None:
+    """
+    Abort Next.js route prefetch and third-party ads/analytics so they cannot
+    429 the origin, and watch remaining PistonHeads responses for 429s on
+    the search/runtime JS bundles View more needs.
+    """
+
+    def abort_route(route) -> None:
+        route.abort()
+
+    for pattern in _ABORTED_REQUEST_GLOBS:
+        page.route(pattern, abort_route)
+
+    setattr(page, _ORIGIN_RATE_LIMIT_ATTR, [])
+    page.on(
+        "response",
+        lambda response: _record_origin_rate_limit(page, response),
+    )
 
 
 # OPEN SESSION
@@ -1512,17 +1855,20 @@ def _open_session(playwright) -> tuple:
     """
 
     def on_ready(page: Page) -> None:
+        # install filters before the first navigation so prefetch cannot 429 us
+        _install_request_filters(page)
+        goto_with_captcha_handling(page, "https://www.pistonheads.com/buy/search")
         pause_for_page(
             page,
             min_seconds=_PAUSE_SESSION_MIN_S,
             max_seconds=_PAUSE_SESSION_MAX_S,
         )
         accept_cookies(page, wait_for_banner=True, timeout=10000)
+        _raise_if_origin_rate_limited(page)
 
     return open_proxied_session(
         playwright,
         headless=is_headless,
-        landing_url="https://www.pistonheads.com/buy/search",
         on_ready=on_ready,
     )
 

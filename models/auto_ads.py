@@ -42,6 +42,7 @@ class ProspectListings(Base):
     __tablename__ = 'prospect_listings'
     __table_args__ = (
         PrimaryKeyConstraint('id', name='prospect_listings_pkey'),
+        UniqueConstraint('listing_source', 'source_id', name='prospect_listings_listing_source_source_id_unique'),
         Index('idx_prospect_listings_hash_code', 'hash_code'),
         Index('idx_prospect_listings_source_id', 'source_id'),
         {'schema': 'aa'}
@@ -54,6 +55,7 @@ class ProspectListings(Base):
     url = mapped_column(String, nullable=False)
     listing_source = mapped_column(ENUM('Autotrader', 'Car&Classic', 'eBay', 'Facebook', 'Gumtree', 'ManualEntry', 'OnlyVans', 'Pistonheads', name='listing_source', schema='aa'), nullable=False)
     status = mapped_column(ENUM('New', 'NotAvailable', 'Viewed', 'NotInterested', 'Interested', 'Bought', 'Sold', name='prospect_listing_status', schema='aa'), nullable=False)
+    source_id = mapped_column(String, nullable=False)
     listing_type = mapped_column(ENUM('Car', 'Van', 'Classic', 'Item', 'Boat', 'Yacht', name='listing_type', schema='aa'), nullable=False)
     created_at = mapped_column(DateTime(True))
     updated_at = mapped_column(DateTime(True))
@@ -107,7 +109,6 @@ class ProspectListings(Base):
     type_approval = mapped_column(String)
     revenue_weight = mapped_column(Integer)
     status_checked_at = mapped_column(DateTime(True))
-    source_id = mapped_column(String)
 
 
 class ResaleListings(Base):

@@ -1,5 +1,6 @@
 import os
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Generator, Optional, Union
 
@@ -10,7 +11,7 @@ is_headless = resolve_runtime_flags()
 from environments import load_environment
 load_environment()
 
-from pydantic import BaseModel, PrivateAttr
+from pydantic import BaseModel, Field, PrivateAttr
 from sqlalchemy.orm import sessionmaker
 
 from ebay_rest import API, Error
@@ -24,6 +25,7 @@ from common import (
     parse_mileage,
     pause,
 )
+from listing_images import MAX_GALLERY_IMAGES, cap_gallery_urls
 from models.auto_ads import ProspectListings
 from models.enums import ListingSource, ListingType, ProspectListingStatus
 from scraper_driver import (
@@ -36,6 +38,7 @@ from scraper_driver import (
     log_saved_listing,
     log_scrape_finished,
     log_skipping,
+    log_timestamp,
     mark_listing_processed_and_check_availability,
     persist_listing_with_images_and_ai,
     run_consent_dismiss_loop,
@@ -49,7 +52,8 @@ from stealth_browser import (
 )
 
 EBAY_VANS_CATEGORY_ID = "122202"
-EBAY_CLASSICS_CATEGORY_ID = "1839833"
+EBAY_CLASSICS_CATEGORY_ID = "29751"
+EBAY_NON_AUCTION_BUYING_OPTIONS = ["FIXED_PRICE", "CLASSIFIED_AD"]
 
 CONFIG = ProxyRotationConfig.from_env_prefix("EBAY")
 
@@ -71,14 +75,19 @@ class EbayScrapeConfig:
 
     listing_type: ListingType
     ai_prompt_filename: str
-    query: str
     category_id: str
+    query: Optional[str] = None
     marketplace: str = "GB"
     limit: Optional[int] = None
     min_price: Optional[float] = None
     max_price: Optional[float] = None
     pickup_postal_code: Optional[str] = None
     pickup_radius: Optional[int] = None
+    item_location_country: Optional[str] = None
+    buying_options: list[str] = field(
+        default_factory=lambda: list(EBAY_NON_AUCTION_BUYING_OPTIONS)
+    )
+    sort: Optional[str] = None
     availability_check_limit: int = 500
 
 
@@ -153,17 +162,32 @@ def build_search_filters(
     max_price: Optional[float] = None,
     pickup_postal_code: Optional[str] = None,
     pickup_radius: Optional[int] = None,
+    item_location_country: Optional[str] = None,
+    buying_options: Optional[list[str]] = None,
 ) -> list[str]:
     """
-    Build eBay Browse API filter strings for price and local pickup constraints.
-    Raises ValueError when only one pickup parameter is provided.
+    Build eBay Browse API filter strings for price, location, buying format,
+    local pickup constraints, and private sellers only. Raises ValueError when
+    only one pickup parameter is provided.
     """
 
-    filters: list[str] = []
+    filters: list[str] = ["sellerAccountTypes:{INDIVIDUAL}"]
     if min_price is not None or max_price is not None:
         price_min = min_price if min_price is not None else 0
         price_max = max_price if max_price is not None else ""
         filters.append(f"price:[{price_min}..{price_max}]")
+
+    if item_location_country is not None:
+        filters.append(f"itemLocationCountry:{item_location_country}")
+
+    resolved_buying_options = (
+        buying_options
+        if buying_options is not None
+        else EBAY_NON_AUCTION_BUYING_OPTIONS
+    )
+    if resolved_buying_options:
+        options = "|".join(resolved_buying_options)
+        filters.append(f"buyingOptions:{{{options}}}")
 
     if pickup_postal_code is not None and pickup_radius is not None:
         filters.append(f"pickupPostalCode:{pickup_postal_code}")
@@ -181,11 +205,14 @@ def build_search_filters(
 
 
 # PARSE ASKING PRICE
-def parse_asking_price(price_value: object) -> int:
+def parse_asking_price(price_value: object) -> Optional[int]:
     """
     Convert an eBay Browse API price value to an integer pounds/dollars amount.
+    Classified and incomplete Browse records may omit a price; those become None.
     """
 
+    if price_value is None or price_value == "":
+        return None
     if isinstance(price_value, str):
         return int(float(price_value.replace(",", "")))
     return int(float(price_value))
@@ -225,6 +252,34 @@ def build_make_and_model(
     return title
 
 
+# IS AUCTION LISTING
+def is_auction_listing(listing: dict, *, details: Optional[dict] = None) -> bool:
+    """
+    Return True when the Browse API record or scraped page details indicate an
+    auction listing rather than fixed price or classified ad.
+    """
+
+    buying_options = listing.get("buying_options") or listing.get("buyingOptions") or []
+    if "AUCTION" in buying_options:
+        return True
+    if details is not None and details.get("auction_closes") is not None:
+        return True
+    return False
+
+
+# EXTRACT SOURCE ID
+def extract_source_id(url: str | None) -> str | None:
+    """
+    Extract the eBay item number from a listing URL such as
+    https://www.ebay.co.uk/itm/800028133156 or
+    https://www.ebay.co.uk/itm/some-title/800028133156. Returns None when the
+    URL does not contain a numeric /itm/ id.
+    """
+
+    match = re.search(r"/itm/(?:[^/?#]+/)?(\d+)", url or "")
+    return match.group(1) if match else None
+
+
 # BUILD PROSPECT LISTING
 def build_prospect_listing(
     *,
@@ -241,12 +296,12 @@ def build_prospect_listing(
 
     title = listing.get("title", "")
     item_web_url = listing.get("item_web_url", "")
-    price_info = listing.get("price", {})
+    price_info = listing.get("price") or {}
     asking_price_raw = price_info.get("value")
     currency = price_info.get("currency", "")
-    item_location = listing.get("item_location", {})
+    item_location = listing.get("item_location") or {}
     location = item_location.get("city", "")
-    source_id = listing.get("item_id")
+    source_id = extract_source_id(item_web_url) or listing.get("item_id")
 
     return ProspectListings(
         hash_code=hash_code,
@@ -359,13 +414,18 @@ class EbayDownloader(BaseModel):
     listing_type: ListingType
     ai_prompt_filename: str
     marketplace: str = "GB"
-    query: str = "van"
+    query: Optional[str] = None
     category_id: str = EBAY_VANS_CATEGORY_ID
     limit: Optional[int] = None
     min_price: Optional[float] = None
     max_price: Optional[float] = None
     pickup_postal_code: Optional[str] = None
     pickup_radius: Optional[int] = None
+    item_location_country: Optional[str] = None
+    buying_options: list[str] = Field(
+        default_factory=lambda: list(EBAY_NON_AUCTION_BUYING_OPTIONS)
+    )
+    sort: Optional[str] = None
     availability_check_limit: int = 500
 
     _api: Optional[API] = PrivateAttr(default=None)
@@ -390,6 +450,9 @@ class EbayDownloader(BaseModel):
             max_price=config.max_price,
             pickup_postal_code=config.pickup_postal_code,
             pickup_radius=config.pickup_radius,
+            item_location_country=config.item_location_country,
+            buying_options=config.buying_options,
+            sort=config.sort,
             availability_check_limit=config.availability_check_limit,
         )
 
@@ -480,6 +543,9 @@ class EbayDownloader(BaseModel):
         Prints and returns a list of category suggestions sorted by relevance.
         """
 
+        if not self.query:
+            raise ValueError("A query is required to request category suggestions")
+
         api = self._get_api()
         marketplace_id = f"EBAY_{self.marketplace}"
 
@@ -527,16 +593,21 @@ class EbayDownloader(BaseModel):
             max_price=self.max_price,
             pickup_postal_code=self.pickup_postal_code,
             pickup_radius=self.pickup_radius,
+            item_location_country=self.item_location_country,
+            buying_options=self.buying_options,
         )
 
-        search_params = {
-            "q": self.query,
+        search_params: dict = {
             "category_ids": self.category_id,
         }
+        if self.query:
+            search_params["q"] = self.query
         if filters:
             search_params["filter"] = ",".join(filters)
         if self.limit is not None:
             search_params["limit"] = self.limit
+        if self.sort is not None:
+            search_params["sort"] = self.sort
 
         records_yielded = 0
         for record in api.buy_browse_search(**search_params):
@@ -685,7 +756,8 @@ class EbayDownloader(BaseModel):
 
     def _extract_listing_images(self) -> list[str]:
         """
-        Iterate through the eBay listing page to collect all image URLs.
+        Iterate through the eBay listing page to collect image URLs, stopping
+        once MAX_GALLERY_IMAGES have been found.
         """
 
         if self._page is None:
@@ -706,6 +778,9 @@ class EbayDownloader(BaseModel):
                 return []
 
             for idx in range(len(thumb_buttons)):
+                if len(image_urls) >= MAX_GALLERY_IMAGES:
+                    break
+
                 thumb = page.query_selector(
                     f'button.ux-image-grid-item[data-idx="{idx}"]'
                 )
@@ -726,6 +801,8 @@ class EbayDownloader(BaseModel):
             if not image_urls:
                 grid_imgs = page.query_selector_all("div.ux-image-grid img[src]")
                 for img in grid_imgs:
+                    if len(image_urls) >= MAX_GALLERY_IMAGES:
+                        break
                     src = img.get_attribute("src")
                     if src:
                         full_url = src.replace("/s-l140.webp", "/s-l1600.webp")
@@ -735,7 +812,7 @@ class EbayDownloader(BaseModel):
         except Exception as e:
             print(f"  Warning: Could not extract listing images: {e}")
 
-        return image_urls
+        return cap_gallery_urls(image_urls)
 
     def _visit_listing_page(
         self, listing_url: str, *, title: str
@@ -777,9 +854,11 @@ class EbayDownloader(BaseModel):
         print(f"Initializing eBay API for marketplace: {self.marketplace}")
         self._get_api()
 
+        query_label = f"'{self.query}' " if self.query else ""
+        sort_label = f", sort={self.sort}" if self.sort else ""
         print(
-            f"Searching for '{self.query}' listings in category "
-            f"(ID: {self.category_id}) for {self.listing_type.value}..."
+            f"Searching for {query_label}listings in category "
+            f"(ID: {self.category_id}) for {self.listing_type.value}{sort_label}..."
         )
         listings: list[dict] = []
         saved_count = 0
@@ -806,7 +885,10 @@ class EbayDownloader(BaseModel):
                     for listing in self.search_listings():
                         listing_index += 1
                         title = listing.get("title", "")
-                        source_id = listing.get("item_id")
+                        item_web_url = listing.get("item_web_url")
+                        source_id = (
+                            extract_source_id(item_web_url) or listing.get("item_id")
+                        )
                         hash_code = generate_hash_code(title)
                         title_short = title[:50] if title else "Unknown"
                         card_id = source_id or hash_code
@@ -815,9 +897,12 @@ class EbayDownloader(BaseModel):
                             log_already_exists(listing_index, title_short)
                             continue
 
-                        item_web_url = listing.get("item_web_url")
                         if not item_web_url:
                             log_skipping(listing_index, title_short, "missing listing url")
+                            continue
+
+                        if is_auction_listing(listing):
+                            log_skipping(listing_index, title_short, "auction listing")
                             continue
 
                         log_processing_new_listing(
@@ -845,14 +930,9 @@ class EbayDownloader(BaseModel):
                             log_listing_error(listing_index, title_short, error)
                             continue
 
-                        log_saved_listing(
-                            listing_index,
-                            title_short,
-                            make_and_model=make_and_model,
-                            year=details.get("year"),
-                            location=listing.get("item_location", {}).get("city"),
-                            image_count=len(image_urls),
-                        )
+                        if is_auction_listing(listing, details=details):
+                            log_skipping(listing_index, title_short, "auction listing")
+                            continue
 
                         current_datetime = datetime.now()
                         prospect_listing = build_prospect_listing(
@@ -864,6 +944,16 @@ class EbayDownloader(BaseModel):
                             current_datetime=current_datetime,
                         )
 
+                        def on_after_persist(saved: ProspectListings) -> None:
+                            log_saved_listing(
+                                listing_index,
+                                title_short,
+                                make_and_model=saved.make_and_model,
+                                year=saved.year,
+                                location=saved.location,
+                                image_count=len(image_urls),
+                            )
+
                         persist_listing_with_images_and_ai(
                             session,
                             prospect_listing,
@@ -872,7 +962,11 @@ class EbayDownloader(BaseModel):
                             image_urls=image_urls,
                             page=self._page,
                             temp_dir_prefix="ebay_images_",
+                            on_after_persist=on_after_persist,
+                            log_index=listing_index,
                         )
+
+                        log_timestamp()
 
                         listings.append(listing)
                         saved_count += 1

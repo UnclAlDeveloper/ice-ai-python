@@ -250,7 +250,8 @@ def generate_ai_analysis(
     print(
         f"  Requesting Gemini analysis ({model_name}, {image_count} images, "
         f"{inline_payload_bytes / (1024 * 1024):.1f} MB inline payload, "
-        f"timeout {GEMINI_REQUEST_TIMEOUT_MS // 60_000} min)..."
+        f"timeout {GEMINI_REQUEST_TIMEOUT_MS // 60_000} min)...",
+        flush=True,
     )
 
     # generate the content

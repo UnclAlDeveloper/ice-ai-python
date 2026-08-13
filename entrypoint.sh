@@ -1,5 +1,22 @@
 #!/bin/bash
 
+# start a virtual x server so headed chromium has a display on ecs/fargate
+Xvfb :99 -screen 0 1280x800x24 -ac -nolisten tcp &
+XVFB_PID=$!
+for _ in $(seq 1 50); do
+  if xdpyinfo -display :99 >/dev/null 2>&1; then
+    break
+  fi
+  sleep 0.1
+done
+if ! xdpyinfo -display :99 >/dev/null 2>&1; then
+  echo "warning: Xvfb on :99 did not become ready; headed chrome will fail"
+fi
+
+if command -v dbus-launch >/dev/null 2>&1; then
+  eval "$(dbus-launch --sh-syntax)"
+fi
+
 # start the api
 python ice_ai_api.py &
 API_PID=$!
@@ -23,6 +40,9 @@ API_PID=$!
 
 wait $API_PID
 EXIT_CODE=$?
+
+kill "$XVFB_PID" 2>/dev/null
+wait "$XVFB_PID" 2>/dev/null
 
 echo "container exiting; ice_ai_api returned $EXIT_CODE"
 exit $EXIT_CODE

@@ -9,8 +9,20 @@ RUN apt-get update \
  && echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
       > /etc/apt/sources.list.d/pgdg.list \
  && apt-get update \
- && apt-get install -y --no-install-recommends postgresql-client-18 procps tmux \
+ && apt-get install -y --no-install-recommends \
+      postgresql-client-18 \
+      procps \
+      tmux \
+      xvfb \
+      xauth \
+      x11-utils \
+      dbus-x11 \
+      fonts-liberation \
+      fonts-unifont \
  && rm -rf /var/lib/apt/lists/*
+
+# virtual display for headed chromium on ecs/fargate (no physical screen)
+ENV DISPLAY=:99
 
 WORKDIR /app
 

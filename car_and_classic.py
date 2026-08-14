@@ -89,18 +89,6 @@ CONFIG = ProxyRotationConfig.from_env_prefix(
     max_consecutive_captchas_before_rotation=3,
 )
 
-# cars in the UK from private sellers, newest first; applied via query params
-# because the All filters overlay needs client-side JS that Cloudflare often
-# blocks on proxied asset requests (button visible, click does nothing)
-_FILTERED_SEARCH_URL = (
-    "https://www.carandclassic.com/search"
-    "?vehicle_type=cars"
-    "&country=GB"
-    "&seller_type=private"
-    "&sort=latest"
-    "&source=modal-sort"
-)
-
 # title or h1 patterns that indicate a listing is sold or under offer
 TITLE_SOLD_OR_UNDER_OFFER = re.compile(
     r"(?i)\bunder\s+offer\b|\b(?:already\s+)?sold\b"
@@ -763,6 +751,23 @@ _NEWEST_LISTED_SORT_APPLIED_SELECTOR = (
     'button:has(svg[data-icon="clock"]):has(span:text-is("Newest listed"))'
 )
 _SORT_MENU_BUTTON_SELECTOR = 'button:has(svg[data-icon="sort"])'
+_ALL_FILTERS_BUTTON_SELECTOR = 'button:has(span:text-is("All filters"))'
+_FILTER_OVERLAY_CATEGORY_SELECTOR = 'section:has(h2:text-is("Category"))'
+_SHOW_RESULTS_BUTTON_SELECTOR = 'button:has-text("Show"):has-text("results")'
+
+
+# IS UNFILTERED SEARCH LANDING
+def _is_unfiltered_search_landing(page: Page) -> bool:
+    """
+    Return True when the page is the /search landing that a new proxied session
+    opens on, with no filter query parameters applied yet.
+    """
+
+    parsed = urlparse(page.url)
+    path = parsed.path.rstrip("/")
+    if path != "/search":
+        return False
+    return not parse_qsl(parsed.query, keep_blank_values=True)
 
 
 # IS SORTED BY NEWEST
@@ -832,15 +837,11 @@ def _apply_newest_listed_sort(page: Page) -> None:
 # CANONICAL NEWEST SEARCH URL
 def _canonical_newest_search_url(url: str) -> str:
     """
-    Return the page-one search url with sort=latest and source=modal-sort set,
-    preserving every other filter query parameter from url.
+    Return the page-one form of a search-results url, preserving the filter
+    query parameters produced by the All filters overlay.
     """
 
-    return replace_query_params(
-        url,
-        drop=("sort", "source", "page"),
-        set_params={"sort": "latest", "source": "modal-sort"},
-    )
+    return replace_query_params(url, drop=("page",))
 
 
 # EXTRACT SOURCE ID
@@ -1148,14 +1149,15 @@ def scrape_listings(
 ):
     """
     Walk up to _MAX_SEARCH_PAGES of Car & Classic search results and save new
-    listings. Each results page is loaded via the page= query parameter on the canonical
-    search url (including sort=latest), listing cards are snapshotted, then each
-    candidate is visited directly without returning to the grid between items.
-    When deadline (a time.monotonic value) is given, raises ProxySessionExpired
-    between listings once it is reached so the proxy can be rotated without
-    interrupting a partially-downloaded listing. When resume carries a
-    search_url from an interrupted run, continues from the saved results page
-    number rather than starting over from page one.
+    listings. Page one uses the grid already produced by the All filters overlay
+    when it is still on screen; later pages are loaded via the page= query
+    parameter on that overlay result url. Listing cards are snapshotted, then
+    each candidate is visited directly without returning to the grid between
+    items. When deadline (a time.monotonic value) is given, raises
+    ProxySessionExpired between listings once it is reached so the proxy can be
+    rotated without interrupting a partially-downloaded listing. When resume
+    carries a page_number from an interrupted run, continues from that results
+    page rather than starting over from page one.
     """
 
     existing_source_ids = get_existing_source_ids(ListingSource.CAR_AND_CLASSIC)
@@ -1171,15 +1173,21 @@ def scrape_listings(
     previous_page_listing_ids: set[str] = set()
     use_new_section: bool | None = None
 
-    if resume is not None and resume.search_url is not None:
-        search_url = with_page_param(resume.search_url, 1)
+    if resume is not None and (page_number > 1 or processed_ids):
         log_resume_scrape(page_number, len(processed_ids))
 
     log_paginating_start("Car & Classic")
 
     while True:
         page_url = with_page_param(search_url, page_number)
-        goto_with_captcha_handling(page, page_url)
+        # page one is already on screen after the all filters overlay; skip the
+        # extra navigation so a rotated session does not jump to a stored url
+        already_on_results = (
+            page_number == 1
+            and search_results_present(page, _SEARCH_RESULTS_CARD_SELECTOR)
+        )
+        if not already_on_results:
+            goto_with_captcha_handling(page, page_url)
         accept_cookies(page, wait_for_banner=True, timeout=8000)
         pause_for_page(page, min_seconds=2.0, max_seconds=4.0)
 
@@ -1424,37 +1432,81 @@ def _open_session(playwright) -> tuple:
     )
 
 
+# CLICK FILTER CHIP
+def _click_filter_chip(page: Page, section_heading: str, option_label: str) -> None:
+    """
+    Click a chip button inside the All filters overlay section whose h2 matches
+    section_heading, choosing the option whose span text is option_label.
+    """
+
+    chip = page.locator(
+        f'section:has(h2:text-is("{section_heading}")) '
+        f'button:has(span:text-is("{option_label}"))'
+    )
+    chip.first.wait_for(state="visible")
+    chip.first.click()
+    print(f"Selected '{option_label}' in '{section_heading}'")
+    pause_for_page(page)
+
+
 # APPLY SEARCH FILTERS
 def _apply_search_filters(page: Page) -> str:
     """
-    Load the Cars / United Kingdom / Private seller search results sorted by
-    Newest listed. Filters are set via query parameters on the search URL
-    rather than the All filters overlay, which depends on hydrated client JS
-    that often fails to load behind Cloudflare on proxied sessions. Returns
-    the canonical page-one search url including sort=latest.
+    Open the All filters overlay on the search page, select Cars, Right-hand
+    drive, Advert and Private seller type, apply the filters, then sort the
+    results by Newest listed. Returns the canonical page-one search url
+    including sort=latest.
     """
 
     _dismiss_blocking_overlays(page, cookie_timeout=15000)
     pause_for_page(page)
 
-    # navigate to the pre-filtered search url (cars, GB, private, newest)
-    goto_with_captcha_handling(page, _FILTERED_SEARCH_URL)
-    accept_cookies(page, wait_for_banner=True, timeout=8000)
+    # open the all filters overlay
     wait_for_selector_with_backoff(
         page,
-        '[data-testid="card-listing"]',
+        _ALL_FILTERS_BUTTON_SELECTOR,
+        state="visible",
+        description="all filters button",
+    )
+    page.locator(_ALL_FILTERS_BUTTON_SELECTOR).first.click()
+    print("Clicked 'All filters'")
+    wait_for_selector_with_backoff(
+        page,
+        _FILTER_OVERLAY_CATEGORY_SELECTOR,
+        state="attached",
+        description="all filters overlay",
+    )
+    pause_for_page(page)
+
+    # select category, drive side, listing type and seller type
+    _click_filter_chip(page, "Category", "Cars")
+    _click_filter_chip(page, "Driver side", "Right-hand drive")
+    _click_filter_chip(page, "Listing type", "Advert")
+    _click_filter_chip(page, "Seller type", "Private")
+
+    # apply the selected filters and wait for the overlay to close
+    show_results = page.locator(_SHOW_RESULTS_BUTTON_SELECTOR)
+    show_results.first.wait_for(state="visible")
+    show_results.first.click()
+    print("Clicked 'Show results' to apply filters")
+    wait_for_selector_with_backoff(
+        page,
+        _SEARCH_RESULTS_CARD_SELECTOR,
         state="attached",
         description="search results grid",
     )
+    try:
+        show_results.first.wait_for(state="hidden", timeout=15000)
+    except Exception:
+        pass
+    pause_for_page(page)
 
-    # sort=latest is already on the url; only open the sort control if the
-    # page did not pick it up (e.g. a soft redirect dropped the param)
-    if not _is_sorted_by_newest(page):
-        _apply_newest_listed_sort(page)
-
+    _apply_newest_listed_sort(page)
     _warm_up_search_session(page)
 
-    return _canonical_newest_search_url(page.url)
+    search_url = _canonical_newest_search_url(page.url)
+    print(f"Navigated to search results: {search_url}")
+    return search_url
 
 
 # CAR AND CLASSIC
@@ -1463,17 +1515,22 @@ def car_and_classic():
     Scrape new Car & Classic search listings inside a proxy-rotation loop.
     When a Decodo sticky session expires mid-run (surfacing as navigation
     timeouts) the browser is relaunched on a fresh proxy port and the sweep
-    resumes on the same search-results page (page= query param) where it was
-    interrupted; already-saved listings are skipped because scrape_listings
-    reloads the existing source ids from the database on each pass. When a
-    captcha is shown on three consecutive navigations the current exit IP is
-    rotated automatically even if CapSolver cleared the earlier challenges.
+    re-applies the All filters overlay on /search, then resumes on the same
+    results page where it was interrupted; already-saved listings are skipped
+    because scrape_listings reloads the existing source ids from the database
+    on each pass. When a captcha is shown on three consecutive navigations the
+    current exit IP is rotated automatically even if CapSolver cleared the
+    earlier challenges.
     """
 
     def setup(page: Page, resume: ScrapeResumeState) -> None:
         resume.search_url = _apply_search_filters(page)
 
     def scrape(page: Page, deadline: float, resume: ScrapeResumeState) -> None:
+        # rotation skips setup once search_url is set, and the new session
+        # lands on unfiltered /search, so run the overlay again before resuming
+        if _is_unfiltered_search_landing(page):
+            resume.search_url = _apply_search_filters(page)
         scrape_listings(page, resume.search_url, deadline, resume)
 
     run_with_proxy_rotation(

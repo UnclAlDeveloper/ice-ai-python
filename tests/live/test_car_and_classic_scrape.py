@@ -27,8 +27,9 @@ from tests.live.helpers import (
 @pytest.mark.live
 def test_car_and_classic_search_and_listing_elements():
     """
-    Load Car & Classic private UK search results, visit a live listing, and
-    check that card/detail locators and extracted fields still match the scraper.
+    Load Car & Classic private right-hand-drive advert search results, visit a
+    live listing, and check that card/detail locators and extracted fields still
+    match the scraper.
     """
 
     require_proxy()

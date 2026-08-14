@@ -759,7 +759,6 @@ def _stealth_launch_args(*, headless: bool) -> tuple[list[str], dict]:
     """
 
     launch_args = [
-        "--no-sandbox",
         "--disable-dev-shm-usage",
         "--renderer-process-limit=3",
     ]
@@ -809,12 +808,14 @@ def _launch_stealth_session(
     launch_args, browser_env = _stealth_launch_args(headless=headless)
     playwright_headless = False if headless else False
     channel = STEALTH_BROWSER_CHANNEL or None
+    # playwright adds --no-sandbox unless chromium_sandbox is explicitly true
     base_launch_kwargs: dict = {
         "headless": playwright_headless,
         "proxy": proxy,
         "args": launch_args,
         "env": browser_env,
-        "ignore_default_args": ["--enable-automation"],
+        "ignore_default_args": ["--enable-automation", "--no-sandbox"],
+        "chromium_sandbox": True,
     }
     if channel:
         base_launch_kwargs["channel"] = channel

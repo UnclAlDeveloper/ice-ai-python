@@ -261,7 +261,7 @@ def download_and_save_listing_images(
 
             # pause between downloading images
             if index > 0:
-                pause(0.5, 1.5)
+                pause(0.25, 1.0)
                 if page_hook is not None:
                     page_hook(page)
 

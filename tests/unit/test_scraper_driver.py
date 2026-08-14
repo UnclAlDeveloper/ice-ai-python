@@ -4,12 +4,60 @@ import pytest
 
 from models.enums import ListingSource, ListingType, ProspectListingStatus
 from scraper_driver import (
+    ProxyRotationConfig,
     is_site_unreachable_error,
     load_listing_with_backoff,
     persist_unavailable_listing_stub,
     with_page_param,
 )
 from stealth_browser import CaptchaSolveError
+
+
+class TestProxyRotationConfig:
+    """Tests for proxy rotation interval sampling."""
+
+    def _make_config(
+        self,
+        *,
+        mean_minutes: float = 35.0,
+        stddev_minutes: float = 7.5,
+    ) -> ProxyRotationConfig:
+        return ProxyRotationConfig(
+            max_proxy_rotations=20,
+            proxy_rotation_interval_mean_minutes=mean_minutes,
+            proxy_rotation_interval_stddev_minutes=stddev_minutes,
+            max_consecutive_setup_failures=3,
+            max_consecutive_db_failures=10,
+            max_consecutive_captchas_before_rotation=0,
+            availability_max_load_retries=4,
+            availability_load_backoff_seconds=5.0,
+        )
+
+    def test_sample_proxy_rotation_interval_uses_gauss(self, monkeypatch):
+        captured: dict[str, float] = {}
+
+        def fake_gauss(mean: float, stddev: float) -> float:
+            captured["mean"] = mean
+            captured["stddev"] = stddev
+            return 42.0
+
+        monkeypatch.setattr("scraper_driver.random.gauss", fake_gauss)
+        config = self._make_config()
+
+        assert config.sample_proxy_rotation_interval_minutes() == 42.0
+        assert captured == {"mean": 35.0, "stddev": 7.5}
+
+    def test_sample_proxy_rotation_interval_clamps_to_minimum(self, monkeypatch):
+        monkeypatch.setattr("scraper_driver.random.gauss", lambda *_a, **_k: -5.0)
+        config = self._make_config()
+
+        assert config.sample_proxy_rotation_interval_minutes() == 1.0
+
+    def test_sample_proxy_rotation_interval_clamps_to_maximum(self, monkeypatch):
+        monkeypatch.setattr("scraper_driver.random.gauss", lambda *_a, **_k: 90.0)
+        config = self._make_config()
+
+        assert config.sample_proxy_rotation_interval_minutes() == 55.0
 
 
 class TestWithPageParam:

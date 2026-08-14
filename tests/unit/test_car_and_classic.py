@@ -9,6 +9,7 @@ from car_and_classic import (
     _extract_gallery_images_from_structured_html,
     _find_json_array_end,
     _is_non_title_heading,
+    _is_unfiltered_search_landing,
     extract_source_id,
     is_title_sold_or_under_offer,
     scrape_listings,
@@ -102,16 +103,36 @@ class TestNonTitleHeading:
 
 
 class TestCanonicalNewestSearchUrl:
-    """Tests for pinning search results to newest-first page one."""
+    """Tests for stripping pagination from an overlay-produced search url."""
 
-    def test_sets_sort_and_drops_page(self):
+    def test_drops_page_and_preserves_filters(self):
         url = _canonical_newest_search_url(
-            "https://www.carandclassic.com/search?vehicle_type=cars&page=3&sort=price"
+            "https://www.carandclassic.com/search?vehicle_type=cars&page=3&sort=latest"
         )
-        assert "sort=latest" in url
-        assert "source=modal-sort" in url
         assert "page=" not in url
         assert "vehicle_type=cars" in url
+        assert "sort=latest" in url
+
+
+class TestIsUnfilteredSearchLanding:
+    """Tests for detecting the /search page a rotated session lands on."""
+
+    def test_unfiltered_search_path(self):
+        page = MagicMock()
+        page.url = "https://www.carandclassic.com/search"
+        assert _is_unfiltered_search_landing(page) is True
+
+    def test_filtered_search_is_not_landing(self):
+        page = MagicMock()
+        page.url = (
+            "https://www.carandclassic.com/search?vehicle_type=cars&seller_type=private"
+        )
+        assert _is_unfiltered_search_landing(page) is False
+
+    def test_listing_page_is_not_landing(self):
+        page = MagicMock()
+        page.url = "https://www.carandclassic.com/l/C2085940"
+        assert _is_unfiltered_search_landing(page) is False
 
 
 class TestFindJsonArrayEnd:

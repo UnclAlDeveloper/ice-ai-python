@@ -64,6 +64,9 @@ SITE_UNREACHABLE_ERROR_FRAGMENTS = (
 )
 
 
+_PROXY_ROTATION_MAX_MINUTES = 55.0
+
+
 # PROXY ROTATION CONFIG
 @dataclass
 class ProxyRotationConfig:
@@ -74,7 +77,8 @@ class ProxyRotationConfig:
     """
 
     max_proxy_rotations: int
-    proxy_rotation_interval_minutes: float
+    proxy_rotation_interval_mean_minutes: float
+    proxy_rotation_interval_stddev_minutes: float
     max_consecutive_setup_failures: int
     max_consecutive_db_failures: int
     max_consecutive_captchas_before_rotation: int
@@ -94,8 +98,14 @@ class ProxyRotationConfig:
 
         return cls(
             max_proxy_rotations=int(os.getenv(f"{prefix}_MAX_PROXY_ROTATIONS", "20")),
-            proxy_rotation_interval_minutes=float(
-                os.getenv(f"{prefix}_PROXY_ROTATION_MINUTES", "25")
+            proxy_rotation_interval_mean_minutes=float(
+                os.getenv(
+                    f"{prefix}_PROXY_ROTATION_MEAN_MINUTES",
+                    os.getenv(f"{prefix}_PROXY_ROTATION_MINUTES", "35"),
+                )
+            ),
+            proxy_rotation_interval_stddev_minutes=float(
+                os.getenv(f"{prefix}_PROXY_ROTATION_STDDEV_MINUTES", "7.5")
             ),
             max_consecutive_setup_failures=int(
                 os.getenv(f"{prefix}_MAX_SETUP_FAILURES", "3")
@@ -119,6 +129,25 @@ class ProxyRotationConfig:
             availability_load_backoff_seconds=float(
                 os.getenv(f"{prefix}_AVAILABILITY_LOAD_BACKOFF", "5")
             ),
+        )
+
+    # SAMPLE PROXY ROTATION INTERVAL MINUTES
+    def sample_proxy_rotation_interval_minutes(
+        self, *, min_minutes: float = 1.0
+    ) -> float:
+        """
+        Draw a proxy rotation interval from a normal distribution using the
+        configured mean and standard deviation, clamped to a positive minimum
+        and a hard maximum of 55 minutes.
+        """
+
+        interval_minutes = random.gauss(
+            self.proxy_rotation_interval_mean_minutes,
+            self.proxy_rotation_interval_stddev_minutes,
+        )
+        return min(
+            _PROXY_ROTATION_MAX_MINUTES,
+            max(min_minutes, interval_minutes),
         )
 
 
@@ -928,7 +957,7 @@ def update_new_listings_availability(
                     session.rollback()
                     print(f"  Error checking {listing.url}: {e}")
 
-            pause(2.0, 8.0)
+            pause(1.0, 3.0)
 
         print("Finished availability check for New listings")
 
@@ -965,13 +994,16 @@ def run_with_proxy_rotation(
         try:
             while True:
                 established = False
+                rotation_interval_minutes = (
+                    config.sample_proxy_rotation_interval_minutes()
+                )
                 try:
                     browser, page = open_session(p)
                     reset_consecutive_captcha_count()
 
                     deadline = (
                         time.monotonic()
-                        + config.proxy_rotation_interval_minutes * 60
+                        + rotation_interval_minutes * 60
                     )
 
                     if scrape_resume.search_url is None:
@@ -991,7 +1023,7 @@ def run_with_proxy_rotation(
                     rotations += 1
                     print(
                         f"\nScheduled proxy rotation after "
-                        f"{config.proxy_rotation_interval_minutes} min ({e}); relaunching "
+                        f"{rotation_interval_minutes:.1f} min ({e}); relaunching "
                         f"on a new Decodo port and resuming "
                         f"(rotation {rotations}/{config.max_proxy_rotations})...\n"
                     )
